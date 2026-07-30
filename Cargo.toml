@@ -1,0 +1,8 @@
+[package]
+name = "Opposite_Gradients"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+grad = {path="grad"}
+bincode = { version = "2", features = ["serde"] }

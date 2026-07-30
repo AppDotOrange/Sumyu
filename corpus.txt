@@ -1,0 +1,1341 @@
+use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
+use crate::Tensor;
+
+#[derive(Clone)]
+#[derive(Serialize, Deserialize)]
+pub struct SavedEmbeddings {
+    embedding_dim: usize,
+    vectors: Vec<Vec<f64>>,
+}
+
+
+pub struct Embeddings {
+    embedding_dim: usize,
+    vectors: Vec<Vec<Tensor>>,
+}
+
+impl Embeddings {
+    pub fn new(vocab_size: usize, embedding_dim: usize) -> Self {
+        let mut rng = rand::rng();
+
+        let normal = Normal::new(
+            0.0,
+            (1.0 / embedding_dim as f64).sqrt(),
+        )
+            .unwrap();
+
+        let vectors = (0..vocab_size)
+            .map(|_| {
+                (0..embedding_dim)
+                    .map(|_| Tensor::new(normal.sample(&mut rng)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            embedding_dim,
+            vectors,
+        }
+    }
+
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vectors.len()
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.embedding_dim * self.vectors.len()
+    }
+
+    pub fn encode(&self, ids: &[usize]) -> Vec<Tensor> {
+        let mut out =
+            Vec::with_capacity(ids.len() * self.embedding_dim);
+
+        for &id in ids {
+            out.extend(
+                self.vectors[id]
+                    .iter()
+                    .cloned()
+            );
+        }
+        out
+    }
+
+    pub fn parameters(&self) -> Vec<Tensor> {
+        self.vectors
+            .iter()
+            .flat_map(|row| row.iter().cloned())
+            .collect()
+    }
+
+    pub fn save(&self) -> SavedEmbeddings {
+        SavedEmbeddings {
+            embedding_dim: self.embedding_dim,
+            vectors: self.vectors
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|t| t.data())
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    pub fn load(saved: SavedEmbeddings) -> Self {
+        Embeddings {
+            embedding_dim: saved.embedding_dim,
+            vectors: saved.vectors
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(Tensor::new)
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+use std::collections::HashMap;
+use crate::neuron::{SavedMLP, MLP};
+use crate::Tensor;
+use crate::trainer::Trainer;
+use crate::embeddings::{Embeddings, SavedEmbeddings};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedLM {
+    mlp: SavedMLP,
+    vocab: Vec<String>,
+    context_len: u32,
+    hidden_layers: Vec<usize>,
+    embeddings: SavedEmbeddings,
+}
+
+pub fn tokenize(text: &str, vocab: &Vec<String>) -> Vec<usize> {
+    struct Node {
+        children: HashMap<char, usize>,
+        id: Option<usize>,
+    }
+    let total_chars: usize = vocab.iter().map(|s| s.len()).sum();
+    let mut nodes: Vec<Node> = Vec::with_capacity(total_chars + 1);
+
+    // Create root node (index 0)
+    nodes.push(Node { children: HashMap::new(), id: None });
+
+    // 1. Build Trie using indices (avoids borrow checker conflicts)
+    for (id, token) in vocab.iter().enumerate() {
+        let mut current_idx = 0; // Start at root
+
+        for ch in token.chars() {
+            // Check if child exists
+            if let Some(&next_idx) = nodes[current_idx].children.get(&ch) {
+                current_idx = next_idx;
+            } else {
+                // Create new node
+                let new_idx = nodes.len();
+                nodes.push(Node { children: HashMap::new(), id: None });
+
+                nodes[current_idx].children.insert(ch, new_idx);
+                current_idx = new_idx;
+            }
+        }
+        // Mark the end of the token
+        nodes[current_idx].id = Some(id);
+    }
+
+    // 2. Encode text (Greedy Longest Match)
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let mut current_idx = 0;
+        let mut best_match_id: Option<usize> = None;
+        let mut match_len = 0;
+        let mut j = i;
+
+        // Traverse Trie to find longest match starting at i
+        while j < chars.len() {
+            let ch = chars[j];
+            // Use immutable borrow to check children
+            if let Some(&next_idx) = nodes[current_idx].children.get(&ch) {
+                current_idx = next_idx;
+                j += 1;
+
+                // If this node is a valid token end, remember it
+                if let Some(id) = nodes[current_idx].id {
+                    best_match_id = Some(id);
+                    match_len = j - i;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(id) = best_match_id {
+            result.push(id);
+            i += match_len;
+        } else {
+            result.push(0);  // unknown char
+            i += 1;
+        }
+    }
+    result
+}
+
+pub struct LM {
+    trainer: Trainer,
+    mlp: MLP,
+    dataset: Vec<usize>,
+    vocab: Vec<String>,
+    context_len: u32,
+    hidden_layers: Vec<usize>,
+    embeddings: Embeddings,
+}
+
+impl LM {
+    pub fn new(context_len: u32, vocab: Vec<String>, hidden_dim: &[usize], embedding_dim: usize) -> Self {
+        let mut dim = vec![context_len as usize * embedding_dim];
+        dim.extend(hidden_dim.to_vec());
+        dim.push(vocab.len());
+        let embeddings =
+            Embeddings::new(
+                vocab.len(),
+                embedding_dim,
+            );
+
+        let trainer = Trainer::new(0.0, 0, 0, 0);
+        Self {
+            trainer,
+            mlp: MLP::new(dim[0], &dim[1..]),
+            dataset: vec![],
+            vocab,
+            context_len,
+            hidden_layers: hidden_dim.to_vec(),
+            embeddings,
+        }
+    }
+
+    pub fn encode_embeddings(&self, ids: &[usize]) -> Vec<Tensor> {
+        self.embeddings.encode(ids)
+    }
+
+    pub fn train_options(&mut self, lr: f64, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) {
+        self.trainer.reinit_lr(lr);
+        self.trainer.reinit_epochs(epochs);
+        self.trainer.reinit_batch(batch_size);
+        self.trainer.reinit_batch_per_epoch(max_batches_per_epoch);
+    }
+
+    pub fn encode_nums(&self, string: String) -> Vec<usize> {
+        tokenize(&*string, &self.vocab)
+    }
+
+    pub fn encode_one_hot_from_nums(&self, nums: Vec<usize>) -> Vec<Tensor> {
+        let mut one_hot: Vec<Tensor> = vec![Tensor::new(0f64); nums.len()*self.vocab.len()];
+        for (idx, x) in nums.iter().enumerate() {
+            one_hot[x+(idx*self.vocab.len())] = Tensor::new(1f64);
+        }
+        one_hot
+    }
+
+    pub fn decode_one_hot_char(&self, one_hot: Vec<Tensor>) -> &String {
+        let num = one_hot.iter().position(|x| {x.data() == 1.0}).unwrap();
+        &self.vocab[num]
+    }
+
+    pub fn max(&self, vec: Vec<Tensor>) -> usize {
+        let mut best = 0;
+        let mut best_val = vec[0].data();
+
+        for (i, t) in vec.iter().enumerate().skip(1) {
+            let v = t.data();
+            if v > best_val {
+                best = i;
+                best_val = v;
+            }
+        }
+
+        best
+    }
+
+    pub fn generate_one(&self, context: String) -> &String {
+        let mut new_context: String = context.clone();
+        if context.len() > self.context_len as usize {
+            new_context = context[context.len() - self.context_len as usize..context.len()].parse().unwrap();
+        }
+        let ids = self.encode_nums(new_context);
+
+        let input = self.encode_embeddings(&ids);
+        // println!("{:?}", input.iter().map(|x| {x.data()}).collect::<Vec<f64>>());
+        // println!("{}", input.iter().map(|x| {x.data()}).collect::<Vec<f64>>().len());
+        let out: Vec<Tensor> = self.mlp.forward(&*input);
+        self.decode_one_hot_char(self.encode_one_hot_from_nums(vec![self.max(out)]))
+    }
+
+    pub fn generate(&self, context: String, gen_length: usize) -> String {
+        let mut context_ = context.clone();
+        let mut output = "".to_string();
+        for _ in 0..gen_length {
+            let generation = self.generate_one(context_.clone());
+            context_.push_str(generation);
+            output.push_str(generation);
+        }
+        output
+    }
+
+    pub fn set_dataset(&mut self, dataset: Vec<usize>) {
+        self.dataset = dataset;
+    }
+
+    pub fn load_corpus(&mut self, corpus: &str) {
+        println!("Tokenizing corpus...");
+
+        self.dataset = tokenize(corpus, &self.vocab);
+
+        println!(
+            "Done! Loaded {} tokens ({} training samples).",
+            self.dataset.len(),
+            self.dataset.len().saturating_sub(self.context_len as usize)
+        );
+    }
+
+    pub fn train(&mut self) {
+        let mut params = self.mlp.parameters();
+        params.extend(self.embeddings.parameters());
+
+        self.trainer.train_lm(
+            1,
+            &mut self.mlp,
+            &self.dataset,
+            self.context_len as usize,
+            &self.embeddings,
+            params,
+        );
+    }
+
+    pub fn param_count(&self) -> usize {
+        let input =
+            self.context_len as usize
+                * self.embeddings.embedding_dim();
+        let mut dims = self.hidden_layers.clone();
+        dims.push(self.vocab.len());
+        let mut params = 0;
+        params += dims.iter().sum::<usize>();
+        let mut full_dims = vec![input];
+        full_dims.extend(dims);
+        for x in 1..full_dims.len() {
+            params += full_dims[x] * full_dims[x-1]
+        }
+        params += self.embeddings.parameter_count();
+
+        params
+    }
+
+    pub fn params(&self) {
+        println!("Parameter count: {}.", self.param_count());
+
+        let mut prev =
+            self.context_len as usize
+                * self.embeddings.embedding_dim();
+        println!(
+            "Embedding table: {} params",
+            self.embeddings.parameter_count()
+        );
+        println!("O O O        {} neurons   -   input layer", prev);
+        let mut layers = self.hidden_layers.clone();
+        layers.push(self.vocab.len());
+        for (idx, x) in layers.clone().iter().enumerate() {
+            println!(r"ЖХЖХЖ           {} weights   -   layer {} weights", prev*x, idx+1);
+            println!(r"O O O        {} neurons   -   layer {}", x, idx+1);
+            prev = layers[idx]
+        }
+    }
+
+    pub fn to_saved(&self) -> SavedLM {
+        SavedLM {
+            mlp: self.mlp.save(),
+            vocab: self.vocab.clone(),
+            context_len: self.context_len,
+            hidden_layers: self.hidden_layers.clone(),
+            embeddings: self.embeddings.save().clone(),
+        }
+    }
+
+    pub fn from_saved(saved: SavedLM) -> Self {
+        Self {
+            trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
+            mlp: MLP::load(&saved.mlp),
+            dataset: Vec::new(),
+            vocab: saved.vocab,
+            context_len: saved.context_len,
+            hidden_layers: saved.hidden_layers,
+            embeddings: Embeddings::load(saved.embeddings),
+        }
+    }
+}
+pub mod neuron;
+pub mod trainer;
+pub mod helper;
+pub mod fnn_lm;
+pub mod chatter;
+pub mod embeddings;
+
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+#[derive(Serialize, Deserialize)]
+enum Op {
+    Leaf,
+    Add,
+    Sub,
+    Mul,
+    Fma {
+        weight: f64,
+        input: f64,
+    },
+    _Neuron {
+        relu: bool,
+        output: f64,
+    },
+    Linear {
+        input_size: usize,
+        relu: bool,
+        pre_activation: f64,
+    },
+    Pow(f64),
+    Sigmoid,
+    Relu,
+    SoftmaxCrossEntropy {
+        probs: Vec<f64>,
+        target: usize,
+    },
+    SoftmaxCrossEntropyOld {
+        probs: Vec<f64>,
+        targets: Vec<f64>,
+    },
+}
+
+struct TensorData {
+    data: f64,
+    grad: f64,
+    prev: Vec<Rc<RefCell<TensorData>>>,
+    op: Op,
+}
+
+pub struct Tensor {
+    inner: Rc<RefCell<TensorData>>
+}
+
+impl Tensor {
+    pub fn new(data: f64) -> Self {
+        Tensor {
+            inner: Rc::new(RefCell::new(TensorData {
+                data,
+                grad: 0.0,
+                prev: Vec::new(),
+                op: Op::Leaf
+            })),
+        }
+    }
+
+    fn from_op(data: f64, prev: Vec<Rc<RefCell<TensorData>>>, op: Op) -> Self {
+        Tensor {
+            inner: Rc::new(RefCell::new(TensorData {
+                data,
+                grad: 0.0,
+                prev,
+                op,
+            })),
+        }
+    }
+
+    pub fn data(&self) -> f64 {
+        self.inner.borrow().data
+    }
+
+    pub fn grad(&self) -> f64 {
+        self.inner.borrow().grad
+    }
+
+    pub fn set_grad(&self, val: f64) {
+        self.inner.borrow_mut().grad = val;
+    }
+
+    pub fn add(&self, other: &Tensor) -> Tensor {
+        let a = self.data();
+        let b = other.data();
+        let data = a + b;
+
+        let mut prev = Vec::with_capacity(2);
+        prev.push(self.inner.clone());
+        prev.push(other.inner.clone());
+
+        Tensor::from_op(data, prev, Op::Add)
+    }
+
+    pub fn sub(&self, other: &Tensor) -> Tensor {
+        let a = self.data();
+        let b = other.data();
+        let data = a - b;
+
+        let mut prev = Vec::with_capacity(2);
+        prev.push(self.inner.clone());
+        prev.push(other.inner.clone());
+
+        Tensor::from_op(data, prev, Op::Sub)
+    }
+
+    pub fn mul(&self, other: &Tensor) -> Tensor {
+        let left = self.data();
+        let right = other.data();
+
+        let data = left * right;
+
+        let mut prev = Vec::with_capacity(2);
+        prev.push(self.inner.clone());
+        prev.push(other.inner.clone());
+
+        Tensor::from_op(
+            data,
+            prev,
+            Op::Mul,
+        )
+    }
+
+    pub fn fma(&self, weight: &Tensor, input: &Tensor) -> Tensor {
+
+        let w = weight.data();
+        let x = input.data();
+
+        let data = self.data() + w * x;
+
+        Tensor::from_op(
+            data,
+            vec![
+                self.inner.clone(),
+                weight.inner.clone(),
+                input.inner.clone(),
+            ],
+            Op::Fma {
+                weight: w,
+                input: x,
+            },
+        )
+    }
+
+    pub fn pow(&self, n: f64) -> Tensor {
+        let x = self.data();
+        let data = x.powf(n);
+
+        Tensor::from_op(data, vec![self.inner.clone()], Op::Pow(n))
+    }
+
+    pub fn sigmoid(&self) -> Tensor {
+        // 1. Forward Pass: Compute 1 / (1 + e^-x)
+        let data = 1.0 / (1.0 + (-self.data()).exp());
+
+        // 2. Clone the input so we can use it in the closure
+
+        // 4. Create the Tensor with the operation graph
+        let prev = vec![self.inner.clone()];
+
+        Tensor::from_op(data, prev, Op::Sigmoid)
+    }
+
+    pub fn linear_neuron(
+        weights: &[Tensor],
+        inputs: &[Tensor],
+        bias: &Tensor,
+        input_size: usize,
+        relu: bool,
+    ) -> Tensor {
+
+        let mut sum = bias.data();
+
+
+        for i in 0..input_size {
+            sum += weights[i].data() * inputs[i].data();
+        }
+
+
+        let output =
+            if relu {
+                if sum > 0.0 {
+                    sum
+                } else {
+                    sum * 0.01
+                }
+            }
+            else {
+                sum
+            };
+
+
+        let mut prev =
+            Vec::with_capacity(
+                input_size * 2 + 1
+            );
+
+
+        // weights
+        for w in weights {
+            prev.push(w.inner.clone());
+        }
+
+
+        // inputs
+        for x in inputs {
+            prev.push(x.inner.clone());
+        }
+
+
+        // bias
+        prev.push(bias.inner.clone());
+
+
+        Tensor::from_op(
+            output,
+            prev,
+            Op::Linear {
+                input_size,
+                relu,
+                pre_activation: sum,
+            }
+        )
+    }
+
+    fn build_reverse_top_order(&self) -> Vec<Tensor> {
+        let mut stack1 = Vec::new();
+        let mut stack2 = Vec::new();
+        let mut visited = HashSet::new();
+
+        // Push the root Tensor
+        stack1.push(self.clone());
+
+        while let Some(node) = stack1.pop() {
+            let ptr = Rc::as_ptr(&node.inner) as *const ();
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.insert(ptr);
+
+            stack2.push(node.clone());
+
+            // Extract parents safely
+            let parents: Vec<Rc<RefCell<TensorData>>> = {
+                let inner = node.inner.borrow();
+                inner.prev.clone()
+            }; // Borrow guard drops here
+
+            // Push parents as Tensors
+            for parent_rc in parents.iter().rev() {
+                // Dereference the Rc<Tensor> to get the Tensor, then access its inner Rc
+                // parent_rc: &Rc<Tensor>
+                // *parent_rc: Tensor
+                // (*parent_rc).inner: &Rc<RefCell<TensorData>>
+                // We need to clone the Rc<RefCell<TensorData>>
+                stack1.push(Tensor {
+                    inner: (*parent_rc).clone()
+                });
+            }
+        }
+
+        stack2
+    }
+
+    pub fn backward(&self) {
+        let topo = self.build_reverse_top_order();
+
+        self.inner.borrow_mut().grad = 1.0;
+
+        for tensor in topo.iter() {
+
+            let grad = tensor.grad();
+            let inner = tensor.inner.borrow();
+
+            match &inner.op {
+                Op::Leaf => {}
+                Op::Add => {
+                    inner.prev[0].borrow_mut().grad += grad;
+                    inner.prev[1].borrow_mut().grad += grad;
+                }
+                Op::Sub => {
+                    inner.prev[0].borrow_mut().grad += grad;
+                    inner.prev[1].borrow_mut().grad -= grad;
+                }
+                Op::Mul => {
+                    let a = inner.prev[0].borrow().data;
+                    let b = inner.prev[1].borrow().data;
+
+                    inner.prev[0].borrow_mut().grad += grad * b;
+                    inner.prev[1].borrow_mut().grad += grad * a;
+                }
+                Op::Fma { weight, input } => {
+
+                    inner.prev[0].borrow_mut().grad += grad;
+
+                    inner.prev[1].borrow_mut().grad += grad * input;
+
+                    inner.prev[2].borrow_mut().grad += grad * weight;
+                }
+                Op::_Neuron {
+                    relu,
+                    output,
+                } => {
+                    let mut local_grad = grad;
+                    if *relu && output <= &0.0 {
+                        local_grad *= 0.01;
+                    }
+                    let weight_count =
+                        (inner.prev.len() - 1) / 2;
+                    let input_offset = weight_count;
+                    // weights gradients
+                    for i in 0..weight_count {
+                        let input_value =
+                            inner.prev[input_offset + i]
+                                .borrow()
+                                .data;
+                        inner.prev[i]
+                            .borrow_mut()
+                            .grad += local_grad * input_value;
+                    }
+                    // input gradients
+                    for i in 0..weight_count {
+                        let weight_value =
+                            inner.prev[i]
+                                .borrow()
+                                .data;
+                        inner.prev[input_offset + i]
+                            .borrow_mut()
+                            .grad += local_grad * weight_value;
+                    }
+                    // bias gradient
+                    inner.prev[inner.prev.len()-1]
+                        .borrow_mut()
+                        .grad += local_grad;
+                }
+                Op::Linear {
+                    input_size,
+                    relu,
+                    pre_activation,
+                } => {
+                    let mut grad_out = grad;
+                    if *relu && pre_activation <= &0.0 {
+                        grad_out *= 0.01;
+                    }
+                    for i in 0..*input_size {
+                        let w =
+                            inner.prev[i].borrow().data;
+                        let x =
+                            inner.prev[input_size+i]
+                                .borrow()
+                                .data;
+                        // dw
+                        inner.prev[i]
+                            .borrow_mut()
+                            .grad += grad_out * x;
+                        // dx
+                        inner.prev[input_size+i]
+                            .borrow_mut()
+                            .grad += grad_out * w;
+                    }
+                    // bias
+                    inner.prev[input_size*2]
+                        .borrow_mut()
+                        .grad += grad_out;
+                }
+                Op::Pow(n) => {
+                    let x = inner.prev[0].borrow().data;
+                    inner.prev[0].borrow_mut().grad +=
+                        grad * n * x.powf(n - 1.0);
+                }
+                Op::Sigmoid => {
+                    let y = inner.data;
+                    inner.prev[0].borrow_mut().grad +=
+                        grad * y * (1.0 - y);
+                }
+                Op::Relu => {
+                    let x = inner.prev[0].borrow().data;
+                    let local_grad = if x > 0.0 { 1.0 } else { 0.01 };
+                    inner.prev[0].borrow_mut().grad += grad * local_grad;
+                }
+                Op::SoftmaxCrossEntropyOld { probs, targets } => {
+                    for ((parent, p), t) in inner.prev
+                        .iter()
+                        .zip(probs.iter())
+                        .zip(targets.iter())
+                    {
+                        parent.borrow_mut().grad += grad * (p - t);
+                    }
+                }
+                Op::SoftmaxCrossEntropy { probs, target } => {
+                    for (i, (parent, p)) in inner.prev
+                        .iter()
+                        .zip(probs.iter())
+                        .enumerate()
+                    {
+                        let mut local_grad = *p;
+
+                        if i == *target {
+                            local_grad -= 1.0;
+                        }
+
+                        parent.borrow_mut().grad += grad * local_grad;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn relu(&self) -> Tensor {
+        let alpha = 0.01; // The "leak" factor
+        let x = self.data();
+
+        let data = if x > 0.0 {
+            x
+        } else {
+            x * alpha
+        };
+
+        // Create the tensor with the new logic
+        Tensor::from_op(data, vec![self.inner.clone()], Op::Relu)
+    }
+
+    pub fn zero_grad(&self) {
+        self.inner.borrow_mut().grad = 0.0;
+    }
+
+    pub fn update(&self, learning_rate: f64) {
+        let mut locked = self.inner.borrow_mut();
+        locked.data -= learning_rate * locked.grad;
+    }
+}
+
+impl Clone for Tensor {
+    fn clone(&self) -> Tensor {
+        Tensor {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+use crate::Tensor;
+use rand_distr::{Distribution, Normal as NormalDist};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedNeuron {
+    weights: Vec<f64>,
+    bias: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedLayer {
+    neurons: Vec<SavedNeuron>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedMLP {
+    layers: Vec<SavedLayer>,
+}
+
+#[derive(Clone)]
+pub struct Neuron {
+    weights: Vec<Tensor>,
+    bias: Tensor,
+    is_output: bool,
+}
+
+impl Neuron {
+    pub fn new(num_inputs: usize, is_output: bool) -> Self {
+        let mut rng = rand::rng();
+        let std_dev = (2.0 / (num_inputs as f64)).sqrt();
+        let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
+
+        let weights: Vec<Tensor> = (0..num_inputs)
+            .map(|_| {
+                let val = normal.sample(&mut rng);
+                Tensor::new(val)
+            })
+            .collect();
+
+        let bias = Tensor::new(0.1);
+
+        Neuron {
+            weights,
+            bias,
+            is_output,
+        }
+    }
+
+    pub fn fwd(
+        &self,
+        inputs: &[Tensor],
+    ) -> Tensor {
+
+        Tensor::linear_neuron(
+            &self.weights,
+            inputs,
+            &self.bias,
+            inputs.len(),
+            !self.is_output,
+        )
+    }
+
+    pub fn parameters(&self) -> Vec<Tensor> {
+        // return all parameters (weights + bias) for training
+        let mut params = self.weights.clone();
+        params.push(self.bias.clone());
+        params
+    }
+
+    pub fn save(&self) -> SavedNeuron {
+        SavedNeuron {
+            weights: self.weights
+                .iter()
+                .map(|x| x.data())
+                .collect(),
+
+            bias: self.bias.data(),
+        }
+    }
+
+    pub fn load(saved: &SavedNeuron) -> Self {
+        Neuron {
+            weights: saved.weights
+                .iter()
+                .map(|x| Tensor::new(*x))
+                .collect(),
+
+            bias: Tensor::new(saved.bias),
+
+            is_output: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Layer {
+    neurons: Vec<Neuron>,
+}
+
+impl Layer {
+    pub fn new(num_inputs: usize, num_outputs: usize, is_output: bool) -> Self {
+        let neurons = (0..num_outputs)
+            .map(|_| Neuron::new(num_inputs, is_output))
+            .collect();
+
+        Layer { neurons }
+    }
+
+    pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
+        self.neurons
+            .iter()
+            .enumerate()
+            .map(|(_i, neuron)| {
+                neuron.fwd(
+                    inputs
+                )
+            })
+            .collect()
+    }
+
+    pub fn parameters(&self) -> Vec<Tensor> {
+        self.neurons
+            .iter()
+            .flat_map(|neuron| neuron.parameters())
+            .collect()
+    }
+
+    pub fn save(&self) -> SavedLayer {
+        SavedLayer {
+            neurons: self.neurons
+                .iter()
+                .map(|n| n.save())
+                .collect(),
+        }
+    }
+
+    pub fn load(saved: &SavedLayer, is_output: bool) -> Self {
+        Layer {
+            neurons: saved.neurons
+                .iter()
+                .map(|n| {
+                    let mut neuron = Neuron::load(n);
+                    neuron.is_output = is_output;
+                    neuron
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MLP {
+    layers: Vec<Layer>,
+}
+
+impl MLP {
+    pub fn new(num_inputs: usize, layer_sizes: &[usize]) -> Self {
+        let mut layers = Vec::new();
+        let mut input_size = num_inputs;
+
+        for (i, &output_size) in layer_sizes.iter().enumerate() {
+            let is_last_layer = i == layer_sizes.len() - 1;
+            layers.push(Layer::new(input_size, output_size, is_last_layer));
+            input_size = output_size;
+        }
+
+        MLP { layers }
+    }
+
+    pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
+        let mut current = inputs.to_vec();
+
+        for layer in &self.layers {
+            current = layer.forward(&current);
+        }
+
+        current
+    }
+
+    pub fn parameters(&self) -> Vec<Tensor> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.parameters())
+            .collect()
+    }
+
+    pub fn save(&self) -> SavedMLP {
+        SavedMLP {
+            layers: self.layers
+                .iter()
+                .map(|l| l.save())
+                .collect(),
+        }
+    }
+
+    pub fn load(saved: &SavedMLP) -> Self {
+        let last = saved.layers.len() - 1;
+
+        MLP {
+            layers: saved.layers
+                .iter()
+                .enumerate()
+                .map(|(i, layer)| {
+                    Layer::load(layer, i == last)
+                })
+                .collect(),
+        }
+    }
+}
+use std::time::Instant;
+use rand::prelude::SliceRandom;
+use crate::neuron::MLP;
+use crate::{Op, Tensor};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+pub enum TrainResult {
+    Finished,
+    Interrupted,
+}
+
+pub struct Trainer {
+    lr: f64,
+    epochs: usize,
+    batch_size: usize,
+    max_batches_per_epoch: usize,
+}
+
+impl Trainer {
+    pub fn new(lr: f64, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) -> Self {
+        Trainer { lr, epochs, batch_size, max_batches_per_epoch }
+    }
+    
+    pub fn reinit_lr(&mut self, lr: f64) {
+        self.lr = lr
+    }
+
+    pub fn reinit_epochs(&mut self, epochs: usize) {
+        self.epochs = epochs
+    }
+
+    pub fn reinit_batch(&mut self, batch_size: usize) {
+        self.batch_size = batch_size
+    }
+
+    pub fn reinit_batch_per_epoch(&mut self, max_batches_per_epoch: usize) {
+        self.max_batches_per_epoch = max_batches_per_epoch
+    }
+
+    pub fn softmax_cross_entropy(
+        logits: &[Tensor],
+        target: usize,
+    ) -> Tensor {
+        let n = logits.len();
+
+        let max_val = logits
+            .iter()
+            .map(|t| t.data())
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut exps = Vec::with_capacity(n);
+        let mut sum_exp = 0.0;
+
+        for t in logits {
+            let val = t.data();
+            let e = (val - max_val).exp();
+            exps.push(e);
+            sum_exp += e;
+        }
+
+        let probs: Vec<f64> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        let loss = -probs[target].max(1e-7).ln();
+
+        Tensor::from_op(
+            loss,
+            logits.iter().map(|x| x.inner.clone()).collect(),
+            Op::SoftmaxCrossEntropy {
+                probs,
+                target,
+            },
+        )
+    }
+
+    pub fn softmax_cross_entropy_old(
+        logits: &[Tensor],
+        targets: &[f64],
+    ) -> Tensor {
+        let n = logits.len();
+
+        let max_val = logits
+            .iter()
+            .map(|t| t.data())
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut exps = Vec::with_capacity(n);
+        let mut sum_exp = 0.0;
+
+        for t in logits {
+            let val = t.data();
+            let e = (val - max_val).exp();
+            exps.push(e);
+            sum_exp += e;
+        }
+
+        let probs: Vec<f64> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        let mut loss = 0.0;
+        for (i, &target) in targets.iter().enumerate() {
+            if target > 0.5 {
+                loss -= probs[i].max(1e-7).ln();
+            }
+        }
+
+        Tensor::from_op(
+            loss,
+            logits.iter().map(|x| x.inner.clone()).collect(),
+            Op::SoftmaxCrossEntropyOld {
+                probs,
+                targets: targets.to_vec(),
+            },
+        )
+    }
+
+    pub fn train(
+        &mut self,
+        update_frequency: usize,
+        mlp: &mut MLP,
+        dataset: &mut [(Vec<Tensor>, Vec<f64>)],
+        params: Vec<Tensor>,
+    ) -> TrainResult {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+
+        ctrlc::set_handler(move || {
+            println!("\nStopping after current batch...");
+            r.store(false, Ordering::SeqCst);
+        }).expect("Error setting Ctrl+C handler");
+        let mut rng = rand::rng();
+        let data_len = dataset.len() as f64;
+        if self.batch_size > data_len as usize {
+            println!("Batch size too high! Quitting...");
+            return TrainResult::Finished;
+        }
+        if self.batch_size == 0 {
+            self.batch_size = data_len as usize;
+        }
+        let data: &mut [(Vec<Tensor>, Vec<f64>)] = dataset;
+        for epoch in 1..self.epochs+1 {
+            let now = Instant::now();
+            data.shuffle(&mut rng);
+            // zero out gradients in between epoch runs
+            for j in params.iter() {
+                j.update(self.lr);
+                j.zero_grad();
+            }
+            let mut grad_sum = 0.0;
+
+            // initialize loss
+            let mut total_loss = 0.0;
+            let mut count = 0;
+
+            for (input, target) in data.iter() {
+                count += 1;
+                // call forward pass
+                let prediction = mlp.forward(input);
+
+                // calc loss
+                let loss: Tensor = Trainer::softmax_cross_entropy_old(&prediction, &target);
+                total_loss += loss.data();
+                loss.backward();
+                if count % self.batch_size == 0 {
+                    for p in &params {
+                        grad_sum += p.grad().abs();
+                        p.update(self.lr);
+                        p.zero_grad();
+                    }
+                    if !running.load(Ordering::SeqCst) {
+                        println!("Interrupted");
+                        return TrainResult::Interrupted;
+                    }
+                    if count/self.batch_size >= self.max_batches_per_epoch && self.max_batches_per_epoch != 0 {
+                        break;
+                    }
+                }
+            }
+            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f64>();
+
+            if epoch % update_frequency == 0 {
+                let elapsed = now.elapsed();
+                println!(
+                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Time elapsed: {:.2?} sec.",
+                    epoch, total_loss/data_len, grad_sum/data_len, elapsed
+                );
+                if grad_sum/data_len <= 1e-9 {
+                    println!("Early stopping, network will not learn anymore!");
+                    return TrainResult::Finished;
+                }
+            }
+        }
+
+        if data.len() <= 50 {
+            println!("\nTesting trained model:");
+            for (inputs, target) in data {
+                let prediction = mlp.forward(inputs);
+                println!(
+                    "Input: {:.1?} -> Prediction: {:.4?}, Target: {:.1?}",
+                    &inputs.iter().map(|x| { x.data() }).collect::<Vec<_>>(),
+                    &prediction.iter().map(|x| { x.data() }).collect::<Vec<_>>(),
+                    &target
+                );
+            }
+        }
+        TrainResult::Finished
+    }
+
+    pub fn train_lm(
+        &mut self,
+        update_frequency: usize,
+        mlp: &mut MLP,
+        tokens: &[usize],
+        context_len: usize,
+        embeddings: &crate::embeddings::Embeddings,
+        params: Vec<Tensor>,
+    ) -> TrainResult {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+
+        ctrlc::set_handler(move || {
+            println!("\nStopping after current batch...");
+            r.store(false, Ordering::SeqCst);
+        }).expect("Error setting Ctrl+C handler");
+        let mut rng = rand::rng();
+        let data_len = (tokens.len() - context_len) as f64;
+        if self.batch_size > data_len as usize {
+            println!("Batch size too high! Quitting...");
+            return TrainResult::Finished;
+        }
+        if self.batch_size == 0 {
+            self.batch_size = data_len as usize;
+        }
+        for epoch in 1..self.epochs+1 {
+            let now = Instant::now();
+            let mut indices: Vec<usize> =
+                (0..tokens.len() - context_len).collect();
+
+            indices.shuffle(&mut rng);
+            // zero out gradients in between epoch runs
+            for j in params.iter() {
+                j.update(self.lr);
+                j.zero_grad();
+            }
+            let mut grad_sum = 0.0;
+
+            // initialize loss
+            let mut total_loss = 0.0;
+            let mut count = 0;
+
+            for &sample in &indices {
+
+                let ids =
+                    &tokens[sample..sample + context_len];
+
+                let target =
+                    tokens[sample + context_len];
+
+                let input =
+                    embeddings.encode(ids);
+                count += 1;
+                // call forward pass
+                let prediction = mlp.forward(&input);
+
+                // calc loss
+                let loss: Tensor = Trainer::softmax_cross_entropy(&prediction, target);
+                total_loss += loss.data();
+                loss.backward();
+                if count % self.batch_size == 0 {
+                    for p in &params {
+                        grad_sum += p.grad().abs();
+                        p.update(self.lr);
+                        p.zero_grad();
+                    }
+                    if !running.load(Ordering::SeqCst) {
+                        println!("Interrupted");
+                        return TrainResult::Interrupted;
+                    }
+                    if count/self.batch_size >= self.max_batches_per_epoch && self.max_batches_per_epoch != 0 {
+                        break;
+                    }
+                }
+            }
+            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f64>();
+
+            if epoch % update_frequency == 0 {
+                let elapsed = now.elapsed();
+                println!(
+                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Time elapsed: {:.2?} sec.",
+                    epoch, total_loss/data_len, grad_sum/data_len, elapsed
+                );
+                if grad_sum/data_len <= 1e-9 {
+                    println!("Early stopping, network will not learn anymore!");
+                    return TrainResult::Finished;
+                }
+            }
+        }
+        TrainResult::Finished
+    }
+}
