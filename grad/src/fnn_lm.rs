@@ -170,10 +170,41 @@ impl LM {
         let ids = self.encode_nums(new_context);
 
         let input = self.encode_embeddings(&ids);
-        // println!("{:?}", input.iter().map(|x| {x.data()}).collect::<Vec<f64>>());
-        // println!("{}", input.iter().map(|x| {x.data()}).collect::<Vec<f64>>().len());
         let out: Vec<Tensor> = self.mlp.forward(&*input);
-        self.decode_one_hot_char(self.encode_one_hot_from_nums(vec![self.max(out)]))
+        &self.vocab[self.max(out)]
+    }
+
+    pub fn generate_one_distribution(&self, context: String, top_k: usize) {
+        let mut new_context = context.clone();
+        if context.len() > self.context_len as usize {
+            new_context = context[context.len() - self.context_len as usize..]
+                .parse()
+                .unwrap();
+        }
+        let ids = self.encode_nums(new_context);
+        let input = self.encode_embeddings(&ids);
+        let out: Vec<Tensor> = self.mlp.forward(&*input);
+        let logits: Vec<f64> = out.iter().map(|x| x.data()).collect();
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let exp_logits: Vec<f64> = logits
+            .iter()
+            .map(|&x| (x - max_logit).exp())
+            .collect();
+        let sum_exp: f64 = exp_logits.iter().sum();
+        let probs: Vec<f64> = exp_logits
+            .iter()
+            .map(|&x| x / sum_exp)
+            .collect();
+        let mut newest: Vec<(usize, f64)> = probs.into_iter().enumerate().collect();
+        newest.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        for i in 0..top_k.min(newest.len()) {
+            let (idx, prob) = newest[i];
+            println!("{}- {:.2}%", self.vocab[idx], prob * 100.0);
+        }
     }
 
     pub fn generate(&self, context: String, gen_length: usize) -> String {

@@ -1,6 +1,4 @@
-<USER>Hi, how are you?<EOT>
-<BOT>I'm great, thanks for asking. Can I help you with something?<EOT>
-<USER>Yes, could you please translate this sentence to Croatian:
-"How many people will attend the party?"<EOT>
-<BOT>Here is the translation of that sentence:
-"Koliko će ljudi biti na partiju?"<EOT>
+<USER>Hi, how are you?
+<BOT>I'm great, thanks for asking. Can I help you with something?
+<USER>Yes, can you please explain how trees work?
+<BOT>Trees grow in the ground. Trees

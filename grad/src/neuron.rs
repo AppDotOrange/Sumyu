@@ -108,15 +108,13 @@ impl Layer {
     }
 
     pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        self.neurons
-            .iter()
-            .enumerate()
-            .map(|(_i, neuron)| {
-                neuron.fwd(
-                    inputs
-                )
-            })
-            .collect()
+        let mut out = Vec::with_capacity(self.neurons.len());
+
+        for neuron in &self.neurons {
+            out.push(neuron.fwd(inputs));
+        }
+
+        out
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -169,7 +167,8 @@ impl MLP {
     }
 
     pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let mut current = inputs.to_vec();
+        let mut current = Vec::with_capacity(inputs.len());
+        current.extend_from_slice(inputs);
 
         for layer in &self.layers {
             current = layer.forward(&current);
@@ -179,10 +178,13 @@ impl MLP {
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
-        self.layers
-            .iter()
-            .flat_map(|layer| layer.parameters())
-            .collect()
+        let mut params = Vec::new();
+
+        for layer in &self.layers {
+            params.extend(layer.parameters());
+        }
+
+        params
     }
 
     pub fn save(&self) -> SavedMLP {

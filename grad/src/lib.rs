@@ -168,8 +168,8 @@ impl Tensor {
         let data = a + b;
 
         let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle.clone());
-        prev.push(other.handle.clone());
+        prev.push(self.handle);
+        prev.push(other.handle);
 
         Tensor::from_op(data, prev, Op::Add)
     }
@@ -180,8 +180,8 @@ impl Tensor {
         let data = a - b;
 
         let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle.clone());
-        prev.push(other.handle.clone());
+        prev.push(self.handle);
+        prev.push(other.handle);
 
         Tensor::from_op(data, prev, Op::Sub)
     }
@@ -193,8 +193,8 @@ impl Tensor {
         let data = left * right;
 
         let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle.clone());
-        prev.push(other.handle.clone());
+        prev.push(self.handle);
+        prev.push(other.handle);
 
         Tensor::from_op(
             data,
@@ -213,9 +213,9 @@ impl Tensor {
         Tensor::from_op(
             data,
             vec![
-                self.handle.clone(),
-                weight.handle.clone(),
-                input.handle.clone(),
+                self.handle,
+                weight.handle,
+                input.handle,
             ],
             Op::Fma {
                 weight: w,
@@ -228,7 +228,7 @@ impl Tensor {
         let x = self.data();
         let data = x.powf(n);
 
-        Tensor::from_op(data, vec![self.handle.clone()], Op::Pow(n))
+        Tensor::from_op(data, vec![self.handle], Op::Pow(n))
     }
 
     pub fn sigmoid(&self) -> Tensor {
@@ -238,7 +238,7 @@ impl Tensor {
         // 2. Clone the input so we can use it in the closure
 
         // 4. Create the Tensor with the operation graph
-        let prev = vec![self.handle.clone()];
+        let prev = vec![self.handle];
 
         Tensor::from_op(data, prev, Op::Sigmoid)
     }
@@ -280,18 +280,18 @@ impl Tensor {
 
         // weights
         for w in weights {
-            prev.push(w.handle.clone());
+            prev.push(w.handle);
         }
 
 
         // inputs
         for x in inputs {
-            prev.push(x.handle.clone());
+            prev.push(x.handle);
         }
 
 
         // bias
-        prev.push(bias.handle.clone());
+        prev.push(bias.handle);
 
 
         Tensor::from_op(
@@ -382,132 +382,115 @@ impl Tensor {
         let topo = self.build_reverse_top_order();
 
         TAPE.with(|t| {
-            t.borrow_mut()
-                .nodes[self.handle]
-                .grad = 1.0;
-        });
+            let mut tape = t.borrow_mut();
 
-        for tensor in topo.iter() {
+            tape.nodes[self.handle].grad = 1.0;
 
-            let id = tensor.handle;
+            for tensor in topo.iter() {
+                let id = tensor.handle;
 
-            let (grad, op, prev) = TAPE.with(|t| {
-                let tape = t.borrow();
+                let grad = tape.nodes[id].grad;
 
-                let node = &tape.nodes[id];
+                let op = tape.nodes[id].op.clone();
 
-                (
-                    node.grad,
-                    node.op.clone(),
-                    node.prev.clone(),
-                )
-            });
+                match op {
+                    Op::Leaf => {}
 
-            match op {
-                Op::Leaf => {}
-                Op::Add => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
-                        tape.nodes[prev[0]].grad += grad;
-                        tape.nodes[prev[1]].grad += grad;
-                    });
-                }
-                Op::Sub => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
-                        tape.nodes[prev[0]].grad += grad;
-                        tape.nodes[prev[1]].grad -= grad;
-                    });
-                }
-                Op::Mul => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
+                    Op::Add => {
+                        let a = tape.nodes[id].prev[0];
+                        let b = tape.nodes[id].prev[1];
 
-                        let a = tape.nodes[prev[0]].data;
-                        let b = tape.nodes[prev[1]].data;
-
-                        tape.nodes[prev[0]].grad += grad * b;
-                        tape.nodes[prev[1]].grad += grad * a;
-                    });
-                }
-                Op::Fma { weight, input } => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
-
-                        tape.nodes[prev[0]].grad += grad;
-                        tape.nodes[prev[1]].grad += grad * input;
-                        tape.nodes[prev[2]].grad += grad * weight;
-                    });
-                }
-                Op::Linear {
-                    input_size,
-                    relu,
-                    pre_activation,
-                } => {
-                    let mut grad_out = grad;
-
-                    if relu && pre_activation <= 0.0 {
-                        grad_out *= 0.01;
+                        tape.nodes[a].grad += grad;
+                        tape.nodes[b].grad += grad;
                     }
 
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
+                    Op::Sub => {
+                        let a = tape.nodes[id].prev[0];
+                        let b = tape.nodes[id].prev[1];
 
-                        for i in 0..input_size {
-                            let w = tape.nodes[prev[i]].data;
-                            let x = tape.nodes[prev[input_size + i]].data;
+                        tape.nodes[a].grad += grad;
+                        tape.nodes[b].grad -= grad;
+                    }
 
-                            tape.nodes[prev[i]].grad += grad_out * x;
-                            tape.nodes[prev[input_size + i]].grad += grad_out * w;
+                    Op::Mul => {
+                        let a = tape.nodes[id].prev[0];
+                        let b = tape.nodes[id].prev[1];
+
+                        let a_data = tape.nodes[a].data;
+                        let b_data = tape.nodes[b].data;
+
+                        tape.nodes[a].grad += grad * b_data;
+                        tape.nodes[b].grad += grad * a_data;
+                    }
+
+                    Op::Fma { weight, input } => {
+                        let sum = tape.nodes[id].prev[0];
+                        let w = tape.nodes[id].prev[1];
+                        let x = tape.nodes[id].prev[2];
+
+                        tape.nodes[sum].grad += grad;
+                        tape.nodes[w].grad += grad * input;
+                        tape.nodes[x].grad += grad * weight;
+                    }
+
+                    Op::Linear {
+                        input_size,
+                        relu,
+                        pre_activation,
+                    } => {
+                        let input_size = input_size;
+                        let relu = relu;
+                        let pre_activation = pre_activation;
+
+                        let prev = tape.nodes[id].prev.clone();
+
+                        let mut grad_out = grad;
+
+                        if relu && pre_activation <= 0.0 {
+                            grad_out *= 0.01;
                         }
 
-                        tape.nodes[prev[input_size * 2]].grad += grad_out;
-                    });
-                }
-                Op::Pow(n) => {
-                    let x = TAPE.with(|t| {
-                        t.borrow()
-                            .nodes[prev[0]]
-                            .data
-                    });
-                    TAPE.with(|t| {
-                        t.borrow_mut()
-                            .nodes[prev[0]]
-                            .grad += grad * n * x.powf(n - 1.0);
-                    });
-                }
-                Op::Sigmoid => {
-                    let y = TAPE.with(|t| {
-                        t.borrow()
-                            .nodes[id]
-                            .data
-                    });
-                    TAPE.with(|t| {
-                        t.borrow_mut()
-                            .nodes[prev[0]]
-                            .grad += grad * y * (1.0 - y);
-                    });
-                }
-                Op::Relu => {
-                    let x = TAPE.with(|t| {
-                        t.borrow()
-                            .nodes[prev[0]]
-                            .data
-                    });
-                    let local_grad = if x > 0.0 {
-                        1.0
-                    } else {
-                        0.01
-                    };
-                    TAPE.with(|t| {
-                        t.borrow_mut()
-                            .nodes[prev[0]]
-                            .grad += grad * local_grad;
-                    });
-                }
-                Op::SoftmaxCrossEntropyOld { probs, targets } => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
+                        for i in 0..input_size {
+                            let w_id = prev[i];
+                            let x_id = prev[input_size + i];
+
+                            let w = tape.nodes[w_id].data;
+                            let x = tape.nodes[x_id].data;
+
+                            tape.nodes[w_id].grad += grad_out * x;
+                            tape.nodes[x_id].grad += grad_out * w;
+                        }
+
+                        let bias = prev[input_size * 2];
+                        tape.nodes[bias].grad += grad_out;
+                    }
+
+                    Op::Pow(n) => {
+                        let x_id = tape.nodes[id].prev[0];
+                        let x = tape.nodes[x_id].data;
+
+                        tape.nodes[x_id].grad += grad * n * x.powf(n - 1.0);
+                    }
+
+                    Op::Sigmoid => {
+                        let x_id = tape.nodes[id].prev[0];
+                        let y = tape.nodes[id].data;
+
+                        tape.nodes[x_id].grad += grad * y * (1.0 - y);
+                    }
+
+                    Op::Relu => {
+                        let x_id = tape.nodes[id].prev[0];
+                        let x = tape.nodes[x_id].data;
+
+                        let local_grad = if x > 0.0 { 1.0 } else { 0.01 };
+
+                        tape.nodes[x_id].grad += grad * local_grad;
+                    }
+
+                    Op::SoftmaxCrossEntropyOld { probs, targets } => {
+                        let prev = tape.nodes[id].prev.clone();
+
                         for ((parent, p), target) in prev
                             .iter()
                             .zip(probs.iter())
@@ -515,26 +498,24 @@ impl Tensor {
                         {
                             tape.nodes[*parent].grad += grad * (p - target);
                         }
-                    });
-                }
-                Op::SoftmaxCrossEntropy { probs, target } => {
-                    TAPE.with(|t| {
-                        let mut tape = t.borrow_mut();
-                        for (i, (parent, p)) in prev
-                            .iter()
-                            .zip(probs.iter())
-                            .enumerate()
-                        {
+                    }
+
+                    Op::SoftmaxCrossEntropy { probs, target } => {
+                        let prev = tape.nodes[id].prev.clone();
+
+                        for (i, (parent, p)) in prev.iter().zip(probs.iter()).enumerate() {
                             let mut local_grad = *p;
+
                             if i == target {
                                 local_grad -= 1.0;
                             }
+
                             tape.nodes[*parent].grad += grad * local_grad;
                         }
-                    });
+                    }
                 }
             }
-        }
+        });
     }
 
     pub fn relu(&self) -> Tensor {
@@ -548,7 +529,7 @@ impl Tensor {
         };
 
         // Create the tensor with the new logic
-        Tensor::from_op(data, vec![self.handle.clone()], Op::Relu)
+        Tensor::from_op(data, vec![self.handle], Op::Relu)
     }
 
     pub fn zero_grad(&self) {
