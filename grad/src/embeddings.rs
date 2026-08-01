@@ -9,7 +9,7 @@ pub struct SavedEmbeddings {
     vectors: Vec<Vec<f64>>,
 }
 
-
+#[derive(Clone)]
 pub struct Embeddings {
     embedding_dim: usize,
     vectors: Vec<Vec<Tensor>>,
@@ -25,13 +25,16 @@ impl Embeddings {
         )
             .unwrap();
 
-        let vectors = (0..vocab_size)
+        let mut vectors = (0..vocab_size)
             .map(|_| {
                 (0..embedding_dim)
                     .map(|_| Tensor::new(normal.sample(&mut rng)))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        vectors[1] = (0..embedding_dim)
+            .map(|_| Tensor::new(0.0))
+            .collect();
 
         Self {
             embedding_dim,
@@ -98,5 +101,97 @@ impl Embeddings {
                 })
                 .collect(),
         }
+    }
+
+    pub fn find_clusters(&self, threshold: f64, vocab: Vec<String>) {
+        let n = self.vectors.len();
+
+        let mut norms = vec![0.0; n];
+
+        for i in 0..n {
+            norms[i] = self.vectors[i]
+                .iter()
+                .map(|t| {
+                    let x = t.data();
+                    x * x
+                })
+                .sum::<f64>()
+                .sqrt();
+        }
+
+        let cosine = |a: usize, b: usize| -> f64 {
+            let dot = self.vectors[a]
+                .iter()
+                .zip(self.vectors[b].iter())
+                .map(|(x, y)| x.data() * y.data())
+                .sum::<f64>();
+
+            dot / (norms[a] * norms[b] + 1e-12)
+        };
+
+        let mut graph = vec![Vec::<usize>::new(); n];
+
+        let mut max_sim = -1.0;
+        let mut max_pair = (0, 0);
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim = cosine(i, j);
+
+                if sim > max_sim {
+                    max_sim = sim;
+                    max_pair = (i, j);
+                }
+
+                if sim >= threshold {
+                    graph[i].push(j);
+                    graph[j].push(i);
+                }
+            }
+        }
+
+        println!(
+            "Highest similarity: {:.5} between {} and {}",
+            max_sim,
+            max_pair.0,
+            max_pair.1
+        );
+
+        let mut visited = vec![false; n];
+        let mut clusters = 0;
+
+        for start in 0..n {
+            if visited[start] {
+                continue;
+            }
+
+            let mut stack = vec![start];
+            let mut cluster = Vec::new();
+
+            visited[start] = true;
+
+            while let Some(node) = stack.pop() {
+                cluster.push(node);
+
+                for &next in &graph[node] {
+                    if !visited[next] {
+                        visited[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+
+            if cluster.len() > 1 {
+                clusters += 1;
+
+                println!("\nCluster {} ({} tokens):", clusters, cluster.len());
+
+                for id in cluster {
+                    println!("  token {} ({})", id, vocab[id]);
+                }
+            }
+        }
+
+        println!("\nTotal clusters: {}", clusters);
     }
 }

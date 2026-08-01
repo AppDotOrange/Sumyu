@@ -62,9 +62,8 @@ impl Neuron {
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
-        // return all parameters (weights + bias) for training
         let mut params = self.weights.clone();
-        params.push(self.bias.clone());
+        params.push(self.bias);
         params
     }
 

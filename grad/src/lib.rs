@@ -103,6 +103,19 @@ thread_local! {
     static TOPO_STACK2: RefCell<Vec<TensorHandle>> = RefCell::new(Vec::new());
 }
 
+pub fn zero_grad_and_update(params: &[Tensor], lr: f64) {
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        for p in params {
+            let node = &mut tape.nodes[p.handle];
+            node.data -= lr * node.grad;
+            tape.nodes[p.handle].grad = 0.0;
+        }
+    });
+}
+
+#[derive(Copy)]
 pub struct Tensor {
     handle: TensorHandle,
 }
@@ -306,75 +319,51 @@ impl Tensor {
     }
 
     fn build_reverse_top_order(&self) -> Vec<Tensor> {
-        let tape_size = TAPE.with(|t| {
-            t.borrow().nodes.len()
-        });
-
-        TOPO_VISITED.with(|v| {
-            let mut visited = v.borrow_mut();
-
-            if visited.len() != tape_size {
-                visited.resize(tape_size, false);
-            } else {
-                visited.fill(false);
-            }
-        });
-
-        TOPO_STACK1.with(|s| {
-            let mut stack = s.borrow_mut();
-            stack.clear();
-            stack.push(self.handle);
-        });
-
-        TOPO_STACK2.with(|s| {
-            let mut stack = s.borrow_mut();
-            stack.clear();
-        });
-
-        loop {
-            let current = TOPO_STACK1.with(|s| {
-                s.borrow_mut().pop()
-            });
-
-            let id = match current {
-                Some(x) => x,
-                None => break,
-            };
-
-            let already_seen = TOPO_VISITED.with(|v| {
-                let visited = v.borrow();
-                visited[id]
-            });
-
-            if already_seen {
-                continue;
-            }
+        TAPE.with(|t| {
+            let tape = t.borrow();
+            let tape_size = tape.nodes.len();
 
             TOPO_VISITED.with(|v| {
-                v.borrow_mut()[id] = true;
+                let mut visited = v.borrow_mut();
+
+                if visited.len() != tape_size {
+                    visited.resize(tape_size, false);
+                } else {
+                    visited.fill(false);
+                }
             });
 
-            TOPO_STACK2.with(|s| {
-                s.borrow_mut().push(id);
-            });
+            TOPO_STACK1.with(|s1| {
+                TOPO_STACK2.with(|s2| {
+                    TOPO_VISITED.with(|v| {
+                        let mut stack1 = s1.borrow_mut();
+                        let mut stack2 = s2.borrow_mut();
+                        let mut visited = v.borrow_mut();
 
-            TAPE.with(|t| {
-                let tape = t.borrow();
+                        stack1.clear();
+                        stack2.clear();
 
-                TOPO_STACK1.with(|s| {
-                    let mut stack = s.borrow_mut();
+                        stack1.push(self.handle);
 
-                    for &parent in tape.nodes[id].prev.iter().rev() {
-                        stack.push(parent);
-                    }
-                });
-            });
-        }
-        TOPO_STACK2.with(|s| {
-            s.borrow()
-                .iter()
-                .map(|&handle| Tensor { handle })
-                .collect()
+                        while let Some(id) = stack1.pop() {
+                            if visited[id] {
+                                continue;
+                            }
+
+                            visited[id] = true;
+                            stack2.push(id);
+
+                            for &parent in tape.nodes[id].prev.iter().rev() {
+                                stack1.push(parent);
+                            }
+                        }
+                        stack2
+                            .iter()
+                            .map(|&handle| Tensor { handle })
+                            .collect()
+                    })
+                })
+            })
         })
     }
 
@@ -438,21 +427,17 @@ impl Tensor {
                         relu,
                         pre_activation,
                     } => {
-                        let input_size = input_size;
-                        let relu = relu;
-                        let pre_activation = pre_activation;
-
-                        let prev = tape.nodes[id].prev.clone();
-
                         let mut grad_out = grad;
 
                         if relu && pre_activation <= 0.0 {
                             grad_out *= 0.01;
                         }
 
-                        for i in 0..input_size {
-                            let w_id = prev[i];
-                            let x_id = prev[input_size + i];
+                        let base = input_size;
+
+                        for i in 0..base {
+                            let w_id = tape.nodes[id].prev[i];
+                            let x_id = tape.nodes[id].prev[base + i];
 
                             let w = tape.nodes[w_id].data;
                             let x = tape.nodes[x_id].data;
@@ -461,7 +446,7 @@ impl Tensor {
                             tape.nodes[x_id].grad += grad_out * w;
                         }
 
-                        let bias = prev[input_size * 2];
+                        let bias = tape.nodes[id].prev[base * 2];
                         tape.nodes[bias].grad += grad_out;
                     }
 
@@ -489,28 +474,27 @@ impl Tensor {
                     }
 
                     Op::SoftmaxCrossEntropyOld { probs, targets } => {
-                        let prev = tape.nodes[id].prev.clone();
+                        let prev_len = tape.nodes[id].prev.len();
 
-                        for ((parent, p), target) in prev
-                            .iter()
-                            .zip(probs.iter())
-                            .zip(targets.iter())
-                        {
-                            tape.nodes[*parent].grad += grad * (p - target);
+                        for i in 0..prev_len {
+                            let parent = tape.nodes[id].prev[i];
+                            tape.nodes[parent].grad += grad * (probs[i] - targets[i]);
                         }
                     }
 
                     Op::SoftmaxCrossEntropy { probs, target } => {
-                        let prev = tape.nodes[id].prev.clone();
+                        let prev_len = tape.nodes[id].prev.len();
 
-                        for (i, (parent, p)) in prev.iter().zip(probs.iter()).enumerate() {
-                            let mut local_grad = *p;
+                        for i in 0..prev_len {
+                            let parent = tape.nodes[id].prev[i];
+
+                            let mut local_grad = probs[i];
 
                             if i == target {
                                 local_grad -= 1.0;
                             }
 
-                            tape.nodes[*parent].grad += grad * local_grad;
+                            tape.nodes[parent].grad += grad * local_grad;
                         }
                     }
                 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::fnn_lm::tokenize;
+use crate::fnn_lm::{tokenize};
 
 pub fn xor() -> Vec<(Vec<f64>, Vec<f64>)> {
     vec![
@@ -204,6 +204,10 @@ pub fn ml_200_tok_vocab_v3() -> Vec<String> {
      ["<UNKNOWN>", "u", "s", "e", " ", "r", "a", "n", "d", "_", "i", "t", ":", "{", "D", "b", "o", ",", "N", "m", "l", "}", ";", "\r", "\n", "z", "S", "c", "T", "#", "[", "v", "(", "C", ")", "]", "p", "E", "g", "V", "<", "f", "6", "4", ">", "w", "-", "=", "0", ".", "1", "/", "q", "|", "&", "*", "h", "y", "x", "H", "M", "L", "P", "3", "2", "k", "O", "+", "B", "G", "j", "U", "I", "!", "\"", "?", "Ж", "Х", "R", "A", "F", "^", "W", "Y", "7", "5", "\\", "Q", "%", "9", "  ", "    ", "        ", "\n        ", "\r\n        ", "\r\n            ", "\n                ", "in", "\r\n", "er", "t ", "\r\n                ", "()", "en", "\r\n    ", " {", "se", "= ", "or", "le", "let ", "sel", "self", "at", "pu", ": ", "self.", " = ", "ra", "\n                        ", "\n                    ", "on", "\r\n        let ", "::", ", ", "\r\n                    ", "ed", "iz", "ize", "size", "ens", "ensor", "Tensor", "dat", "data", "ing", "ch", "re", "\n            ", "ec", ",\r\n            ", "rad", "grad", " {\r\n            ", ");", "pub", "pub ", "\r\n    pub ", "\r\n\r\n    pub ", "mu", "mut ", "usize", "();", "\r\n    }", "ro", "t_", "\n    ", "n ", "Vec", "\r\n        }", "er.", "it", "pre", "inn", "inner.", "s: ", "inpu", "Vec<", "fn ", "prev", "al", "ding", "edding", "bedding", "mbedding", "embedding", "ne", "\r\n                .", "\n        let ", " -", "one", "\r\n            .", "inner.prev", "().", " {\r\n        ", " ->", " -> ", "atch", "id", "iter", "ma", "(&", "(&self", "s.", "lone", "ar", "len", "\r\n\r\n        ", "clone", "inner.prev[", "ex", "yer", "ayer", "layer", ";\n                    ", "par", "st", "new", "um", "co", "nt", "lo", "batch", "av", "aved", "orro", "orrow", "borrow", "rain", "input", "_size", " {\r\n                ", ".borrow", "/ ", "// ", "for", "::new", "cont", "contex", "para", "param", "\n                            ", "();\r\n\r\n        ", "grad ", "di", "clone()", "for ", " {\n                    ", "\n                }", "s ", "el", ",\r\n    ", ",\r\n        ", "Vec<Tensor", "Vec<Tensor>", "p(", ");\r\n            ", "context_", "context_len", "uro", "iter()", "ct", "dim", "len()", "to", "och", "poch", "epoch", "map(", "map(|", "inner.clone()", "embedding_", "embedding_dim", "lect", "llect", "collect", "64", "f64", "\n\n        ", "in ", " in ", "\n                }\n                ", "sh", "(&self)", "\r\n            }", "+= ", "Saved", "de", ";\r\n\r\n        ", ".borrow_", ".borrow_mu", ".borrow_mut", "::new(", "\n    }", "ig", "igh", "eigh", "weigh", "weight", ");\r\n\r\n        "].iter().map(|x| { String::from(*x) }).collect()
 }
 
+pub fn ml_v4() -> Vec<String> { // 250 tokens
+     ["<UNKNOWN>", "", "u", "s", "e", " ", "r", "a", "n", "d", "_", "i", "t", ":", "{", "D", "b", "o", ",", "N", "m", "l", "}", ";", "\r", "\n", "z", "S", "c", "T", "#", "[", "v", "(", "C", ")", "]", "p", "E", "g", "V", "<", "f", "6", "4", ">", "w", "-", "=", "0", ".", "1", "/", "q", "|", "&", "*", "h", "y", "x", "H", "M", "L", "P", "3", "2", "k", "O", "+", "B", "G", "j", "U", "I", "!", "\"", "?", "Ж", "Х", "R", "A", "F", "^", "W", "Y", "7", "5", "\\", "Q", "%", "9", "  ", "    ", "        ", "\n        ", "\r\n        ", "\r\n            ", "\n                ", "in", "\r\n", "er", "t ", "\r\n                ", "()", "en", "\r\n    ", " {", "se", "= ", "or", "le", "let ", "sel", "self", "at", "pu", ": ", "self.", " = ", "ra", "\n                        ", "\n                    ", "on", "\r\n        let ", "::", ", ", "\r\n                    ", "ed", "iz", "ize", "size", "ens", "ensor", "Tensor", "ata", "data", "ing", "ch", "\n            ", "re", "rad", "grad", "ec", ",\r\n            ", " {\r\n            ", ");", "pub", "pub ", "\r\n    pub ", "\r\n\r\n    pub ", "mu", "mut ", "usize", "();", "\r\n    }", "ro", "n ", "it", "\n    ", "Vec", "put", "input", "\r\n        }", "er.", "pre", "inn", "inner.", "s: ", "Vec<", "prev", "fn ", "al", "ding", "edding", "bedding", "mbedding", "embedding", "ne", "\n        let ", "\r\n                .", " -", "one", "\r\n            .", "inner.prev", " {\r\n        ", "().", " ->", " -> ", "id", "iter", "st", "atch", "ma", "(&", "(&self", "s.", "lone", "ar", "\r\n\r\n        ", "len", "_size", "clone", "inner.prev[", "ex", ";\n                    ", "yer", "ayer", "layer", "par", "new", "co", "nt", "um", "lo", "batch", "av", "aved", "rain", "orro", "orrow", "borrow", " {\r\n                ", "/ ", "// ", "_len", "for", ".borrow", "::new", "cont", "contex", "context", "para", "param", "\n                            ", "();\r\n\r\n        ", "grad ", "di", "clone()", "for ", "\n                }", " {\n                    ", "context_len", "el", ",\r\n    ", ",\r\n        ", "s ", "Vec<Tensor", "Vec<Tensor>", "p(", ");\r\n            ", "uro", "iter()", "ct", "och", "poch", "epoch", "map(", "map(|", "to", "len()", "dim", "inner.clone()", "f6", "f64", "lect", "llect", "collect", "in ", " in ", "\n\n        ", "embedding_", "embedding_dim", "sh", "\n                }\n                ", "+= ", "(&self)", "Saved", "\r\n            }", ";\r\n\r\n        ", "de", ");\r\n\r\n        ", ".borrow_", ".borrow_mu", ".borrow_mut", "uron", "neuron", "batch_size", "\n    }", "ig", "igh", "ight", "eight", "weight", "::new(", "iter().", "max", ".borrow_mut().", ".borrow_mut().grad ", "].borrow_mut().grad ", "et", "push", "push(", "0.", "sum", "ou", "alize", "ialize", "collect()", "vec", "f ", "if ", "out", "output", "(&self, ", " =", ",\n        ", ",\n                ", "\n    }\n", "\n    }\n\n    ", ".data", "\r\n            let ", ");\r\n        ", "Embedding", "ca", "s,\r\n            ", "Train", ");\r\n                ", " {\r\n                    ", "ate", "str", "get", "arget", "target", "train", "saved", "self.batch_size", "\r\n                .collect()", "ion", "Op", "Op::", ".len()"].iter().map(|x| { String::from(*x) }).collect()
+}
+
 fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
      if v.len() < 2 {
           return None;
@@ -230,7 +234,7 @@ fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
 }
 
 pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
-     let mut vocab: Vec<String> = vec!["<UNKNOWN>".to_string()];
+     let mut vocab: Vec<String> = vec!["<UNKNOWN>".to_string(), "".to_string()];
      let mut chars = Vec::new();
      for x in text.chars() {
           let y = x.to_string();
@@ -238,7 +242,7 @@ pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
                chars.push(y)
           }
      }
-     let len = chars.len()+1;
+     let len = chars.len()+2;
      vocab.extend(chars);
 
      while vocab.len() < len+token_num {
@@ -255,4 +259,109 @@ pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
           vocab.push(new_tok)
      }
      vocab
+}
+
+pub struct Config<'a> {
+     pub lr: f64,
+     pub batch_size: usize,
+     pub max_batches_per_epoch: usize, // 0 means no limit
+     pub vocab: Vec<String>,
+     pub context_len: usize,
+     pub emb_dim: usize,
+     pub hidden_dim: &'a [usize],
+     pub epochs: usize,
+}
+
+impl<'a> Config<'a> {
+     pub fn new(lr: f64,
+                batch_size: usize,
+                max_batches_per_epoch: usize,
+                vocab: Vec<String>,
+                context_len: usize,
+                emb_dim: usize,
+                hidden_dim: &'a [usize],
+                epochs: usize,) -> Self {
+          Self {
+               lr,
+               batch_size,
+               max_batches_per_epoch,
+               vocab,
+               context_len,
+               emb_dim,
+               hidden_dim,
+               epochs,
+          }
+     }
+}
+
+pub fn minimodel_config() -> Config<'static> {
+     Config::new(0.01,
+          32,
+          10,
+          ml_200_tok_vocab_v3(),
+          8,
+          20,
+          &[200],
+          500,
+     )
+}
+
+pub fn rustception_optimized() -> Config<'static> {
+     Config::new(0.01,
+                 32,
+                 0, // no limit
+                 ml_200_tok_vocab_v3(),
+                 32,
+                 32,
+                 &[200, 200, 100],
+                 500,
+     )
+}
+
+pub fn rustception_optimized_v2() -> Config<'static> {
+     Config::new(0.01,
+                 32,
+                 0, // no limit
+                 ml_200_tok_vocab_v3(),
+                 32,
+                 32,
+                 &[250, 200, 64],
+                 500,
+     )
+}
+
+pub fn rustception_optimized_v2_train_options(lr: f64, batch_size: usize, epochs: usize) -> Config<'static> {
+     Config::new(lr,
+                 batch_size,
+                 0, // no limit
+                 ml_200_tok_vocab_v3(),
+                 32,
+                 32,
+                 &[250, 200, 64],
+                 epochs,
+     )
+}
+
+pub fn rustception_optimized_v2_large_train_options(lr: f64, batch_size: usize, epochs: usize) -> Config<'static> {
+     Config::new(lr,
+                 batch_size,
+                 0, // no limit
+                 ml_200_tok_vocab_v3(),
+                 32,
+                 42,
+                 &[250, 200, 100, 64],
+                 epochs,
+     )
+}
+
+pub fn rustception_v3_to(lr: f64, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+     Config::new(lr,
+                 batch_size,
+                 0, // no limit
+                 ml_v4(),
+                 32,
+                 42,
+                 &[250, 200, 100, 64],
+                 epochs,
+     )
 }

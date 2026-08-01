@@ -67,7 +67,7 @@ impl Trainer {
 
         Tensor::from_op(
             loss,
-            logits.iter().map(|x| x.handle.clone()).collect(),
+            logits.iter().map(|x| x.handle).collect(),
             Op::SoftmaxCrossEntropy {
                 probs,
                 target,
@@ -107,7 +107,7 @@ impl Trainer {
 
         Tensor::from_op(
             loss,
-            logits.iter().map(|x| x.handle.clone()).collect(),
+            logits.iter().map(|x| x.handle).collect(),
             Op::SoftmaxCrossEntropyOld {
                 probs,
                 targets: targets.to_vec(),
@@ -174,7 +174,9 @@ impl Trainer {
                         println!("Interrupted");
                         return TrainResult::Interrupted;
                     }
-                    if count/self.batch_size >= self.max_batches_per_epoch && self.max_batches_per_epoch != 0 {
+                    if self.max_batches_per_epoch != 0
+                        && count / self.batch_size >= self.max_batches_per_epoch
+                    {
                         break;
                     }
                 }
@@ -242,10 +244,7 @@ impl Trainer {
 
             indices.shuffle(&mut rng);
             // zero out gradients in between epoch runs
-            for j in params.iter() {
-                j.update(self.lr);
-                j.zero_grad();
-            }
+            crate::zero_grad_and_update(&*params, self.lr);
             let mut grad_sum = 0.0;
 
             // initialize loss
@@ -271,11 +270,8 @@ impl Trainer {
                 total_loss += loss.data();
                 loss.backward();
                 if count % self.batch_size == 0 {
-                    for p in &params {
-                        grad_sum += p.grad().abs();
-                        p.update(self.lr);
-                        p.zero_grad();
-                    }
+                    grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f64>();
+                    crate::zero_grad_and_update(&*params, self.lr);
                     crate::clear_tape_after(parameter_boundary);
                     if !running.load(Ordering::SeqCst) {
                         println!("Interrupted");
@@ -290,11 +286,12 @@ impl Trainer {
 
             if epoch % update_frequency == 0 {
                 let elapsed = now.elapsed();
+                let samples = count as f64;
                 println!(
-                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Time elapsed: {:.2?} sec.",
-                    epoch, total_loss/data_len, grad_sum/data_len, elapsed
+                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Perplexity = {:.6} | Time elapsed: {:.2?} sec.",
+                    epoch, total_loss/samples, grad_sum/samples, (total_loss/samples).exp(), elapsed,
                 );
-                if grad_sum/data_len <= 1e-9 {
+                if grad_sum/samples <= 1e-9 {
                     println!("Early stopping, network will not learn anymore!");
                     return TrainResult::Finished;
                 }

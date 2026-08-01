@@ -4,6 +4,7 @@ use crate::Tensor;
 use crate::trainer::Trainer;
 use crate::embeddings::{Embeddings, SavedEmbeddings};
 use serde::{Serialize, Deserialize};
+use crate::helper::Config;
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedLM {
@@ -119,12 +120,34 @@ impl LM {
         }
     }
 
+    pub fn from_config(config: Config) -> Self {
+        let mut dim = vec![config.context_len as usize * config.emb_dim];
+        dim.extend(config.hidden_dim.to_vec());
+        dim.push(config.vocab.len());
+        let embeddings =
+            Embeddings::new(
+                config.vocab.len(),
+                config.emb_dim,
+            );
+
+        let trainer = Trainer::new(config.lr / config.batch_size as f64, config.epochs, config.batch_size, config.max_batches_per_epoch);
+        Self {
+            trainer,
+            mlp: MLP::new(dim[0], &dim[1..]),
+            dataset: vec![],
+            vocab: config.vocab,
+            context_len: config.context_len as u32,
+            hidden_layers: config.hidden_dim.to_vec(),
+            embeddings,
+        }
+    }
+
     pub fn encode_embeddings(&self, ids: &[usize]) -> Vec<Tensor> {
         self.embeddings.encode(ids)
     }
 
     pub fn train_options(&mut self, lr: f64, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) {
-        self.trainer.reinit_lr(lr);
+        self.trainer.reinit_lr(lr/batch_size as f64);
         self.trainer.reinit_epochs(epochs);
         self.trainer.reinit_batch(batch_size);
         self.trainer.reinit_batch_per_epoch(max_batches_per_epoch);
@@ -132,19 +155,6 @@ impl LM {
 
     pub fn encode_nums(&self, string: String) -> Vec<usize> {
         tokenize(&*string, &self.vocab)
-    }
-
-    pub fn encode_one_hot_from_nums(&self, nums: Vec<usize>) -> Vec<Tensor> {
-        let mut one_hot: Vec<Tensor> = vec![Tensor::new(0f64); nums.len()*self.vocab.len()];
-        for (idx, x) in nums.iter().enumerate() {
-            one_hot[x+(idx*self.vocab.len())] = Tensor::new(1f64);
-        }
-        one_hot
-    }
-
-    pub fn decode_one_hot_char(&self, one_hot: Vec<Tensor>) -> &String {
-        let num = one_hot.iter().position(|x| {x.data() == 1.0}).unwrap();
-        &self.vocab[num]
     }
 
     pub fn max(&self, vec: Vec<Tensor>) -> usize {
@@ -306,5 +316,9 @@ impl LM {
             hidden_layers: saved.hidden_layers,
             embeddings: Embeddings::load(saved.embeddings),
         }
+    }
+
+    pub fn embeds(&self) -> Embeddings {
+        self.embeddings.clone()
     }
 }

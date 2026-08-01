@@ -1,4 +1,9 @@
 <USER>Hi, how are you?
-<BOT>I'm great, thanks for asking. Can I help you with something?
+<BOT>I'm great, thanks for asking. Can I help you with something?<EOT>
 <USER>Yes, can you please explain how trees work?
-<BOT>Trees grow in the ground. Trees
+<BOT>Trees grow in the ground. Trees' leaves fall down and the wind carries them.<EOT>
+<USER>What is the capital of France?
+<BOT>Paris.<EOT>
+<USER>What color is the sky?
+<BOT>Blue.<EOT>
+
