@@ -6,7 +6,7 @@ use crate::Tensor;
 #[derive(Serialize, Deserialize)]
 pub struct SavedEmbeddings {
     embedding_dim: usize,
-    vectors: Vec<Vec<f64>>,
+    vectors: Vec<Vec<f32>>,
 }
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ impl Embeddings {
 
         let normal = Normal::new(
             0.0,
-            (1.0 / embedding_dim as f64).sqrt(),
+            (1.0 / embedding_dim as f32).sqrt(),
         )
             .unwrap();
 
@@ -103,7 +103,7 @@ impl Embeddings {
         }
     }
 
-    pub fn find_clusters(&self, threshold: f64, vocab: Vec<String>) {
+    pub fn find_clusters(&self, threshold: f32, vocab: Vec<String>) {
         let n = self.vectors.len();
 
         let mut norms = vec![0.0; n];
@@ -115,16 +115,16 @@ impl Embeddings {
                     let x = t.data();
                     x * x
                 })
-                .sum::<f64>()
+                .sum::<f32>()
                 .sqrt();
         }
 
-        let cosine = |a: usize, b: usize| -> f64 {
+        let cosine = |a: usize, b: usize| -> f32 {
             let dot = self.vectors[a]
                 .iter()
                 .zip(self.vectors[b].iter())
                 .map(|(x, y)| x.data() * y.data())
-                .sum::<f64>();
+                .sum::<f32>();
 
             dot / (norms[a] * norms[b] + 1e-12)
         };
@@ -193,5 +193,27 @@ impl Embeddings {
         }
 
         println!("\nTotal clusters: {}", clusters);
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OldSavedEmbeddings {
+    embedding_dim: usize,
+    vectors: Vec<Vec<f64>>,
+}
+
+impl From<OldSavedEmbeddings> for SavedEmbeddings {
+    fn from(old: OldSavedEmbeddings) -> Self {
+        Self {
+            embedding_dim: old.embedding_dim,
+            vectors: old.vectors
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|x| x as f32)
+                        .collect()
+                })
+                .collect(),
+        }
     }
 }

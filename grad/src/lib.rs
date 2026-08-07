@@ -16,30 +16,30 @@ enum Op {
     Sub,
     Mul,
     Fma {
-        weight: f64,
-        input: f64,
+        weight: f32,
+        input: f32,
     },
     Linear {
         input_size: usize,
         relu: bool,
-        pre_activation: f64,
+        pre_activation: f32,
     },
-    Pow(f64),
+    Pow(f32),
     Sigmoid,
     Relu,
     SoftmaxCrossEntropy {
-        probs: Vec<f64>,
+        probs: Vec<f32>,
         target: usize,
     },
     SoftmaxCrossEntropyOld {
-        probs: Vec<f64>,
-        targets: Vec<f64>,
+        probs: Vec<f32>,
+        targets: Vec<f32>,
     },
 }
 
 struct TensorData {
-    data: f64,
-    grad: f64,
+    data: f32,
+    grad: f32,
     prev: Vec<TensorHandle>,
     op: Op,
 }
@@ -59,7 +59,7 @@ impl Tape {
 
     fn alloc(
         &mut self,
-        data: f64,
+        data: f32,
         prev: Vec<TensorHandle>,
         op: Op,
     ) -> TensorHandle {
@@ -103,7 +103,7 @@ thread_local! {
     static TOPO_STACK2: RefCell<Vec<TensorHandle>> = RefCell::new(Vec::new());
 }
 
-pub fn zero_grad_and_update(params: &[Tensor], lr: f64) {
+pub fn zero_grad_and_update(params: &[Tensor], lr: f32) {
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
 
@@ -121,7 +121,7 @@ pub struct Tensor {
 }
 
 impl Tensor {
-    pub fn new(data: f64) -> Self {
+    pub fn new(data: f32) -> Self {
         let id = TAPE.with(|t| {
             t.borrow_mut().alloc(
                 data,
@@ -135,7 +135,7 @@ impl Tensor {
     }
 
     fn from_op(
-        data: f64,
+        data: f32,
         prev: Vec<TensorHandle>,
         op: Op,
     ) -> Self {
@@ -151,7 +151,7 @@ impl Tensor {
         }
     }
 
-    pub fn data(&self) -> f64 {
+    pub fn data(&self) -> f32 {
         TAPE.with(|t| {
             t.borrow()
                 .nodes[self.handle]
@@ -159,7 +159,7 @@ impl Tensor {
         })
     }
 
-    pub fn grad(&self) -> f64 {
+    pub fn grad(&self) -> f32 {
         TAPE.with(|t| {
             t.borrow()
                 .nodes[self.handle]
@@ -167,7 +167,7 @@ impl Tensor {
         })
     }
 
-    pub fn set_grad(&self, val: f64) {
+    pub fn set_grad(&self, val: f32) {
         TAPE.with(|t| {
             t.borrow_mut()
                 .nodes[self.handle]
@@ -237,7 +237,7 @@ impl Tensor {
         )
     }
 
-    pub fn pow(&self, n: f64) -> Tensor {
+    pub fn pow(&self, n: f32) -> Tensor {
         let x = self.data();
         let data = x.powf(n);
 
@@ -524,7 +524,7 @@ impl Tensor {
         });
     }
 
-    pub fn update(&self, learning_rate: f64) {
+    pub fn update(&self, learning_rate: f32) {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
             let node = &mut tape.nodes[self.handle];

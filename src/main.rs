@@ -1,16 +1,18 @@
 use grad::fnn_lm::{SavedLM, LM};
 use grad::helper;
-use std::fs;
+use std::{fs, io};
+use std::io::Write;
 use bincode;
 
 fn main() {
-    let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
-    let test = 3;
+    //let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
+    let text = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
+    let test = 5;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
         //------------------------------------------------------------------------------------------
-
+        
         let lr = 0.01;
         let batch_size = 32;
         let max_batches_per_epoch = 10; // 0 means no limit
@@ -48,7 +50,7 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         if load {
-            let bytes = fs::read("model.bin").unwrap();
+            let bytes = fs::read("model.sumyu").unwrap();
             let (model, _): (SavedLM, usize) =
                 bincode::serde::decode_from_slice(
                     &bytes,
@@ -60,68 +62,89 @@ fn main() {
             lm.load_corpus(&*text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
             lm.train();
-            let saved = lm.to_saved();
-            let bytes = bincode::serde::encode_to_vec(
-                &saved,
-                bincode::config::standard(),
-            ).unwrap();
-            fs::write("model.bin", bytes).unwrap();
         } else {
             let mut lm = LM::new(context_len, vocab, hidden_dim, emb_dim);
             lm.params();
             lm.load_corpus(&*text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
             lm.train();
-            let saved = lm.to_saved();
-            let bytes = bincode::serde::encode_to_vec(
-                &saved,
-                bincode::config::standard(),
-            ).unwrap();
-            fs::write("model.bin", bytes).unwrap();
+        let saved = lm.to_saved("");
+        let bytes = bincode::serde::encode_to_vec(
+            &saved,
+            bincode::config::standard(),
+        ).unwrap();
+        fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
         println!("{:?}", helper::make_vocab(&*text, 250))
     } else if test == 2 {
-        let bytes = fs::read("Working_saved_models/Rustception V4 Finale.bin").unwrap();
+        let bytes = fs::read("Poke_V1_working.sumyu").unwrap();
+        //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
+        //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
         let (model, _): (SavedLM, usize) =
             bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
             ).unwrap();
         let lm = LM::from_saved(model);
-        //println!("{}\n\n", lm.generate("pub ".to_string(), 10));
+        lm.params();
+        println!("\"{}\"", lm.generate("NAME: Blorbo\n".to_string(), 100, 0.7));
         //lm.generate_one_distribution("".to_string(), 10);
-        //println!("\"{}\"", lm.generate("let x =".to_string(), 100))
-        lm.embeds().find_clusters(0.50, helper::ml_200_tok_vocab_v3());
+        //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
+        //lm.embeds().find_clusters(0.50, helper::ml_v4());
     } else if test == 3 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::rustception_v3_to(0.01, 64, 500);
+        //let config = helper::rustception_v4_mini_to(0.01, 32, 500);
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         //let mut lm = LM::from_config(config);
         //*
-        let bytes = fs::read("Rustception_optimized.bin").unwrap();
-        let (model, _): (SavedLM, usize) =
-            bincode::serde::decode_from_slice(
-                &bytes,
-                bincode::config::standard(),
-            ).unwrap();
-        let mut lm = LM::from_saved(model);
-        lm.train_options(0.1, 100000, 32, 0);
+        let (description, mut lm) = LM::load("Production/Rustception_P1_mini.sumyu");
+        lm.train_options(0.01, 100_000, 32, 0);
         //*/
         lm.params();
         lm.load_corpus(&*text);
         lm.train();
-        let saved = lm.to_saved();
-        let bytes = bincode::serde::encode_to_vec(
-            &saved,
-            bincode::config::standard(),
-        ).unwrap();
-        fs::write("Rustception_optimized.bin", bytes).unwrap();
+        lm.save(
+            "Rustception_optimized.sumyu",
+            &*description,
+        );
+    } else if test == 4 {
+        println!("Updating save format to .sumyu quality...");
+        print!("Description: ");
+        io::stdout().flush().expect("Failed to flush.");
+        let mut desc = String::new();
+        io::stdin().read_line(&mut desc).expect("Failed to read line!");
+        let desc = desc.trim().to_string();
+        let lm = LM::load_legacy("Poke_V1.sumyu");
+        lm.save("Poke_V1_working.sumyu", &*desc);
+    } else if test == 5 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        //let config = helper::poke_v1_mini_to(0.1, 32, 100_000);
+        //let description = "A Sumyu model trained on a filtered Pokedex.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        //let mut lm = LM::from_config(config);
+        //*
+        let (description, mut lm) = LM::load("Tests/Poke_V1_26.sumyu");
+        lm.train_options(0.1, 100_000, 32, 0);
+        //*/
+        lm.params();
+        lm.load_corpus(&*text);
+        lm.train();
+        lm.save(
+            "Poke_V1.sumyu",
+            &*description,
+        );
     }
 }

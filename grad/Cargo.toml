@@ -8,3 +8,4 @@ rand = "0.10.2"
 rand_distr = "0.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
 ctrlc = "3.5.2"
+bincode = { version = "2", features = ["serde"] }

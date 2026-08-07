@@ -4,8 +4,8 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedNeuron {
-    weights: Vec<f64>,
-    bias: f64,
+    weights: Vec<f32>,
+    bias: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -18,6 +18,22 @@ pub struct SavedMLP {
     layers: Vec<SavedLayer>,
 }
 
+#[derive(Deserialize)]
+struct OldSavedNeuron {
+    weights: Vec<f64>,
+    bias: f64,
+}
+
+#[derive(Deserialize)]
+struct OldSavedLayer {
+    neurons: Vec<OldSavedNeuron>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OldSavedMLP {
+    layers: Vec<OldSavedLayer>,
+}
+
 #[derive(Clone)]
 pub struct Neuron {
     weights: Vec<Tensor>,
@@ -28,7 +44,7 @@ pub struct Neuron {
 impl Neuron {
     pub fn new(num_inputs: usize, is_output: bool) -> Self {
         let mut rng = rand::rng();
-        let std_dev = (2.0 / (num_inputs as f64)).sqrt();
+        let std_dev = (2.0 / (num_inputs as f32)).sqrt();
         let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
 
         let weights: Vec<Tensor> = (0..num_inputs)
@@ -205,6 +221,37 @@ impl MLP {
                 .map(|(i, layer)| {
                     Layer::load(layer, i == last)
                 })
+                .collect(),
+        }
+    }
+}
+
+impl From<OldSavedNeuron> for SavedNeuron {
+    fn from(old: OldSavedNeuron) -> Self {
+        SavedNeuron {
+            weights: old.weights.into_iter()
+                .map(|x| x as f32)
+                .collect(),
+            bias: old.bias as f32,
+        }
+    }
+}
+
+impl From<OldSavedLayer> for SavedLayer {
+    fn from(old: OldSavedLayer) -> Self {
+        SavedLayer {
+            neurons: old.neurons.into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<OldSavedMLP> for SavedMLP {
+    fn from(old: OldSavedMLP) -> Self {
+        SavedMLP {
+            layers: old.layers.into_iter()
+                .map(Into::into)
                 .collect(),
         }
     }

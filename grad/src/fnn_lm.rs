@@ -1,18 +1,47 @@
 use std::collections::HashMap;
-use crate::neuron::{SavedMLP, MLP};
+use std::fs;
+use crate::neuron::{SavedMLP, MLP, OldSavedMLP};
 use crate::Tensor;
 use crate::trainer::Trainer;
-use crate::embeddings::{Embeddings, SavedEmbeddings};
+use crate::embeddings::{Embeddings, OldSavedEmbeddings, SavedEmbeddings};
 use serde::{Serialize, Deserialize};
 use crate::helper::Config;
+use rand::distr::Distribution;
+use rand::distr::weighted::WeightedIndex;
+use rand::rng;
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedLM {
+    description: String,
     mlp: SavedMLP,
     vocab: Vec<String>,
     context_len: u32,
     hidden_layers: Vec<usize>,
     embeddings: SavedEmbeddings,
+}
+
+#[derive(Deserialize)]
+pub struct SavedLMf64 {
+    mlp: OldSavedMLP,
+    vocab: Vec<String>,
+    context_len: u32,
+    hidden_layers: Vec<usize>,
+    embeddings: OldSavedEmbeddings,
+}
+
+#[derive(Deserialize)]
+pub struct SavedLMf64desc {
+    description: String,
+    mlp: OldSavedMLP,
+    vocab: Vec<String>,
+    context_len: u32,
+    hidden_layers: Vec<usize>,
+    embeddings: OldSavedEmbeddings,
+}
+
+pub enum LegacyLM {
+    NoDesc(SavedLMf64),
+    Desc(SavedLMf64desc),
 }
 
 pub fn tokenize(text: &str, vocab: &Vec<String>) -> Vec<usize> {
@@ -121,7 +150,7 @@ impl LM {
     }
 
     pub fn from_config(config: Config) -> Self {
-        let mut dim = vec![config.context_len as usize * config.emb_dim];
+        let mut dim = vec![config.context_len * config.emb_dim];
         dim.extend(config.hidden_dim.to_vec());
         dim.push(config.vocab.len());
         let embeddings =
@@ -130,7 +159,7 @@ impl LM {
                 config.emb_dim,
             );
 
-        let trainer = Trainer::new(config.lr / config.batch_size as f64, config.epochs, config.batch_size, config.max_batches_per_epoch);
+        let trainer = Trainer::new(config.lr / config.batch_size as f32, config.epochs, config.batch_size, config.max_batches_per_epoch);
         Self {
             trainer,
             mlp: MLP::new(dim[0], &dim[1..]),
@@ -146,8 +175,8 @@ impl LM {
         self.embeddings.encode(ids)
     }
 
-    pub fn train_options(&mut self, lr: f64, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) {
-        self.trainer.reinit_lr(lr/batch_size as f64);
+    pub fn train_options(&mut self, lr: f32, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) {
+        self.trainer.reinit_lr(lr/batch_size as f32);
         self.trainer.reinit_epochs(epochs);
         self.trainer.reinit_batch(batch_size);
         self.trainer.reinit_batch_per_epoch(max_batches_per_epoch);
@@ -172,43 +201,97 @@ impl LM {
         best
     }
 
-    pub fn generate_one(&self, context: String) -> &String {
-        let mut new_context: String = context.clone();
-        if context.len() > self.context_len as usize {
-            new_context = context[context.len() - self.context_len as usize..context.len()].parse().unwrap();
-        }
-        let ids = self.encode_nums(new_context);
+    pub fn generate_one(&self, context: String, temp: f32) -> String {
+        let mut ids = self.encode_nums(context);
 
+        if ids.len() > self.context_len as usize {
+            ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
+        } else if ids.len() < self.context_len as usize {
+            let num_to_add = self.context_len as usize - ids.len();
+            let mut new_ids = vec![1usize; num_to_add];
+            new_ids.extend(ids);
+            ids = new_ids;
+        }
         let input = self.encode_embeddings(&ids);
         let out: Vec<Tensor> = self.mlp.forward(&*input);
-        &self.vocab[self.max(out)]
-    }
 
-    pub fn generate_one_distribution(&self, context: String, top_k: usize) {
-        let mut new_context = context.clone();
-        if context.len() > self.context_len as usize {
-            new_context = context[context.len() - self.context_len as usize..]
-                .parse()
-                .unwrap();
+        let logits: Vec<f32> = out.iter()
+            .map(|x| x.data())
+            .collect();
+
+        if temp <= 0.0 {
+            let idx = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+
+            return self.vocab[idx].clone();
         }
-        let ids = self.encode_nums(new_context);
-        let input = self.encode_embeddings(&ids);
-        let out: Vec<Tensor> = self.mlp.forward(&*input);
-        let logits: Vec<f64> = out.iter().map(|x| x.data()).collect();
-        let max_logit = logits
+
+        // Apply temperature
+        let scaled_logits: Vec<f32> = logits
+            .iter()
+            .map(|&x| x / temp)
+            .collect();
+
+        // Stable softmax
+        let max_logit = scaled_logits
             .iter()
             .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let exp_logits: Vec<f64> = logits
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let exp_logits: Vec<f32> = scaled_logits
             .iter()
             .map(|&x| (x - max_logit).exp())
             .collect();
-        let sum_exp: f64 = exp_logits.iter().sum();
-        let probs: Vec<f64> = exp_logits
+
+        let sum_exp: f32 = exp_logits.iter().sum();
+
+        let probs: Vec<f32> = exp_logits
             .iter()
             .map(|&x| x / sum_exp)
             .collect();
-        let mut newest: Vec<(usize, f64)> = probs.into_iter().enumerate().collect();
+
+        // Sample
+        let dist = WeightedIndex::new(&probs).unwrap();
+        let mut rng = rng();
+
+        let idx = dist.sample(&mut rng);
+
+        self.vocab[idx].clone()
+    }
+
+    pub fn generate_one_distribution(&self, context: String, top_k: usize) {
+        let mut ids = self.encode_nums(context);
+        if ids.len() > self.context_len as usize {
+            ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
+        } else if ids.len() < self.context_len as usize {
+            let num_to_add = self.context_len as usize-ids.len();
+            let mut new_ids = vec![1usize; num_to_add];
+            new_ids.extend(ids);
+            ids = new_ids
+        }
+        println!("IDs: {:?}", ids);
+        println!("Split text: {:?}", ids.iter().map(|x1| {self.vocab[*x1].clone()}).collect::<Vec<_>>());
+        let input = self.encode_embeddings(&ids);
+        let out: Vec<Tensor> = self.mlp.forward(&*input);
+        let logits: Vec<f32> = out.iter().map(|x| x.data()).collect();
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exp_logits: Vec<f32> = logits
+            .iter()
+            .map(|&x| (x - max_logit).exp())
+            .collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+        let probs: Vec<f32> = exp_logits
+            .iter()
+            .map(|&x| x / sum_exp)
+            .collect();
+        let mut newest: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
         newest.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         for i in 0..top_k.min(newest.len()) {
@@ -217,13 +300,13 @@ impl LM {
         }
     }
 
-    pub fn generate(&self, context: String, gen_length: usize) -> String {
+    pub fn generate(&self, context: String, gen_length: usize, temp: f32) -> String {
         let mut context_ = context.clone();
         let mut output = "".to_string();
         for _ in 0..gen_length {
-            let generation = self.generate_one(context_.clone());
-            context_.push_str(generation);
-            output.push_str(generation);
+            let generation = self.generate_one(context_.clone(), temp);
+            context_.push_str(&*generation);
+            output.push_str(&*generation);
         }
         output
     }
@@ -296,8 +379,9 @@ impl LM {
         }
     }
 
-    pub fn to_saved(&self) -> SavedLM {
+    pub fn to_saved(&self, description: &str) -> SavedLM {
         SavedLM {
+            description: description.to_string(),
             mlp: self.mlp.save(),
             vocab: self.vocab.clone(),
             context_len: self.context_len,
@@ -307,6 +391,8 @@ impl LM {
     }
 
     pub fn from_saved(saved: SavedLM) -> Self {
+        println!("Description:\n{}", saved.description);
+        println!("Loading...");
         Self {
             trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
             mlp: MLP::load(&saved.mlp),
@@ -318,7 +404,93 @@ impl LM {
         }
     }
 
+    pub fn from_saved_legacy(saved: LegacyLM) -> Self {
+        match saved {
+            LegacyLM::NoDesc(x) => {
+                println!("Loading...");
+                Self {
+                    trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
+                    mlp: MLP::load(&x.mlp.into()),
+                    dataset: Vec::new(),
+                    vocab: x.vocab,
+                    context_len: x.context_len,
+                    hidden_layers: x.hidden_layers,
+                    embeddings: Embeddings::load(x.embeddings.into()),
+                }
+            }
+            LegacyLM::Desc(y) => {
+                println!("Description:\n{}", y.description);
+                println!("Loading...");
+                Self {
+                    trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
+                    mlp: MLP::load(&y.mlp.into()),
+                    dataset: Vec::new(),
+                    vocab: y.vocab,
+                    context_len: y.context_len,
+                    hidden_layers: y.hidden_layers,
+                    embeddings: Embeddings::load(y.embeddings.into()),
+                }
+            }
+        }
+    }
+
     pub fn embeds(&self) -> Embeddings {
         self.embeddings.clone()
+    }
+
+    pub fn save(&self, path: &str, description: &str) {
+        let saved = self.to_saved(description);
+        let bytes = bincode::serde::encode_to_vec(
+            &saved,
+            bincode::config::standard(),
+        ).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    
+    pub fn load(path: &str) -> (String, Self) {
+        let bytes = fs::read(path).unwrap();
+        let (model, _): (SavedLM, usize) =
+            bincode::serde::decode_from_slice(
+                &bytes,
+                bincode::config::standard(),
+            ).unwrap();
+        (model.description.clone(), LM::from_saved(model))
+    }
+
+    pub fn load_legacy(path: &str) -> Self {
+        let bytes = fs::read(path).unwrap();
+
+        let model = match bincode::serde::decode_from_slice::<SavedLMf64desc, _>(
+            &bytes,
+            bincode::config::standard(),
+        ) {
+            Ok((model, _)) => LegacyLM::Desc(model),
+
+            Err(_) => {
+                let (model, _) =
+                    bincode::serde::decode_from_slice::<SavedLMf64, _>(
+                        &bytes,
+                        bincode::config::standard(),
+                    )
+                        .unwrap();
+
+                LegacyLM::NoDesc(model)
+            }
+        };
+
+        LM::from_saved_legacy(model)
+    }
+}
+
+impl From<SavedLMf64> for SavedLM {
+    fn from(old: SavedLMf64) -> Self {
+        SavedLM {
+            description: String::new(),
+            mlp: old.mlp.into(),
+            vocab: old.vocab,
+            context_len: old.context_len,
+            hidden_layers: old.hidden_layers,
+            embeddings: old.embeddings.into(),
+        }
     }
 }

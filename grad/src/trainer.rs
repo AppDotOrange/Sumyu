@@ -13,18 +13,18 @@ pub enum TrainResult {
 }
 
 pub struct Trainer {
-    lr: f64,
+    lr: f32,
     epochs: usize,
     batch_size: usize,
     max_batches_per_epoch: usize,
 }
 
 impl Trainer {
-    pub fn new(lr: f64, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) -> Self {
+    pub fn new(lr: f32, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) -> Self {
         Trainer { lr, epochs, batch_size, max_batches_per_epoch }
     }
     
-    pub fn reinit_lr(&mut self, lr: f64) {
+    pub fn reinit_lr(&mut self, lr: f32) {
         self.lr = lr
     }
 
@@ -49,7 +49,7 @@ impl Trainer {
         let max_val = logits
             .iter()
             .map(|t| t.data())
-            .fold(f64::NEG_INFINITY, f64::max);
+            .fold(f32::NEG_INFINITY, f32::max);
 
         let mut exps = Vec::with_capacity(n);
         let mut sum_exp = 0.0;
@@ -61,7 +61,7 @@ impl Trainer {
             sum_exp += e;
         }
 
-        let probs: Vec<f64> = exps.iter().map(|&e| e / sum_exp).collect();
+        let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
 
         let loss = -probs[target].max(1e-7).ln();
 
@@ -77,14 +77,14 @@ impl Trainer {
 
     pub fn softmax_cross_entropy_old(
         logits: &[Tensor],
-        targets: &[f64],
+        targets: &[f32],
     ) -> Tensor {
         let n = logits.len();
 
         let max_val = logits
             .iter()
             .map(|t| t.data())
-            .fold(f64::NEG_INFINITY, f64::max);
+            .fold(f32::NEG_INFINITY, f32::max);
 
         let mut exps = Vec::with_capacity(n);
         let mut sum_exp = 0.0;
@@ -96,7 +96,7 @@ impl Trainer {
             sum_exp += e;
         }
 
-        let probs: Vec<f64> = exps.iter().map(|&e| e / sum_exp).collect();
+        let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
 
         let mut loss = 0.0;
         for (i, &target) in targets.iter().enumerate() {
@@ -119,7 +119,7 @@ impl Trainer {
         &mut self,
         update_frequency: usize,
         mlp: &mut MLP,
-        dataset: &mut [(Vec<Tensor>, Vec<f64>)],
+        dataset: &mut [(Vec<Tensor>, Vec<f32>)],
         params: Vec<Tensor>,
     ) -> TrainResult {
         let running = Arc::new(AtomicBool::new(true));
@@ -130,7 +130,7 @@ impl Trainer {
             r.store(false, Ordering::SeqCst);
         }).expect("Error setting Ctrl+C handler");
         let mut rng = rand::rng();
-        let data_len = dataset.len() as f64;
+        let data_len = dataset.len() as f32;
         if self.batch_size > data_len as usize {
             println!("Batch size too high! Quitting...");
             return TrainResult::Finished;
@@ -138,7 +138,7 @@ impl Trainer {
         if self.batch_size == 0 {
             self.batch_size = data_len as usize;
         }
-        let data: &mut [(Vec<Tensor>, Vec<f64>)] = dataset;
+        let data: &mut [(Vec<Tensor>, Vec<f32>)] = dataset;
         let parameter_boundary = crate::tape_len();
         for epoch in 1..self.epochs+1 {
             let now = Instant::now();
@@ -181,7 +181,7 @@ impl Trainer {
                     }
                 }
             }
-            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f64>();
+            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
 
             if epoch % update_frequency == 0 {
                 let elapsed = now.elapsed();
@@ -228,7 +228,7 @@ impl Trainer {
             r.store(false, Ordering::SeqCst);
         }).expect("Error setting Ctrl+C handler");
         let mut rng = rand::rng();
-        let data_len = (tokens.len() - context_len) as f64;
+        let data_len = (tokens.len() - context_len) as f32;
         if self.batch_size > data_len as usize {
             println!("Batch size too high! Quitting...");
             return TrainResult::Finished;
@@ -270,7 +270,7 @@ impl Trainer {
                 total_loss += loss.data();
                 loss.backward();
                 if count % self.batch_size == 0 {
-                    grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f64>();
+                    grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
                     crate::zero_grad_and_update(&*params, self.lr);
                     crate::clear_tape_after(parameter_boundary);
                     if !running.load(Ordering::SeqCst) {
@@ -282,11 +282,11 @@ impl Trainer {
                     }
                 }
             }
-            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f64>();
+            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
 
             if epoch % update_frequency == 0 {
                 let elapsed = now.elapsed();
-                let samples = count as f64;
+                let samples = count as f32;
                 println!(
                     "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Perplexity = {:.6} | Time elapsed: {:.2?} sec.",
                     epoch, total_loss/samples, grad_sum/samples, (total_loss/samples).exp(), elapsed,
