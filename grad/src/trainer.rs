@@ -237,6 +237,10 @@ impl Trainer {
             self.batch_size = data_len as usize;
         }
         let parameter_boundary = crate::tape_len();
+        let mut lr = self.lr;
+        let min_lr = 0.001;
+        let mut best_loss = f32::MAX;
+        let mut plateau_count = 0;
         for epoch in 1..self.epochs+1 {
             let now = Instant::now();
             let mut indices: Vec<usize> =
@@ -244,7 +248,7 @@ impl Trainer {
 
             indices.shuffle(&mut rng);
             // zero out gradients in between epoch runs
-            crate::zero_grad_and_update(&*params, self.lr);
+            crate::zero_grad_and_update(&*params, lr);
             let mut grad_sum = 0.0;
 
             // initialize loss
@@ -271,7 +275,7 @@ impl Trainer {
                 loss.backward();
                 if count % self.batch_size == 0 {
                     grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
-                    crate::zero_grad_and_update(&*params, self.lr);
+                    crate::zero_grad_and_update(&*params, lr);
                     crate::clear_tape_after(parameter_boundary);
                     if !running.load(Ordering::SeqCst) {
                         println!("Interrupted");
@@ -284,9 +288,24 @@ impl Trainer {
             }
             grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
 
+            let samples = count as f32;
+            let avg_loss = total_loss / samples;
+
+            if avg_loss < best_loss * 0.998 {
+                best_loss = avg_loss;
+                plateau_count = 0;
+            } else {
+                plateau_count += 1;
+            }
+
+            if plateau_count >= 10 {
+                lr = (lr * 0.8).max(min_lr);
+                plateau_count = 0;
+                println!("LR reduced to {}", lr);
+            }
+
             if epoch % update_frequency == 0 {
                 let elapsed = now.elapsed();
-                let samples = count as f32;
                 println!(
                     "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Perplexity = {:.6} | Time elapsed: {:.2?} sec.",
                     epoch, total_loss/samples, grad_sum/samples, (total_loss/samples).exp(), elapsed,
