@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use rand::prelude::SliceRandom;
 use crate::neuron::MLP;
 use crate::{Op, Tensor};
@@ -6,10 +6,19 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::sync::mpsc::Sender;
 
 pub enum TrainResult {
     Finished,
     Interrupted,
+}
+
+pub struct TrainInfo {
+    pub epoch: usize,
+    pub loss: f32,
+    pub perplexity: f32,
+    pub time: Duration,
+    pub done: bool,
 }
 
 pub struct Trainer {
@@ -160,7 +169,7 @@ impl Trainer {
                 let prediction = mlp.forward(input);
 
                 // calc loss
-                let loss: Tensor = Trainer::softmax_cross_entropy_old(&prediction, &target);
+                let loss: Tensor = Trainer::softmax_cross_entropy_old(&prediction, target);
                 total_loss += loss.data();
                 loss.backward();
                 if count % self.batch_size == 0 {
@@ -248,7 +257,7 @@ impl Trainer {
 
             indices.shuffle(&mut rng);
             // zero out gradients in between epoch runs
-            crate::zero_grad_and_update(&*params, lr);
+            crate::zero_grad_and_update(&params, lr);
             let mut grad_sum = 0.0;
 
             // initialize loss
@@ -275,7 +284,7 @@ impl Trainer {
                 loss.backward();
                 if count % self.batch_size == 0 {
                     grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
-                    crate::zero_grad_and_update(&*params, lr);
+                    crate::zero_grad_and_update(&params, lr);
                     crate::clear_tape_after(parameter_boundary);
                     if !running.load(Ordering::SeqCst) {
                         println!("Interrupted");
@@ -315,6 +324,130 @@ impl Trainer {
                     return TrainResult::Finished;
                 }
             }
+        }
+        TrainResult::Finished
+    }
+
+    pub fn train_lm_sumyu(
+        &mut self,
+        update_frequency: usize,
+        mlp: &mut MLP,
+        tokens: &[usize],
+        context_len: usize,
+        embeddings: &crate::embeddings::Embeddings,
+        params: Vec<Tensor>,
+        tx: Sender<TrainInfo>,
+    ) -> TrainResult {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+
+        ctrlc::set_handler(move || {
+            println!("\nStopping after current batch...");
+            r.store(false, Ordering::SeqCst);
+        }).expect("Error setting Ctrl+C handler");
+        let mut rng = rand::rng();
+        let data_len = (tokens.len() - context_len) as f32;
+        if self.batch_size > data_len as usize {
+            println!("Batch size too high! Quitting...");
+            return TrainResult::Finished;
+        }
+        if self.batch_size == 0 {
+            self.batch_size = data_len as usize;
+        }
+        let parameter_boundary = crate::tape_len();
+        let mut lr = self.lr;
+        let min_lr = 0.001;
+        let mut best_loss = f32::MAX;
+        let mut plateau_count = 0;
+        for epoch in 1..self.epochs+1 {
+            let now = Instant::now();
+            let mut indices: Vec<usize> =
+                (0..tokens.len() - context_len).collect();
+
+            indices.shuffle(&mut rng);
+            // zero out gradients in between epoch runs
+            crate::zero_grad_and_update(&params, lr);
+            let mut grad_sum = 0.0;
+
+            // initialize loss
+            let mut total_loss = 0.0;
+            let mut count = 0;
+
+            for &sample in &indices {
+
+                let ids =
+                    &tokens[sample..sample + context_len];
+
+                let target =
+                    tokens[sample + context_len];
+
+                let input =
+                    embeddings.encode(ids);
+                count += 1;
+                // call forward pass
+                let prediction = mlp.forward(&input);
+
+                // calc loss
+                let loss: Tensor = Trainer::softmax_cross_entropy(&prediction, target);
+                total_loss += loss.data();
+                loss.backward();
+                if count % self.batch_size == 0 {
+                    grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
+                    crate::zero_grad_and_update(&params, lr);
+                    crate::clear_tape_after(parameter_boundary);
+                    if !running.load(Ordering::SeqCst) {
+                        println!("Interrupted");
+                        return TrainResult::Interrupted;
+                    }
+                    if count/self.batch_size >= self.max_batches_per_epoch && self.max_batches_per_epoch != 0 {
+                        break;
+                    }
+                }
+            }
+            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
+
+            let samples = count as f32;
+            let avg_loss = total_loss / samples;
+
+            if avg_loss < best_loss * 0.998 {
+                best_loss = avg_loss;
+                plateau_count = 0;
+            } else {
+                plateau_count += 1;
+            }
+
+            if plateau_count >= 10 {
+                lr = (lr * 0.8).max(min_lr);
+                plateau_count = 0;
+                println!("LR reduced to {}", lr);
+            }
+            let elapsed = now.elapsed();
+            if epoch % update_frequency == 0 {
+                println!(
+                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Perplexity = {:.6} | Time elapsed: {:.2?} sec.",
+                    epoch, total_loss/samples, grad_sum/samples, (total_loss/samples).exp(), elapsed,
+                );
+            }
+            let info = TrainInfo {
+                epoch,
+                loss: total_loss/samples,
+                perplexity: (total_loss/samples).exp(),
+                time: elapsed,
+                done: false,
+            };
+            if grad_sum/samples <= 1e-9 {
+                println!("Early stopping, network will not learn anymore!");
+                let info = TrainInfo {
+                    epoch,
+                    loss: total_loss/samples,
+                    perplexity: (total_loss/samples).exp(),
+                    time: elapsed,
+                    done: true,
+                };
+                tx.send(info).unwrap();
+                return TrainResult::Finished;
+            }
+            tx.send(info).unwrap();
         }
         TrainResult::Finished
     }

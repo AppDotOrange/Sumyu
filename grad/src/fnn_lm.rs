@@ -44,7 +44,7 @@ pub enum LegacyLM {
     Desc(SavedLMf64desc),
 }
 
-pub fn tokenize(text: &str, vocab: &Vec<String>) -> Vec<usize> {
+pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
     struct Node {
         children: HashMap<char, usize>,
         id: Option<usize>,
@@ -183,7 +183,7 @@ impl LM {
     }
 
     pub fn encode_nums(&self, string: String) -> Vec<usize> {
-        tokenize(&*string, &self.vocab)
+        tokenize(&string, &self.vocab)
     }
 
     pub fn max(&self, vec: Vec<Tensor>) -> usize {
@@ -213,7 +213,7 @@ impl LM {
             ids = new_ids;
         }
         let input = self.encode_embeddings(&ids);
-        let out: Vec<Tensor> = self.mlp.forward(&*input);
+        let out: Vec<Tensor> = self.mlp.forward(&input);
 
         let logits: Vec<f32> = out.iter()
             .map(|x| x.data())
@@ -276,7 +276,7 @@ impl LM {
         println!("IDs: {:?}", ids);
         println!("Split text: {:?}", ids.iter().map(|x1| {self.vocab[*x1].clone()}).collect::<Vec<_>>());
         let input = self.encode_embeddings(&ids);
-        let out: Vec<Tensor> = self.mlp.forward(&*input);
+        let out: Vec<Tensor> = self.mlp.forward(&input);
         let logits: Vec<f32> = out.iter().map(|x| x.data()).collect();
         let max_logit = logits
             .iter()
@@ -294,9 +294,9 @@ impl LM {
         let mut newest: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
         newest.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        for i in 0..top_k.min(newest.len()) {
-            let (idx, prob) = newest[i];
-            println!("{}- {:.2}%", self.vocab[idx], prob * 100.0);
+        for i in newest.iter().take(top_k.min(newest.len())) {
+            let (idx, prob) = i;
+            println!("{}- {:.2}%", self.vocab[*idx], prob * 100.0);
         }
     }
 
@@ -305,8 +305,8 @@ impl LM {
         let mut output = "".to_string();
         for _ in 0..gen_length {
             let generation = self.generate_one(context_.clone(), temp);
-            context_.push_str(&*generation);
-            output.push_str(&*generation);
+            context_.push_str(&generation);
+            output.push_str(&generation);
         }
         output
     }

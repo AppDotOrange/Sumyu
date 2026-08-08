@@ -277,6 +277,7 @@ pub struct Config<'a> {
 }
 
 impl<'a> Config<'a> {
+    #[allow(clippy::too_many_arguments)]
      pub fn new(lr: f32,
                 batch_size: usize,
                 max_batches_per_epoch: usize,

@@ -17,7 +17,7 @@ impl ChatFNN {
         loop {
             let mut user = "".to_string();
             io::stdin().read_line(&mut user).unwrap();
-            context.push_str(&*user);
+            context.push_str(&user);
             context.push_str("<EOT><BOT>");
             let mut bot = &*self.lm.generate(context.clone(), max_gen_length, temperature);
             bot = bot.split("<EOT>").collect::<Vec<&str>>()[0];

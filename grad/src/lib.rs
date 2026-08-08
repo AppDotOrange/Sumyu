@@ -98,9 +98,9 @@ pub fn tape_len() -> usize {
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
 
-    static TOPO_VISITED: RefCell<Vec<bool>> = RefCell::new(Vec::new());
-    static TOPO_STACK1: RefCell<Vec<TensorHandle>> = RefCell::new(Vec::new());
-    static TOPO_STACK2: RefCell<Vec<TensorHandle>> = RefCell::new(Vec::new());
+    static TOPO_VISITED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static TOPO_STACK1: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
+    static TOPO_STACK2: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn zero_grad_and_update(params: &[Tensor], lr: f32) {
@@ -180,9 +180,7 @@ impl Tensor {
         let b = other.data();
         let data = a + b;
 
-        let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle);
-        prev.push(other.handle);
+        let prev = vec![self.handle, other.handle];
 
         Tensor::from_op(data, prev, Op::Add)
     }
@@ -192,9 +190,7 @@ impl Tensor {
         let b = other.data();
         let data = a - b;
 
-        let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle);
-        prev.push(other.handle);
+        let prev = vec![self.handle, other.handle];
 
         Tensor::from_op(data, prev, Op::Sub)
     }
@@ -205,9 +201,7 @@ impl Tensor {
 
         let data = left * right;
 
-        let mut prev = Vec::with_capacity(2);
-        prev.push(self.handle);
-        prev.push(other.handle);
+        let prev = vec![self.handle, other.handle];
 
         Tensor::from_op(
             data,
@@ -485,10 +479,10 @@ impl Tensor {
                     Op::SoftmaxCrossEntropy { probs, target } => {
                         let prev_len = tape.nodes[id].prev.len();
 
-                        for i in 0..prev_len {
+                        for (i, item) in probs.iter().enumerate().take(prev_len) {
                             let parent = tape.nodes[id].prev[i];
 
-                            let mut local_grad = probs[i];
+                            let mut local_grad = *item;
 
                             if i == target {
                                 local_grad -= 1.0;
@@ -535,8 +529,6 @@ impl Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Tensor {
-        Tensor {
-            handle: self.handle,
-        }
+        *self
     }
 }

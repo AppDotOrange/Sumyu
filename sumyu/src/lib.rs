@@ -18,14 +18,30 @@ pub struct Theme {
 }
 
 pub struct Terminal {
-    colorblind: bool,
+    theme: Theme,
     screen: Screen,
 }
 
 impl Terminal {
     pub fn new(colorblind: bool) -> Self {
+        let theme;
+        if colorblind {
+            theme = Theme {
+                title: r"\e[0;36m",
+                success: r"✓\e[0;32m",
+                warning: r"⚠\e[0;33m",
+                error: r"✗\e[0;31m",
+            }
+        } else {
+            theme = Theme {
+                title: r"\e[0;36m",
+                success: r"\e[0;32m",
+                warning: r"\e[0;33m",
+                error: r"\e[0;31m",
+            }
+        }
         Terminal {
-            colorblind,
+            theme,
             screen: Screen::Start,
         }
     }
@@ -43,9 +59,25 @@ impl Terminal {
         self.screen = screen;
     }
 
+    pub fn t(&self) -> &str {
+        self.theme.title
+    }
+
     pub fn draw(&self) {
+        self.clear();
         match self.screen {
-            _ => todo!(),
+            Screen::Start => {
+                println!("{}SUMYU----------------|", self.t());
+                println!("|Welcome!            |");
+                println!("|Instructions below. |");
+                println!("|>                   |");
+                println!("|____________________|");
+                println!("Type in:");
+                println!("1 for selecting models,");
+                println!("2 for training models,");
+                println!("3 for ")
+            },
+            _ => {}
         }
     }
 }

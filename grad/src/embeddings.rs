@@ -108,8 +108,8 @@ impl Embeddings {
 
         let mut norms = vec![0.0; n];
 
-        for i in 0..n {
-            norms[i] = self.vectors[i]
+        for (norm, vector) in norms.iter_mut().zip(&self.vectors).take(n) {
+            *norm = vector
                 .iter()
                 .map(|t| {
                     let x = t.data();

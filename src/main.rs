@@ -26,7 +26,7 @@ fn main() {
         //------------------------------------------------------------------------------------------
         let mut lm = LM::new(context_len, vocab, hidden_dim, emb_dim);
         lm.params();
-        lm.load_corpus(&*text);
+        lm.load_corpus(&text);
         lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
         lm.train();
     } else if test == 0 {
@@ -58,13 +58,13 @@ fn main() {
             let mut lm = LM::from_saved(model);
             println!("Loaded!");
             lm.params();
-            lm.load_corpus(&*text);
+            lm.load_corpus(&text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
             lm.train();
         } else {
             let mut lm = LM::new(context_len, vocab, hidden_dim, emb_dim);
             lm.params();
-            lm.load_corpus(&*text);
+            lm.load_corpus(&text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
             lm.train();
         let saved = lm.to_saved("");
@@ -75,9 +75,9 @@ fn main() {
         fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
-        println!("{:?}", helper::make_vocab(&*text, 250))
+        println!("{:?}", helper::make_vocab(&text, 250))
     } else if test == 2 {
-        let bytes = fs::read("Tests/Poke_V1_39.sumyu").unwrap();
+        let bytes = fs::read("Tests/Poke_V1_134.sumyu").unwrap();
         //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
         //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
         let (model, _): (SavedLM, usize) =
@@ -107,11 +107,11 @@ fn main() {
         lm.train_options(0.01, 100_000, 32, 0);
         //*/
         lm.params();
-        lm.load_corpus(&*text);
+        lm.load_corpus(&text);
         lm.train();
         lm.save(
             "Rustception_optimized.sumyu",
-            &*description,
+            &description,
         );
     } else if test == 4 {
         println!("Updating save format to .sumyu quality...");
@@ -121,7 +121,7 @@ fn main() {
         io::stdin().read_line(&mut desc).expect("Failed to read line!");
         let desc = desc.trim().to_string();
         let lm = LM::load_legacy("Poke_V1.sumyu");
-        lm.save("Poke_V1_working.sumyu", &*desc);
+        lm.save("Poke_V1_working.sumyu", &desc);
     } else if test == 5 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -135,15 +135,15 @@ fn main() {
         //------------------------------------------------------------------------------------------
         //let mut lm = LM::from_config(config);
         //*
-        let (description, mut lm) = LM::load("Tests/Poke_V1_39.sumyu");
-        lm.train_options(0.05, 100_000, 32, 0);
+        let (description, mut lm) = LM::load("Tests/Poke_V1_134.sumyu");
+        lm.train_options(0.001, 100_000, 32, 0);
         //*/
         lm.params();
-        lm.load_corpus(&*text);
+        lm.load_corpus(&text);
         lm.train();
         lm.save(
             "Poke_V1.sumyu",
-            &*description,
+            &description,
         );
     }
 }
