@@ -123,13 +123,20 @@ impl Layer {
     }
 
     pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let mut out = Vec::with_capacity(self.neurons.len());
+        let mut weights = Vec::new();
+        let mut biases = Vec::with_capacity(self.neurons.len());
 
         for neuron in &self.neurons {
-            out.push(neuron.fwd(inputs));
+            weights.extend_from_slice(&neuron.weights);
+            biases.push(neuron.bias);
         }
 
-        out
+        Tensor::fused_layer(
+            &weights,
+            inputs,
+            &biases,
+            !self.neurons[0].is_output,
+        )
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -254,5 +261,296 @@ impl From<OldSavedMLP> for SavedMLP {
                 .map(Into::into)
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clear_tape_after;
+
+    #[test]
+    fn fused_layer_matches_individual_neurons() {
+        let boundary = crate::tape_len();
+
+        let inputs = vec![
+            Tensor::new(0.5),
+            Tensor::new(-0.2),
+            Tensor::new(0.8),
+        ];
+
+        let layer = Layer::new(3, 2, false);
+
+        // Old implementation: each neuron separately.
+        let old_outputs: Vec<Tensor> = layer
+            .neurons
+            .iter()
+            .map(|n| n.fwd(&inputs))
+            .collect();
+
+        // Fused implementation.
+        let mut weights = Vec::new();
+        let mut biases = Vec::new();
+
+        for neuron in &layer.neurons {
+            weights.extend_from_slice(&neuron.weights);
+            biases.push(neuron.bias);
+        }
+
+        let fused_outputs =
+            Tensor::fused_layer(
+                &weights,
+                &inputs,
+                &biases,
+                true,
+            );
+
+        for (old, fused) in
+            old_outputs.iter().zip(fused_outputs.iter())
+        {
+            let diff = (old.data() - fused.data()).abs();
+
+            assert!(
+                diff < 1e-6,
+                "Output mismatch: old={}, fused={}, diff={}",
+                old.data(),
+                fused.data(),
+                diff
+            );
+        }
+
+        clear_tape_after(boundary);
+    }
+
+    #[test]
+    fn fused_layer_gradients_match_individual_neurons() {
+        let boundary = crate::tape_len();
+
+        // Use fixed values so both implementations receive
+        // exactly the same parameters and inputs.
+        let input_values = [0.5_f32, -0.2, 0.8];
+
+        let layer = Layer::new(3, 2, false);
+
+        let weight_values: Vec<f32> = layer
+            .neurons
+            .iter()
+            .flat_map(|n| n.weights.iter().map(|w| w.data()))
+            .collect();
+
+        let bias_values: Vec<f32> = layer
+            .neurons
+            .iter()
+            .map(|n| n.bias.data())
+            .collect();
+
+        // ============================================================
+        // OLD IMPLEMENTATION
+        // ============================================================
+
+        let old_inputs: Vec<Tensor> = input_values
+            .iter()
+            .map(|&x| Tensor::new(x))
+            .collect();
+
+        let old_layer = Layer {
+            neurons: layer
+                .neurons
+                .iter()
+                .enumerate()
+                .map(|(i, neuron)| {
+                    Neuron {
+                        weights: neuron
+                            .weights
+                            .iter()
+                            .map(|w| Tensor::new(w.data()))
+                            .collect(),
+                        bias: Tensor::new(bias_values[i]),
+                        is_output: neuron.is_output,
+                    }
+                })
+                .collect(),
+        };
+
+        let old_outputs: Vec<Tensor> = old_layer
+            .neurons
+            .iter()
+            .map(|n| n.fwd(&old_inputs))
+            .collect();
+
+        let old_loss = old_outputs[0]
+            .add(&old_outputs[1]);
+
+        old_loss.backward();
+
+        let old_input_grads: Vec<f32> = old_inputs
+            .iter()
+            .map(|x| x.grad())
+            .collect();
+
+        let old_weight_grads: Vec<f32> = old_layer
+            .neurons
+            .iter()
+            .flat_map(|n| n.weights.iter().map(|w| w.grad()))
+            .collect();
+
+        let old_bias_grads: Vec<f32> = old_layer
+            .neurons
+            .iter()
+            .map(|n| n.bias.grad())
+            .collect();
+
+        let old_outputs_data: Vec<f32> = old_outputs
+            .iter()
+            .map(|x| x.data())
+            .collect();
+
+        // ============================================================
+        // Clear the OLD graph.
+        // Everything above this point has been copied into plain f32s.
+        // ============================================================
+
+        crate::clear_tape_after(boundary);
+
+        // ============================================================
+        // FUSED IMPLEMENTATION
+        // ============================================================
+
+        let fused_inputs: Vec<Tensor> = input_values
+            .iter()
+            .map(|&x| Tensor::new(x))
+            .collect();
+
+        let fused_weights: Vec<Tensor> = weight_values
+            .iter()
+            .map(|&x| Tensor::new(x))
+            .collect();
+
+        let fused_biases: Vec<Tensor> = bias_values
+            .iter()
+            .map(|&x| Tensor::new(x))
+            .collect();
+
+        let fused_outputs = Tensor::fused_layer(
+            &fused_weights,
+            &fused_inputs,
+            &fused_biases,
+            true,
+        );
+
+        let fused_loss = fused_outputs[0]
+            .add(&fused_outputs[1]);
+
+        fused_loss.backward();
+
+        println!(
+            "FUSED outputs: {:?}",
+            fused_outputs
+                .iter()
+                .map(|x| x.data())
+                .collect::<Vec<_>>()
+        );
+
+        println!(
+            "FUSED output grads: {:?}",
+            fused_outputs
+                .iter()
+                .map(|x| x.grad())
+                .collect::<Vec<_>>()
+        );
+
+        let fused_input_grads: Vec<f32> = fused_inputs
+            .iter()
+            .map(|x| x.grad())
+            .collect();
+
+        let fused_weight_grads: Vec<f32> = fused_weights
+            .iter()
+            .map(|x| x.grad())
+            .collect();
+
+        let fused_bias_grads: Vec<f32> = fused_biases
+            .iter()
+            .map(|x| x.grad())
+            .collect();
+
+        let fused_outputs_data: Vec<f32> = fused_outputs
+            .iter()
+            .map(|x| x.data())
+            .collect();
+
+        // ============================================================
+        // COMPARE OUTPUTS
+        // ============================================================
+
+        for (i, (old, fused)) in old_outputs_data
+            .iter()
+            .zip(fused_outputs_data.iter())
+            .enumerate()
+        {
+            assert!(
+                (old - fused).abs() < 1e-6,
+                "Output mismatch at {}: old={}, fused={}",
+                i,
+                old,
+                fused
+            );
+        }
+
+        // ============================================================
+        // COMPARE INPUT GRADIENTS
+        // ============================================================
+
+        for (i, (old, fused)) in old_input_grads
+            .iter()
+            .zip(fused_input_grads.iter())
+            .enumerate()
+        {
+            assert!(
+                (old - fused).abs() < 1e-6,
+                "Input gradient mismatch at {}: old={}, fused={}",
+                i,
+                old,
+                fused
+            );
+        }
+
+        // ============================================================
+        // COMPARE WEIGHT GRADIENTS
+        // ============================================================
+
+        for (i, (old, fused)) in old_weight_grads
+            .iter()
+            .zip(fused_weight_grads.iter())
+            .enumerate()
+        {
+            assert!(
+                (old - fused).abs() < 1e-6,
+                "Weight gradient mismatch at {}: old={}, fused={}",
+                i,
+                old,
+                fused
+            );
+        }
+
+        // ============================================================
+        // COMPARE BIAS GRADIENTS
+        // ============================================================
+
+        for (i, (old, fused)) in old_bias_grads
+            .iter()
+            .zip(fused_bias_grads.iter())
+            .enumerate()
+        {
+            assert!(
+                (old - fused).abs() < 1e-6,
+                "Bias gradient mismatch at {}: old={}, fused={}",
+                i,
+                old,
+                fused
+            );
+        }
+
+        crate::clear_tape_after(boundary);
     }
 }

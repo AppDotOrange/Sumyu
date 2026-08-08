@@ -6,7 +6,7 @@ use std::io::Write;
 fn main() {
     //let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
     let text = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    let test = 5;
+    let test = -1;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG

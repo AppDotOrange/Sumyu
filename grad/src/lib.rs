@@ -44,10 +44,32 @@ struct TensorData {
     op: Op,
 }
 
-type TensorHandle = usize;
+#[derive(Copy, Clone, Debug)]
+struct TensorHandle {
+    node: usize,
+    index: usize,
+}
+
+struct FusedLayerData {
+    outputs: Vec<f32>,
+    grads: Vec<f32>,
+
+    inputs: Vec<TensorHandle>,
+    weights: Vec<TensorHandle>,
+    biases: Vec<TensorHandle>,
+
+    input_size: usize,
+    output_size: usize,
+    relu: bool,
+}
+
+enum Node {
+    Scalar(TensorData),
+    FusedLayer(FusedLayerData),
+}
 
 struct Tape {
-    nodes: Vec<TensorData>,
+    nodes: Vec<Node>,
 }
 
 impl Tape {
@@ -65,15 +87,27 @@ impl Tape {
     ) -> TensorHandle {
         let id = self.nodes.len();
 
-        self.nodes.push(
+        self.nodes.push(Node::Scalar(
             TensorData {
                 data,
                 grad: 0.0,
                 prev,
                 op,
             }
-        );
+        ));
 
+        TensorHandle {
+            node: id,
+            index: 0,
+        }
+    }
+
+    fn alloc_fused_layer(
+        &mut self,
+        data: FusedLayerData,
+    ) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(Node::FusedLayer(data));
         id
     }
 
@@ -106,11 +140,14 @@ thread_local! {
 pub fn zero_grad_and_update(params: &[Tensor], lr: f32) {
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
-
         for p in params {
-            let node = &mut tape.nodes[p.handle];
-            node.data -= lr * node.grad;
-            tape.nodes[p.handle].grad = 0.0;
+            match &mut tape.nodes[p.handle.node] {
+                Node::Scalar(node) => {
+                    node.data -= lr * node.grad;
+                    node.grad = 0.0;
+                }
+                Node::FusedLayer(_) => panic!("Parameter cannot be a fused-layer output.")
+            }
         }
     });
 }
@@ -118,6 +155,42 @@ pub fn zero_grad_and_update(params: &[Tensor], lr: f32) {
 #[derive(Copy)]
 pub struct Tensor {
     handle: TensorHandle,
+}
+
+fn node_data(
+    tape: &Tape,
+    handle: TensorHandle,
+) -> f32 {
+    match &tape.nodes[handle.node] {
+        Node::Scalar(node) => node.data,
+        Node::FusedLayer(node) => node.outputs[handle.index],
+    }
+}
+
+fn node_grad(
+    tape: &Tape,
+    handle: TensorHandle,
+) -> f32 {
+    match &tape.nodes[handle.node] {
+        Node::Scalar(node) => node.grad,
+        Node::FusedLayer(node) => node.grads[handle.index],
+    }
+}
+
+fn add_node_grad(
+    tape: &mut Tape,
+    handle: TensorHandle,
+    grad: f32,
+) {
+    match &mut tape.nodes[handle.node] {
+        Node::Scalar(node) => {
+            node.grad += grad;
+        }
+
+        Node::FusedLayer(node) => {
+            node.grads[handle.index] += grad;
+        }
+    }
 }
 
 impl Tensor {
@@ -153,25 +226,28 @@ impl Tensor {
 
     pub fn data(&self) -> f32 {
         TAPE.with(|t| {
-            t.borrow()
-                .nodes[self.handle]
-                .data
+            match &t.borrow().nodes[self.handle.node] {
+                Node::Scalar(node) => node.data,
+                Node::FusedLayer(node) => node.outputs[self.handle.index],
+            }
         })
     }
 
     pub fn grad(&self) -> f32 {
         TAPE.with(|t| {
-            t.borrow()
-                .nodes[self.handle]
-                .grad
+            match &t.borrow().nodes[self.handle.node] {
+                Node::Scalar(node) => node.grad,
+                Node::FusedLayer(node) => node.grads[self.handle.index],
+            }
         })
     }
 
     pub fn set_grad(&self, val: f32) {
         TAPE.with(|t| {
-            t.borrow_mut()
-                .nodes[self.handle]
-                .grad = val;
+            match &mut t.borrow_mut().nodes[self.handle.node] {
+                Node::Scalar(node) => node.grad = val,
+                Node::FusedLayer(node) => node.grads[self.handle.index] = val
+            }
         });
     }
 
@@ -312,7 +388,79 @@ impl Tensor {
         )
     }
 
-    fn build_reverse_top_order(&self) -> Vec<Tensor> {
+    pub fn fused_layer(
+        weights: &[Tensor],
+        inputs: &[Tensor],
+        biases: &[Tensor],
+        relu: bool,
+    ) -> Vec<Tensor> {
+        let input_size = inputs.len();
+        let output_size = biases.len();
+
+        assert_eq!(
+            weights.len(),
+            input_size * output_size,
+            "Fused layer weight count does not match dimensions"
+        );
+
+        let mut outputs = Vec::with_capacity(output_size);
+
+        for o in 0..output_size {
+            let mut sum = biases[o].data();
+
+            let weight_base = o * input_size;
+
+            for i in 0..input_size {
+                sum += weights[weight_base + i].data()
+                    * inputs[i].data();
+            }
+
+            let output = if relu {
+                if sum > 0.0 {
+                    sum
+                } else {
+                    sum * 0.01
+                }
+            } else {
+                sum
+            };
+
+            outputs.push(output);
+        }
+
+        let node = TAPE.with(|t| {
+            let mut tape = t.borrow_mut();
+
+            tape.alloc_fused_layer(
+                FusedLayerData {
+                    outputs,
+                    grads: vec![0.0; output_size],
+                    inputs: inputs.iter()
+                        .map(|x| x.handle)
+                        .collect(),
+                    weights: weights.iter()
+                        .map(|w| w.handle)
+                        .collect(),
+                    biases: biases.iter()
+                        .map(|b| b.handle)
+                        .collect(),
+                    input_size,
+                    output_size,
+                    relu,
+                }
+            )
+        });
+        (0..output_size)
+            .map(|index| Tensor {
+                handle: TensorHandle {
+                    node,
+                    index,
+                },
+            })
+            .collect()
+    }
+
+    fn build_reverse_top_order(&self) -> Vec<TensorHandle> {
         TAPE.with(|t| {
             let tape = t.borrow();
             let tape_size = tape.nodes.len();
@@ -320,11 +468,8 @@ impl Tensor {
             TOPO_VISITED.with(|v| {
                 let mut visited = v.borrow_mut();
 
-                if visited.len() != tape_size {
-                    visited.resize(tape_size, false);
-                } else {
-                    visited.fill(false);
-                }
+                visited.resize(tape_size, false);
+                visited.fill(false);
             });
 
             TOPO_STACK1.with(|s1| {
@@ -339,22 +484,40 @@ impl Tensor {
 
                         stack1.push(self.handle);
 
-                        while let Some(id) = stack1.pop() {
+                        while let Some(handle) = stack1.pop() {
+                            let id = handle.node;
+
                             if visited[id] {
                                 continue;
                             }
 
                             visited[id] = true;
-                            stack2.push(id);
 
-                            for &parent in tape.nodes[id].prev.iter().rev() {
-                                stack1.push(parent);
+                            match &tape.nodes[id] {
+                                Node::Scalar(node) => {
+                                    stack1.extend(
+                                        node.prev.iter().rev().copied()
+                                    );
+                                }
+
+                                Node::FusedLayer(node) => {
+                                    stack1.extend(
+                                        node.inputs.iter().rev().copied()
+                                    );
+
+                                    stack1.extend(
+                                        node.weights.iter().rev().copied()
+                                    );
+
+                                    stack1.extend(
+                                        node.biases.iter().rev().copied()
+                                    );
+                                }
                             }
+
+                            stack2.push(handle);
                         }
-                        stack2
-                            .iter()
-                            .map(|&handle| Tensor { handle })
-                            .collect()
+                        stack2.clone()
                     })
                 })
             })
@@ -367,128 +530,273 @@ impl Tensor {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
 
-            tape.nodes[self.handle].grad = 1.0;
+            // Seed the output gradient.
+            match &mut tape.nodes[self.handle.node] {
+                Node::Scalar(node) => {
+                    node.grad = 1.0;
+                }
 
-            for tensor in topo.iter() {
-                let id = tensor.handle;
+                Node::FusedLayer(node) => {
+                    node.grads[self.handle.index] = 1.0;
+                }
+            }
 
-                let grad = tape.nodes[id].grad;
+            for &handle in topo.iter() {
+                let id = handle.node;
 
-                let op = tape.nodes[id].op.clone();
+                let grad = match &tape.nodes[id] {
+                    Node::Scalar(node) => node.grad,
+                    Node::FusedLayer(node) => node.grads[handle.index],
+                };
 
-                match op {
-                    Op::Leaf => {}
+                match &tape.nodes[id] {
+                    Node::Scalar(node) => {
+                        let prev = node.prev.clone();
+                        let op = node.op.clone();
 
-                    Op::Add => {
-                        let a = tape.nodes[id].prev[0];
-                        let b = tape.nodes[id].prev[1];
+                        match op {
+                            Op::Leaf => {}
 
-                        tape.nodes[a].grad += grad;
-                        tape.nodes[b].grad += grad;
-                    }
+                            Op::Add => {
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[0],
+                                    grad,
+                                );
 
-                    Op::Sub => {
-                        let a = tape.nodes[id].prev[0];
-                        let b = tape.nodes[id].prev[1];
-
-                        tape.nodes[a].grad += grad;
-                        tape.nodes[b].grad -= grad;
-                    }
-
-                    Op::Mul => {
-                        let a = tape.nodes[id].prev[0];
-                        let b = tape.nodes[id].prev[1];
-
-                        let a_data = tape.nodes[a].data;
-                        let b_data = tape.nodes[b].data;
-
-                        tape.nodes[a].grad += grad * b_data;
-                        tape.nodes[b].grad += grad * a_data;
-                    }
-
-                    Op::Fma { weight, input } => {
-                        let sum = tape.nodes[id].prev[0];
-                        let w = tape.nodes[id].prev[1];
-                        let x = tape.nodes[id].prev[2];
-
-                        tape.nodes[sum].grad += grad;
-                        tape.nodes[w].grad += grad * input;
-                        tape.nodes[x].grad += grad * weight;
-                    }
-
-                    Op::Linear {
-                        input_size,
-                        relu,
-                        pre_activation,
-                    } => {
-                        let mut grad_out = grad;
-
-                        if relu && pre_activation <= 0.0 {
-                            grad_out *= 0.01;
-                        }
-
-                        let base = input_size;
-
-                        for i in 0..base {
-                            let w_id = tape.nodes[id].prev[i];
-                            let x_id = tape.nodes[id].prev[base + i];
-
-                            let w = tape.nodes[w_id].data;
-                            let x = tape.nodes[x_id].data;
-
-                            tape.nodes[w_id].grad += grad_out * x;
-                            tape.nodes[x_id].grad += grad_out * w;
-                        }
-
-                        let bias = tape.nodes[id].prev[base * 2];
-                        tape.nodes[bias].grad += grad_out;
-                    }
-
-                    Op::Pow(n) => {
-                        let x_id = tape.nodes[id].prev[0];
-                        let x = tape.nodes[x_id].data;
-
-                        tape.nodes[x_id].grad += grad * n * x.powf(n - 1.0);
-                    }
-
-                    Op::Sigmoid => {
-                        let x_id = tape.nodes[id].prev[0];
-                        let y = tape.nodes[id].data;
-
-                        tape.nodes[x_id].grad += grad * y * (1.0 - y);
-                    }
-
-                    Op::Relu => {
-                        let x_id = tape.nodes[id].prev[0];
-                        let x = tape.nodes[x_id].data;
-
-                        let local_grad = if x > 0.0 { 1.0 } else { 0.01 };
-
-                        tape.nodes[x_id].grad += grad * local_grad;
-                    }
-
-                    Op::SoftmaxCrossEntropyOld { probs, targets } => {
-                        let prev_len = tape.nodes[id].prev.len();
-
-                        for i in 0..prev_len {
-                            let parent = tape.nodes[id].prev[i];
-                            tape.nodes[parent].grad += grad * (probs[i] - targets[i]);
-                        }
-                    }
-
-                    Op::SoftmaxCrossEntropy { probs, target } => {
-                        let prev_len = tape.nodes[id].prev.len();
-
-                        for (i, item) in probs.iter().enumerate().take(prev_len) {
-                            let parent = tape.nodes[id].prev[i];
-
-                            let mut local_grad = *item;
-
-                            if i == target {
-                                local_grad -= 1.0;
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[1],
+                                    grad,
+                                );
                             }
 
-                            tape.nodes[parent].grad += grad * local_grad;
+                            Op::Sub => {
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[0],
+                                    grad,
+                                );
+
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[1],
+                                    -grad,
+                                );
+                            }
+
+                            Op::Mul => {
+                                let a = prev[0];
+                                let b = prev[1];
+
+                                let a_data = node_data(&tape, a);
+                                let b_data = node_data(&tape, b);
+
+                                add_node_grad(
+                                    &mut tape,
+                                    a,
+                                    grad * b_data,
+                                );
+
+                                add_node_grad(
+                                    &mut tape,
+                                    b,
+                                    grad * a_data,
+                                );
+                            }
+
+                            Op::Fma { weight, input } => {
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[0],
+                                    grad,
+                                );
+
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[1],
+                                    grad * input,
+                                );
+
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[2],
+                                    grad * weight,
+                                );
+                            }
+
+                            Op::Linear {
+                                input_size,
+                                relu,
+                                pre_activation,
+                            } => {
+                                let mut grad_out = grad;
+
+                                if relu && pre_activation <= 0.0 {
+                                    grad_out *= 0.01;
+                                }
+
+                                let base = input_size;
+
+                                for i in 0..base {
+                                    let w_id = prev[i];
+                                    let x_id = prev[base + i];
+
+                                    let w = node_data(&tape, w_id);
+                                    let x = node_data(&tape, x_id);
+
+                                    add_node_grad(
+                                        &mut tape,
+                                        w_id,
+                                        grad_out * x,
+                                    );
+
+                                    add_node_grad(
+                                        &mut tape,
+                                        x_id,
+                                        grad_out * w,
+                                    );
+                                }
+
+                                let bias = prev[base * 2];
+
+                                add_node_grad(
+                                    &mut tape,
+                                    bias,
+                                    grad_out,
+                                );
+                            }
+
+                            Op::Pow(n) => {
+                                let x_id = prev[0];
+                                let x = node_data(&tape, x_id);
+
+                                add_node_grad(
+                                    &mut tape,
+                                    x_id,
+                                    grad * n * x.powf(n - 1.0),
+                                );
+                            }
+
+                            Op::Sigmoid => {
+                                let x_id = prev[0];
+                                let y = node_data(&tape, handle);
+
+                                add_node_grad(
+                                    &mut tape,
+                                    x_id,
+                                    grad * y * (1.0 - y),
+                                );
+                            }
+
+                            Op::Relu => {
+                                let x_id = prev[0];
+                                let x = node_data(&tape, x_id);
+
+                                let local_grad = if x > 0.0 {
+                                    1.0
+                                } else {
+                                    0.01
+                                };
+
+                                add_node_grad(
+                                    &mut tape,
+                                    x_id,
+                                    grad * local_grad,
+                                );
+                            }
+
+                            Op::SoftmaxCrossEntropyOld {
+                                probs,
+                                targets,
+                            } => {
+                                for i in 0..prev.len() {
+                                    let local_grad =
+                                        probs[i] - targets[i];
+
+                                    add_node_grad(
+                                        &mut tape,
+                                        prev[i],
+                                        grad * local_grad,
+                                    );
+                                }
+                            }
+
+                            Op::SoftmaxCrossEntropy {
+                                probs,
+                                target,
+                            } => {
+                                for (i, &prob) in probs.iter()
+                                    .enumerate()
+                                    .take(prev.len())
+                                {
+                                    let mut local_grad = prob;
+
+                                    if i == target {
+                                        local_grad -= 1.0;
+                                    }
+
+                                    add_node_grad(
+                                        &mut tape,
+                                        prev[i],
+                                        grad * local_grad,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Node::FusedLayer(node) => {
+                        /*
+                         * One fused node represents an entire dense layer.
+                         *
+                         * Layout:
+                         *
+                         * weights[o * input_size + i]
+                         * inputs[i]
+                         * biases[o]
+                         * outputs[o]
+                         */
+                        let input_size = node.input_size;
+                        let output_size = node.output_size;
+                        let relu = node.relu;
+                        let inputs = node.inputs.clone();
+                        let weights = node.weights.clone();
+                        let biases = node.biases.clone();
+                        let outputs = node.outputs.clone();
+                        // We need every output gradient because all outputs
+                        // belong to this single graph node.
+                        let output_grads = node.grads.clone();
+                        for o in 0..output_size {
+                            let mut grad_out = output_grads[o];
+                            if relu && outputs[o] <= 0.0 { grad_out *= 0.01; }
+                            let weight_base = o * input_size;
+                            for i in 0..input_size {
+                                let w_id =
+                                    weights[weight_base + i];
+                                let x_id = inputs[i];
+                                let w = node_data(&tape, w_id);
+                                let x = node_data(&tape, x_id);
+                                if o == 0 && i == 0 {
+                                }
+                                // dL/dW = dL/dY * X
+                                add_node_grad(
+                                    &mut tape,
+                                    w_id,
+                                    grad_out * x,
+                                );
+                                // dL/dX = dL/dY * W
+                                add_node_grad(
+                                    &mut tape,
+                                    x_id,
+                                    grad_out * w,
+                                );
+                            }
+                            // dL/dB = dL/dY
+                            add_node_grad(
+                                &mut tape,
+                                biases[o],
+                                grad_out,
+                            );
                         }
                     }
                 }
@@ -512,17 +820,26 @@ impl Tensor {
 
     pub fn zero_grad(&self) {
         TAPE.with(|t| {
-            t.borrow_mut()
-                .nodes[self.handle]
-                .grad = 0.0;
+            match &mut t.borrow_mut().nodes[self.handle.node] {
+                Node::Scalar(node) => node.grad = 0.0,
+                Node::FusedLayer(node) => {
+                    node.grads[self.handle.index] = 0.0;
+                }
+            }
         });
     }
 
     pub fn update(&self, learning_rate: f32) {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
-            let node = &mut tape.nodes[self.handle];
-            node.data -= learning_rate * node.grad;
+            match &mut tape.nodes[self.handle.node] {
+                Node::Scalar(node) => {
+                    node.data -= learning_rate * node.grad;
+                }
+                Node::FusedLayer(_) => {
+                    panic!("Cannot update a fused-layer output directly.");
+                }
+            }
         });
     }
 }
