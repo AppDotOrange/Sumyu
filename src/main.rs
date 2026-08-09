@@ -6,7 +6,7 @@ use std::io::Write;
 fn main() {
     //let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
-    let test = 1;
+    let test = 6;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -143,6 +143,29 @@ fn main() {
         lm.train();
         lm.save(
             "Poke_V1.sumyu",
+            &description,
+        );
+    } else if test == 6 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::tale_v1_mini_to(0.01, 32, 100_000);
+        let description = "A Sumyu model trained on Grimm's Fairy Tales, obtained from Project Gutenberg.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_config(config);
+        /*
+        let (description, mut lm) = LM::load("Tests/Poke_V1_134.sumyu");
+        lm.train_options(0.001, 100_000, 32, 0);
+        */
+        lm.params();
+        lm.load_corpus(&text);
+        lm.train();
+        lm.save(
+            "Tale_V1.sumyu",
             &description,
         );
     }

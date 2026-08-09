@@ -38,7 +38,7 @@ enum Op {
     },
 }
 
-struct TensorData {
+pub struct TensorData {
     data: f32,
     grad: f32,
     prev: Vec<TensorHandle>,
@@ -46,7 +46,7 @@ struct TensorData {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct TensorHandle {
+pub struct TensorHandle {
     node: usize,
     index: usize,
 }
@@ -398,49 +398,55 @@ impl Tensor {
 
         let outputs = TAPE.with(|t| {
             let tape = t.borrow();
-
             let mut outputs = Vec::with_capacity(output_size);
 
-            for o in 0..output_size {
-                let bias = match &tape.nodes[biases[o].node] {
-                    Node::Scalar(node) => node.data,
-                    Node::FusedLayer(node) => {
-                        node.outputs[biases[o].index]
+            if relu {
+                for o in 0..output_size {
+                    let bias = match &tape.nodes[biases[o].node] {
+                        Node::Scalar(node) => node.data,
+                        Node::FusedLayer(node) => node.outputs[biases[o].index],
+                    };
+
+                    let weight_base = o * input_size;
+                    let mut sum = bias;
+
+                    for i in 0..input_size {
+                        let w = match &tape.nodes[weights[weight_base + i].node] {
+                            Node::Scalar(node) => node.data,
+                            Node::FusedLayer(node) => node.outputs[weights[weight_base + i].index],
+                        };
+
+                        let x = match &tape.nodes[inputs[i].node] {
+                            Node::Scalar(node) => node.data,
+                            Node::FusedLayer(node) => node.outputs[inputs[i].index],
+                        };
+
+                        sum += w * x;
                     }
-                };
-
-                let weight_base = o * input_size;
-                let mut sum = bias;
-
-                for i in 0..input_size {
-                    let w = match &tape.nodes[weights[weight_base + i].node] {
-                        Node::Scalar(node) => node.data,
-                        Node::FusedLayer(node) => {
-                            node.outputs[weights[weight_base + i].index]
-                        }
-                    };
-
-                    let x = match &tape.nodes[inputs[i].node] {
-                        Node::Scalar(node) => node.data,
-                        Node::FusedLayer(node) => {
-                            node.outputs[inputs[i].index]
-                        }
-                    };
-
-                    sum += w * x;
+                    outputs.push(if sum > 0.0 { sum } else { sum * 0.01 });
                 }
-
-                if relu {
-                    if sum > 0.0 {
-                        outputs.push(sum);
-                    } else {
-                        outputs.push(sum * 0.01);
+            } else {
+                for o in 0..output_size {
+                    let bias = match &tape.nodes[biases[o].node] {
+                        Node::Scalar(node) => node.data,
+                        Node::FusedLayer(node) => node.outputs[biases[o].index],
+                    };
+                    let weight_base = o * input_size;
+                    let mut sum = bias;
+                    for i in 0..input_size {
+                        let w = match &tape.nodes[weights[weight_base + i].node] {
+                            Node::Scalar(node) => node.data,
+                            Node::FusedLayer(node) => node.outputs[weights[weight_base + i].index],
+                        };
+                        let x = match &tape.nodes[inputs[i].node] {
+                            Node::Scalar(node) => node.data,
+                            Node::FusedLayer(node) => node.outputs[inputs[i].index],
+                        };
+                        sum += w * x;
                     }
-                } else {
                     outputs.push(sum);
                 }
             }
-
             outputs
         });
 
