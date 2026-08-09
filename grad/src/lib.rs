@@ -6,6 +6,7 @@ pub mod chatter;
 pub mod embeddings;
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -55,8 +56,8 @@ struct FusedLayerData {
     grads: Vec<f32>,
 
     inputs: Vec<TensorHandle>,
-    weights: Vec<TensorHandle>,
-    biases: Vec<TensorHandle>,
+    weights: Arc<[TensorHandle]>,
+    biases: Arc<[TensorHandle]>,
 
     input_size: usize,
     output_size: usize,
@@ -137,19 +138,22 @@ thread_local! {
     static TOPO_STACK2: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
 }
 
-pub fn zero_grad_and_update(params: &[Tensor], lr: f32) {
+pub fn zero_grad_and_update(params: &[Tensor], lr: f32) -> f32 {
+    let mut grad_sum = 0f32;
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
         for p in params {
             match &mut tape.nodes[p.handle.node] {
                 Node::Scalar(node) => {
                     node.data -= lr * node.grad;
+                    grad_sum += node.grad.abs();
                     node.grad = 0.0;
                 }
                 Node::FusedLayer(_) => panic!("Parameter cannot be a fused-layer output.")
             }
         }
     });
+    grad_sum
 }
 
 #[derive(Copy)]
@@ -379,9 +383,9 @@ impl Tensor {
     }
 
     pub fn fused_layer(
-        weights: &[TensorHandle],
+        weights: Arc<[TensorHandle]>,
         inputs: &[TensorHandle],
-        biases: &[TensorHandle],
+        biases: Arc<[TensorHandle]>,
         relu: bool,
     ) -> Vec<Tensor> {
         let input_size = inputs.len();
@@ -447,8 +451,8 @@ impl Tensor {
                     outputs,
                     grads: vec![0.0; output_size],
                     inputs: inputs.to_vec(),
-                    weights: weights.to_vec(),
-                    biases: biases.to_vec(),
+                    weights,
+                    biases,
                     input_size,
                     output_size,
                     relu,

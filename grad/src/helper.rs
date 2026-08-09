@@ -212,6 +212,10 @@ pub fn poke_v1() -> Vec<String> { // 250 tokens
     ["<UNKNOWN>", "", "N", "A", "M", "E", ":", " ", "B", "u", "l", "b", "a", "s", "r", "\n", "T", "Y", "P", "G", "o", "i", "n", "I", "L", "O", "v", "e", "g", "w", ",", "C", "h", "p", "y", "R", "W", "t", "d", "c", "k", ".", "x", "S", "m", "V", "f", "F", "z", "é", "4", "6", "0", "q", "D", "j", "’", "K", "2", "H", "U", "-", "1", "—", "♀", "♂", "'", "J", "Z", "8", ";", "Q", "!", "3", "X", "”", "“", "9", "5", "−", "7", "s ", "e ", ": ", "in", "th", "E: ", "t ", ", ", "er", "TY", "on", "d ", "an", "PE: ", "TYPE: ", "\nTYPE: ", "ME: ", "AME: ", "NAME: ", "\nNAME: ", "\n\nNAME: ", "ing", "TY: ", "ITY: ", "LITY: ", "ILITY: ", "BILITY: ", "ABILITY: ", "\nABILITY: ", "ar", "it", "en", "or", "y ", "the ", "at", "its ", "ing ", "es ", "\nE", "\nEN", "\nENT", "\nENTR", "\nENTRY", "\nENTRY:", "\nENTRY:\n", "ou", "on ", "o ", "al", "re", "to ", "is ", ". ", "st", "er ", "ic", "f ", "el", "and ", "it ", "of ", "il", "a ", "in ", "ed ", "h ", "Po", "ro", "ra", "le", "Pok", "Poké", "Pokém", "Pokémon ", "at ", "Th", "is", "ch", "en ", "ig", "ow", "un", "l ", "as ", "It ", "an ", "that ", "k ", "igh", "es", "ts ", "om", "ly ", "ea", "ith ", "with ", "im", "ur", "e, ", "ec", "ir", "this ", "em", "la", "for", "’s ", "ol", "us", "iv", "ight", "n ", "ta", "y, ", "sh", "od", "m ", "ev", "oun", "s, ", "The ", "wh", "Wat", "op", "ee", "ill ", "ug", "rom ", "from ", "This ", "le ", "al ", "sp", "are ", "id", "oc", "tr", "ac", "ion", "will ", "ap", "ma", "orma", "Norma", "can ", "ear", "Pokémon", "ss", "rass", "Grass", "ver", "tric", "the", "li", "ce ", "ds ", "ut", "s. ", "ve ", "Water ", "chic", "ychic", "sychic", "Psychic", "lo", "ng", "ent ", "et", "ly", "lying", "Flying", "ent", "up", "mor", "Pois", "St", "d, ", "by ", "roun", "Its ", "er, ", "ost", "for ", "pre", "wa", "ter", " of ", "se ", "air", "s.", "out ", "ke ", "Water", "bod", "t, ", "Normal", "ag", "has ", "ul", "ab", "ies ", "ound ", "if", "rag", "ves ", "their", "their ", "am", "Sh", "ighting", "Fighting", "ous ", "low", "ce", "con", "pro", "po", "ener", "een ", "hea", "body ", "ter ", "ang", "Drag", "pow", "Roc", "In", "into ", "ther", " Flying", "Fir", "ip", "row", "Stee", "Wh", "When ", "ctric", "lectric", "Electric", "one ", "oug", "ough ", "Poison ", "over", "Bug", " to ", "ed", "Sw", "ck", "Groun"].iter().map(|x| { String::from(*x) }).collect()
 }
 
+pub fn tale_v1() -> Vec<String> { // 250 tokens
+    ["<UNKNOWN>", "", "T", "H", "E", " ", "F", "R", "O", "G", "-", "K", "I", "N", ";", ",", "Y", "\n", "n", "o", "l", "d", "t", "i", "m", "e", "s", "w", "h", "g", "a", "v", "r", "u", "b", "f", "y", "c", ".", "C", "’", "k", "W", "p", "A", "D", "“", "?", "”", "S", "!", "B", "q", "j", "_", "x", ":", "M", "L", "[", "]", "V", "U", "P", "Z", "(", "z", ")", "‘", "J", "Q", "<", ">", "X", "e ", "th", "d ", " th", " a", "er", " the ", "t ", "nd ", "in", " and ", ", ", "s ", "and ", "ou", "en", "he ", "to", "the ", "ed ", "ing", "\n\n", " h", "on", "an", " s", "or", "ll", "ea", " w", "as ", ". ", "at ", "y ", "you", "  ", "hi", "e, ", "ai", "no", "d, ", "ther", "hen", ".\n\n", "”\n\n", "for", "re", "of", "ha", "it", "om", "her", "to ", "st", "the", "ow", "gh", "ll ", "ut ", "was ", ".”\n\n", "ld ", "se", "ing ", "le ", "ver", "ve ", "ch", "ith", " the", "be", "not ", "is ", "ca", "The ", " to ", "she ", " m", "le", "oo", "wa", "had ", "s, ", "    ", " you", "ill ", "with", "aid ", "me ", "ter", "that ", "ck", "ri", "d\n", "sh", "la", "out ", "ti", " was ", "ould ", "ir", " in", "other", " ha", " she ", "li", "him", "a ", "un", "tle ", "ear", "but ", "one ", "t, ", "ght ", "ever", " her", "ly ", "ent ", "ar", "go", "ain", "aid, ", "Then", " he ", ",\n", "when", " it", " said ", "his ", "e\n", "ttle ", "little ", "came ", "es ", "hat ", "ho", " f", " d", "y, ", "ed, ", "rea", "they ", "ng", "said, ", " his ", "all ", "wer", " of", "sel", " be", "ra", " b", "ld", "up", "ke ", "went ", "ust", "But ", " that ", "And ", ",”", " will ", "When", "so", "ing, ", "self", "ce ", " had ", "ed", "own", "gain", "hich", "too", "if", "who", "rou", " they ", "thing ", "est", "com", "ro", "’s ", "here ", " with", "id ", "have ", " p", "sa", "      ", "now", "ven", "and\n", "es", "ked ", "into ", "were ", "ep", "ta", "t\n", "et ", " for", "el", "ell", "fu", "man", "e. ", "ong", "im", "der", "“I", " on", "long", "si", " a ", "ted ", "s\n", "da", " him", "ill", " as ", "could ", "took", "ur", "ne", "rom", "the\n", "King ", "de ", ",\n      ", "them", "pp", " an", "mor", "over", "which", "al", "oman", "ish", "King", "She ", "will ", " them", "did ", " into ", "oor", " have ", " the\n", "ghter", "ughter"].iter().map(|x| { String::from(*x) }).collect()
+}
+
 fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
      if v.len() < 2 {
           return None;
@@ -388,6 +392,18 @@ pub fn poke_v1_mini_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'sta
                 batch_size,
                 0, // no limit
                 poke_v1(),
+                16,
+                40,
+                &[200, 100],
+                epochs,
+    )
+}
+
+pub fn tale_v1_mini_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+    Config::new(lr,
+                batch_size,
+                0, // no limit
+                tale_v1(),
                 16,
                 40,
                 &[200, 100],

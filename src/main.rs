@@ -5,8 +5,8 @@ use std::io::Write;
 
 fn main() {
     //let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
-    let text = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    let test = 2;
+    let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
+    let test = 1;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -77,7 +77,7 @@ fn main() {
     } else if test == 1 {
         println!("{:?}", helper::make_vocab(&text, 250))
     } else if test == 2 {
-        let bytes = fs::read("Tests/Poke_V1_196.sumyu").unwrap();
+        let bytes = fs::read("Production/PokeP1.sumyu").unwrap();
         //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
         //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
         let (model, _): (SavedLM, usize) =

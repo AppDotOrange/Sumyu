@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::{Tensor, TensorHandle};
 use rand_distr::{Distribution, Normal as NormalDist};
 use serde::{Serialize, Deserialize};
@@ -111,8 +112,8 @@ impl Neuron {
 #[derive(Clone)]
 pub struct Layer {
     neurons: Vec<Neuron>,
-    fused_weights: Vec<TensorHandle>,
-    fused_biases: Vec<TensorHandle>,
+    fused_weights: Arc<[TensorHandle]>,
+    fused_biases: Arc<[TensorHandle]>,
 }
 
 impl Layer {
@@ -121,12 +122,12 @@ impl Layer {
             .map(|_| Neuron::new(num_inputs, is_output))
             .collect();
 
-        let fused_weights = neurons
+        let fused_weights: Arc<[TensorHandle]> = neurons
             .iter()
             .flat_map(|n| n.weights.iter().map(|w| w.handle))
             .collect();
 
-        let fused_biases = neurons
+        let fused_biases: Arc<[TensorHandle]> = neurons
             .iter()
             .map(|n| n.bias.handle)
             .collect();
@@ -143,9 +144,9 @@ impl Layer {
             inputs.iter().map(|x| x.handle).collect();
 
         Tensor::fused_layer(
-            &self.fused_weights,
+            Arc::clone(&self.fused_weights),
             &input_handles,
-            &self.fused_biases,
+            Arc::clone(&self.fused_biases),
             !self.neurons[0].is_output,
         )
     }
@@ -176,12 +177,12 @@ impl Layer {
             })
             .collect();
 
-        let fused_weights = neurons
+        let fused_weights: Arc<[TensorHandle]> = neurons
             .iter()
             .flat_map(|n| n.weights.iter().map(|w| w.handle))
             .collect();
 
-        let fused_biases = neurons
+        let fused_biases: Arc<[TensorHandle]> = neurons
             .iter()
             .map(|n| n.bias.handle)
             .collect();

@@ -220,7 +220,7 @@ impl Trainer {
         TrainResult::Finished
     }
 
-    pub fn train_lm(
+    pub fn train_lm( // this one is used for training and train_lm_sumyu will be used in the app once it's done
         &mut self,
         update_frequency: usize,
         mlp: &mut MLP,
@@ -256,8 +256,6 @@ impl Trainer {
                 (0..tokens.len() - context_len).collect();
 
             indices.shuffle(&mut rng);
-            // zero out gradients in between epoch runs
-            crate::zero_grad_and_update(&params, lr);
             let mut grad_sum = 0.0;
 
             // initialize loss
@@ -283,9 +281,8 @@ impl Trainer {
                 total_loss += loss.data();
                 loss.backward();
                 crate::clear_tape_after(parameter_boundary);
-                if count % self.batch_size == 0 {
-                    grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
-                    crate::zero_grad_and_update(&params, lr);
+                if count % self.batch_size == 0 || count == data_len as usize {
+                    grad_sum += crate::zero_grad_and_update(&params, lr);
                     if !running.load(Ordering::SeqCst) {
                         println!("Interrupted");
                         return TrainResult::Interrupted;
@@ -296,7 +293,6 @@ impl Trainer {
                 }
                 //println!("{:?}", t.elapsed())
             }
-            grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
 
             let samples = count as f32;
             let avg_loss = total_loss / samples;
