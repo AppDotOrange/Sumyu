@@ -265,7 +265,7 @@ impl Trainer {
             let mut count = 0;
 
             for &sample in &indices {
-
+                //let t = Instant::now();
                 let ids =
                     &tokens[sample..sample + context_len];
 
@@ -282,10 +282,10 @@ impl Trainer {
                 let loss: Tensor = Trainer::softmax_cross_entropy(&prediction, target);
                 total_loss += loss.data();
                 loss.backward();
+                crate::clear_tape_after(parameter_boundary);
                 if count % self.batch_size == 0 {
                     grad_sum += params.iter().map(|x| {x.grad().abs()}).sum::<f32>();
                     crate::zero_grad_and_update(&params, lr);
-                    crate::clear_tape_after(parameter_boundary);
                     if !running.load(Ordering::SeqCst) {
                         println!("Interrupted");
                         return TrainResult::Interrupted;
@@ -294,6 +294,7 @@ impl Trainer {
                         break;
                     }
                 }
+                //println!("{:?}", t.elapsed())
             }
             grad_sum += params.iter().map(|p| p.grad().abs()).sum::<f32>();
 

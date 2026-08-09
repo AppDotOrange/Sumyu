@@ -131,8 +131,8 @@ pub fn tape_len() -> usize {
 
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
-
-    static TOPO_VISITED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static TOPO_VISITED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    static TOPO_GENERATION: RefCell<u32> = const { RefCell::new(0) };
     static TOPO_STACK1: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
     static TOPO_STACK2: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
 }
@@ -164,16 +164,6 @@ fn node_data(
     match &tape.nodes[handle.node] {
         Node::Scalar(node) => node.data,
         Node::FusedLayer(node) => node.outputs[handle.index],
-    }
-}
-
-fn node_grad(
-    tape: &Tape,
-    handle: TensorHandle,
-) -> f32 {
-    match &tape.nodes[handle.node] {
-        Node::Scalar(node) => node.grad,
-        Node::FusedLayer(node) => node.grads[handle.index],
     }
 }
 
@@ -389,61 +379,76 @@ impl Tensor {
     }
 
     pub fn fused_layer(
-        weights: &[Tensor],
-        inputs: &[Tensor],
-        biases: &[Tensor],
+        weights: &[TensorHandle],
+        inputs: &[TensorHandle],
+        biases: &[TensorHandle],
         relu: bool,
     ) -> Vec<Tensor> {
         let input_size = inputs.len();
         let output_size = biases.len();
 
-        assert_eq!(
+        debug_assert_eq!(
             weights.len(),
-            input_size * output_size,
-            "Fused layer weight count does not match dimensions"
+            input_size * output_size
         );
 
-        let mut outputs = Vec::with_capacity(output_size);
+        let outputs = TAPE.with(|t| {
+            let tape = t.borrow();
 
-        for o in 0..output_size {
-            let mut sum = biases[o].data();
+            let mut outputs = Vec::with_capacity(output_size);
 
-            let weight_base = o * input_size;
+            for o in 0..output_size {
+                let bias = match &tape.nodes[biases[o].node] {
+                    Node::Scalar(node) => node.data,
+                    Node::FusedLayer(node) => {
+                        node.outputs[biases[o].index]
+                    }
+                };
 
-            for i in 0..input_size {
-                sum += weights[weight_base + i].data()
-                    * inputs[i].data();
+                let weight_base = o * input_size;
+                let mut sum = bias;
+
+                for i in 0..input_size {
+                    let w = match &tape.nodes[weights[weight_base + i].node] {
+                        Node::Scalar(node) => node.data,
+                        Node::FusedLayer(node) => {
+                            node.outputs[weights[weight_base + i].index]
+                        }
+                    };
+
+                    let x = match &tape.nodes[inputs[i].node] {
+                        Node::Scalar(node) => node.data,
+                        Node::FusedLayer(node) => {
+                            node.outputs[inputs[i].index]
+                        }
+                    };
+
+                    sum += w * x;
+                }
+
+                if relu {
+                    if sum > 0.0 {
+                        outputs.push(sum);
+                    } else {
+                        outputs.push(sum * 0.01);
+                    }
+                } else {
+                    outputs.push(sum);
+                }
             }
 
-            let output = if relu {
-                if sum > 0.0 {
-                    sum
-                } else {
-                    sum * 0.01
-                }
-            } else {
-                sum
-            };
-
-            outputs.push(output);
-        }
+            outputs
+        });
 
         let node = TAPE.with(|t| {
             let mut tape = t.borrow_mut();
-
             tape.alloc_fused_layer(
                 FusedLayerData {
                     outputs,
                     grads: vec![0.0; output_size],
-                    inputs: inputs.iter()
-                        .map(|x| x.handle)
-                        .collect(),
-                    weights: weights.iter()
-                        .map(|w| w.handle)
-                        .collect(),
-                    biases: biases.iter()
-                        .map(|b| b.handle)
-                        .collect(),
+                    inputs: inputs.to_vec(),
+                    weights: weights.to_vec(),
+                    biases: biases.to_vec(),
                     input_size,
                     output_size,
                     relu,
@@ -466,18 +471,27 @@ impl Tensor {
             let tape_size = tape.nodes.len();
 
             TOPO_VISITED.with(|v| {
-                let mut visited = v.borrow_mut();
-
-                visited.resize(tape_size, false);
-                visited.fill(false);
-            });
-
-            TOPO_STACK1.with(|s1| {
-                TOPO_STACK2.with(|s2| {
-                    TOPO_VISITED.with(|v| {
+                TOPO_STACK1.with(|s1| {
+                    TOPO_STACK2.with(|s2| {
+                        let mut visited = v.borrow_mut();
                         let mut stack1 = s1.borrow_mut();
                         let mut stack2 = s2.borrow_mut();
-                        let mut visited = v.borrow_mut();
+
+                        if visited.len() < tape_size {
+                            visited.resize(tape_size, 0);
+                        }
+
+                        let generation = TOPO_GENERATION.with(|g| {
+                            let mut g = g.borrow_mut();
+                            *g = g.wrapping_add(1);
+
+                            if *g == 0 {
+                                visited.fill(0);
+                                *g = 1;
+                            }
+
+                            *g
+                        });
 
                         stack1.clear();
                         stack2.clear();
@@ -487,11 +501,11 @@ impl Tensor {
                         while let Some(handle) = stack1.pop() {
                             let id = handle.node;
 
-                            if visited[id] {
+                            if visited[id] == generation {
                                 continue;
                             }
 
-                            visited[id] = true;
+                            visited[id] = generation;
 
                             match &tape.nodes[id] {
                                 Node::Scalar(node) => {
@@ -499,25 +513,18 @@ impl Tensor {
                                         node.prev.iter().rev().copied()
                                     );
                                 }
-
                                 Node::FusedLayer(node) => {
+                                    // Only inputs are graph dependencies.
+                                    // Weights and biases are leaves/parameters.
                                     stack1.extend(
                                         node.inputs.iter().rev().copied()
                                     );
-
-                                    stack1.extend(
-                                        node.weights.iter().rev().copied()
-                                    );
-
-                                    stack1.extend(
-                                        node.biases.iter().rev().copied()
-                                    );
                                 }
                             }
-
                             stack2.push(handle);
                         }
-                        stack2.clone()
+                        let result = std::mem::take(&mut *stack2);
+                        result
                     })
                 })
             })
@@ -746,56 +753,78 @@ impl Tensor {
                         }
                     }
                     Node::FusedLayer(node) => {
-                        /*
-                         * One fused node represents an entire dense layer.
-                         *
-                         * Layout:
-                         *
-                         * weights[o * input_size + i]
-                         * inputs[i]
-                         * biases[o]
-                         * outputs[o]
-                         */
                         let input_size = node.input_size;
                         let output_size = node.output_size;
                         let relu = node.relu;
+
+                        // Copy only handles. These are tiny compared with the old
+                        // outputs/grads clones and, importantly, release the borrow
+                        // on `tape` before we mutate it.
                         let inputs = node.inputs.clone();
                         let weights = node.weights.clone();
                         let biases = node.biases.clone();
-                        let outputs = node.outputs.clone();
-                        // We need every output gradient because all outputs
-                        // belong to this single graph node.
-                        let output_grads = node.grads.clone();
+                        let input_values: Vec<f32> = inputs
+                            .iter()
+                            .map(|&h| node_data(&tape, h))
+                            .collect();
+                        let weight_values: Vec<f32> = weights
+                            .iter()
+                            .map(|&h| match &tape.nodes[h.node] {
+                                Node::Scalar(node) => node.data,
+                                Node::FusedLayer(_) => unreachable!(),
+                            })
+                            .collect();
+                        let mut input_grads = vec![0.0f32; input_size];
+
+                        // Read output/grads one element at a time before mutation.
                         for o in 0..output_size {
-                            let mut grad_out = output_grads[o];
-                            if relu && outputs[o] <= 0.0 { grad_out *= 0.01; }
-                            let weight_base = o * input_size;
-                            for i in 0..input_size {
-                                let w_id =
-                                    weights[weight_base + i];
-                                let x_id = inputs[i];
-                                let w = node_data(&tape, w_id);
-                                let x = node_data(&tape, x_id);
-                                if o == 0 && i == 0 {
+                            let mut grad_out;
+                            let output;
+
+                            match &tape.nodes[id] {
+                                Node::FusedLayer(node) => {
+                                    grad_out = node.grads[o];
+                                    output = node.outputs[o];
                                 }
-                                // dL/dW = dL/dY * X
-                                add_node_grad(
-                                    &mut tape,
-                                    w_id,
-                                    grad_out * x,
-                                );
-                                // dL/dX = dL/dY * W
-                                add_node_grad(
-                                    &mut tape,
-                                    x_id,
-                                    grad_out * w,
-                                );
+                                _ => unreachable!(),
                             }
-                            // dL/dB = dL/dY
+
+                            if relu && output <= 0.0 {
+                                grad_out *= 0.01;
+                            }
+
+                            let weight_base = o * input_size;
+
+                            for i in 0..input_size {
+                                let w_id = weights[weight_base + i];
+
+                                let w = weight_values[weight_base + i];
+                                let x = input_values[i];
+
+                                match &mut tape.nodes[w_id.node] {
+                                    Node::Scalar(node) => {
+                                        node.grad += grad_out * x;
+                                    }
+                                    Node::FusedLayer(_) => unreachable!(),
+                                }
+
+                                input_grads[i] += grad_out * w;
+                            }
+
+                            let bias_id = biases[o];
+
+                            match &mut tape.nodes[bias_id.node] {
+                                Node::Scalar(node) => {
+                                    node.grad += grad_out;
+                                }
+                                Node::FusedLayer(_) => unreachable!(),
+                            }
+                        }
+                        for i in 0..input_size {
                             add_node_grad(
                                 &mut tape,
-                                biases[o],
-                                grad_out,
+                                inputs[i],
+                                input_grads[i],
                             );
                         }
                     }
