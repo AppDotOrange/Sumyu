@@ -4,9 +4,10 @@ use std::{fs, io};
 use std::io::Write;
 
 fn main() {
-    //let text = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
+    let rust = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
-    let test = 6;
+    let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
+    let test = 5;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -77,7 +78,7 @@ fn main() {
     } else if test == 1 {
         println!("{:?}", helper::make_vocab(&text, 250))
     } else if test == 2 {
-        let bytes = fs::read("Production/PokeP1.sumyu").unwrap();
+        let bytes = fs::read("Production/TaleP1_mini.sumyu").unwrap();
         //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
         //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
         let (model, _): (SavedLM, usize) =
@@ -127,19 +128,19 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        //let config = helper::poke_v1_mini_to(0.1, 32, 100_000);
-        //let description = "A Sumyu model trained on a filtered Pokedex.";
+        let config = helper::poke_v1_mini_to(0.001, 32, 100_000);
+        let description = "A Sumyu model trained on a filtered Pokedex.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
-        //let mut lm = LM::from_config(config);
-        //*
+        let mut lm = LM::from_config(config);
+        /*
         let (description, mut lm) = LM::load("Tests/Poke_V1_134.sumyu");
         lm.train_options(0.001, 100_000, 32, 0);
-        //*/
+        */
         lm.params();
-        lm.load_corpus(&text);
+        lm.load_corpus(&poke);
         lm.train();
         lm.save(
             "Poke_V1.sumyu",
@@ -150,17 +151,17 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::tale_v1_mini_to(0.01, 32, 100_000);
-        let description = "A Sumyu model trained on Grimm's Fairy Tales, obtained from Project Gutenberg.";
+        //let config = helper::tale_v1_scout_to(0.001, 32, 100_000);
+        //let description = "A Sumyu model trained on Grimm's Fairy Tales, obtained from Project Gutenberg.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
-        let mut lm = LM::from_config(config);
-        /*
-        let (description, mut lm) = LM::load("Tests/Poke_V1_134.sumyu");
+        //let mut lm = LM::from_config(config);
+        //*
+        let (description, mut lm) = LM::load("Tests/Tale_V1_scout_10.sumyu");
         lm.train_options(0.001, 100_000, 32, 0);
-        */
+        //*/
         lm.params();
         lm.load_corpus(&text);
         lm.train();

@@ -71,12 +71,32 @@ enum Node {
 
 struct Tape {
     nodes: Vec<Node>,
+
+    scratch_inputs: Vec<f32>,
+    scratch_weights: Vec<f32>,
+    scratch_input_grads: Vec<f32>,
+
+    scratch_outputs: Vec<f32>,
+    scratch_output_grads: Vec<f32>,
+
+    // Reused handle buffers.
+    scratch_inputs_handles: Vec<TensorHandle>,
+    scratch_weights_handles: Vec<TensorHandle>,
+    scratch_bias_handles: Vec<TensorHandle>,
 }
 
 impl Tape {
     fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            scratch_inputs: Vec::new(),
+            scratch_weights: Vec::new(),
+            scratch_input_grads: Vec::new(),
+            scratch_outputs: Vec::new(),
+            scratch_output_grads: Vec::new(),
+            scratch_inputs_handles: Vec::new(),
+            scratch_weights_handles: Vec::new(),
+            scratch_bias_handles: Vec::new(),
         }
     }
 
@@ -161,6 +181,7 @@ pub struct Tensor {
     handle: TensorHandle,
 }
 
+#[inline(always)]
 fn node_data(
     tape: &Tape,
     handle: TensorHandle,
@@ -171,6 +192,7 @@ fn node_data(
     }
 }
 
+#[inline(always)]
 fn add_node_grad(
     tape: &mut Tape,
     handle: TensorHandle,
@@ -396,75 +418,85 @@ impl Tensor {
             input_size * output_size
         );
 
-        let outputs = TAPE.with(|t| {
-            let tape = t.borrow();
-            let mut outputs = Vec::with_capacity(output_size);
-
-            if relu {
-                for o in 0..output_size {
-                    let bias = match &tape.nodes[biases[o].node] {
-                        Node::Scalar(node) => node.data,
-                        Node::FusedLayer(node) => node.outputs[biases[o].index],
-                    };
-
-                    let weight_base = o * input_size;
-                    let mut sum = bias;
-
-                    for i in 0..input_size {
-                        let w = match &tape.nodes[weights[weight_base + i].node] {
-                            Node::Scalar(node) => node.data,
-                            Node::FusedLayer(node) => node.outputs[weights[weight_base + i].index],
-                        };
-
-                        let x = match &tape.nodes[inputs[i].node] {
-                            Node::Scalar(node) => node.data,
-                            Node::FusedLayer(node) => node.outputs[inputs[i].index],
-                        };
-
-                        sum += w * x;
-                    }
-                    outputs.push(if sum > 0.0 { sum } else { sum * 0.01 });
-                }
-            } else {
-                for o in 0..output_size {
-                    let bias = match &tape.nodes[biases[o].node] {
-                        Node::Scalar(node) => node.data,
-                        Node::FusedLayer(node) => node.outputs[biases[o].index],
-                    };
-                    let weight_base = o * input_size;
-                    let mut sum = bias;
-                    for i in 0..input_size {
-                        let w = match &tape.nodes[weights[weight_base + i].node] {
-                            Node::Scalar(node) => node.data,
-                            Node::FusedLayer(node) => node.outputs[weights[weight_base + i].index],
-                        };
-                        let x = match &tape.nodes[inputs[i].node] {
-                            Node::Scalar(node) => node.data,
-                            Node::FusedLayer(node) => node.outputs[inputs[i].index],
-                        };
-                        sum += w * x;
-                    }
-                    outputs.push(sum);
-                }
-            }
-            outputs
-        });
-
         let node = TAPE.with(|t| {
             let mut tape = t.borrow_mut();
-            tape.alloc_fused_layer(
+
+            // Resize reusable scratch buffers only when necessary.
+            if tape.scratch_inputs.len() < input_size {
+                tape.scratch_inputs.resize(input_size, 0.0);
+            }
+
+            if tape.scratch_weights.len() < weights.len() {
+                tape.scratch_weights.resize(weights.len(), 0.0);
+            }
+
+            // Read inputs once.
+            for i in 0..input_size {
+                tape.scratch_inputs[i] =
+                    node_data(&tape, inputs[i]);
+            }
+
+            // Read weights once.
+            for i in 0..weights.len() {
+                let h = weights[i];
+
+                tape.scratch_weights[i] =
+                    match &tape.nodes[h.node] {
+                        Node::Scalar(node) => node.data,
+                        Node::FusedLayer(_) => unreachable!(),
+                    };
+            }
+
+            let mut outputs = Vec::with_capacity(output_size);
+
+            for o in 0..output_size {
+                let bias = match &tape.nodes[biases[o].node] {
+                    Node::Scalar(node) => node.data,
+                    Node::FusedLayer(_) => unreachable!(),
+                };
+
+                let base = o * input_size;
+
+                let mut sum = bias;
+
+                // HOT LOOP
+                for i in 0..input_size {
+                    sum +=
+                        tape.scratch_weights[base + i]
+                            * tape.scratch_inputs[i];
+                }
+
+                if relu {
+                    sum = if sum > 0.0 {
+                        sum
+                    } else {
+                        sum * 0.01
+                    };
+                }
+
+                outputs.push(sum);
+            }
+
+            let id = tape.nodes.len();
+
+            tape.nodes.push(Node::FusedLayer(
                 FusedLayerData {
                     outputs,
                     grads: vec![0.0; output_size],
+
                     inputs: inputs.to_vec(),
                     weights,
                     biases,
+
                     input_size,
                     output_size,
                     relu,
                 }
-            )
+            ));
+
+            id
         });
+
         (0..output_size)
             .map(|index| Tensor {
                 handle: TensorHandle {
@@ -547,7 +579,7 @@ impl Tensor {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
 
-            // Seed the output gradient.
+            // Seed output gradient.
             match &mut tape.nodes[self.handle.node] {
                 Node::Scalar(node) => {
                     node.grad = 1.0;
@@ -561,284 +593,416 @@ impl Tensor {
             for &handle in topo.iter() {
                 let id = handle.node;
 
+                // ---------------------------------------------------------
+                // Get gradient without keeping a borrow alive.
+                // ---------------------------------------------------------
+
                 let grad = match &tape.nodes[id] {
                     Node::Scalar(node) => node.grad,
                     Node::FusedLayer(node) => node.grads[handle.index],
                 };
 
-                match &tape.nodes[id] {
-                    Node::Scalar(node) => {
-                        let prev = node.prev.clone();
-                        let op = node.op.clone();
+                // ---------------------------------------------------------
+                // Scalar node
+                // ---------------------------------------------------------
 
-                        match op {
-                            Op::Leaf => {}
+                if matches!(&tape.nodes[id], Node::Scalar(_)) {
+                    // Extract everything we need from the node FIRST.
+                    //
+                    // This is the important part:
+                    // after this scope ends, `tape.nodes[id]` is no longer
+                    // immutably borrowed.
 
-                            Op::Add => {
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[0],
-                                    grad,
-                                );
+                    let op = match &tape.nodes[id] {
+                        Node::Scalar(node) => node.op.clone(),
+                        _ => unreachable!(),
+                    };
 
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[1],
-                                    grad,
-                                );
-                            }
+                    // We unfortunately still clone Op here because your
+                    // SoftmaxCrossEntropy variants contain Vecs.
+                    //
+                    // The common ops themselves are tiny, so the next
+                    // optimization can remove this clone entirely.
 
-                            Op::Sub => {
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[0],
-                                    grad,
-                                );
+                    let prev = match &tape.nodes[id] {
+                        Node::Scalar(node) => node.prev.clone(),
+                        _ => unreachable!(),
+                    };
 
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[1],
-                                    -grad,
-                                );
-                            }
+                    match op {
+                        Op::Leaf => {}
 
-                            Op::Mul => {
-                                let a = prev[0];
-                                let b = prev[1];
+                        Op::Add => {
+                            add_node_grad(
+                                &mut tape,
+                                prev[0],
+                                grad,
+                            );
 
-                                let a_data = node_data(&tape, a);
-                                let b_data = node_data(&tape, b);
-
-                                add_node_grad(
-                                    &mut tape,
-                                    a,
-                                    grad * b_data,
-                                );
-
-                                add_node_grad(
-                                    &mut tape,
-                                    b,
-                                    grad * a_data,
-                                );
-                            }
-
-                            Op::Fma { weight, input } => {
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[0],
-                                    grad,
-                                );
-
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[1],
-                                    grad * input,
-                                );
-
-                                add_node_grad(
-                                    &mut tape,
-                                    prev[2],
-                                    grad * weight,
-                                );
-                            }
-
-                            Op::Linear {
-                                input_size,
-                                relu,
-                                pre_activation,
-                            } => {
-                                let mut grad_out = grad;
-
-                                if relu && pre_activation <= 0.0 {
-                                    grad_out *= 0.01;
-                                }
-
-                                let base = input_size;
-
-                                for i in 0..base {
-                                    let w_id = prev[i];
-                                    let x_id = prev[base + i];
-
-                                    let w = node_data(&tape, w_id);
-                                    let x = node_data(&tape, x_id);
-
-                                    add_node_grad(
-                                        &mut tape,
-                                        w_id,
-                                        grad_out * x,
-                                    );
-
-                                    add_node_grad(
-                                        &mut tape,
-                                        x_id,
-                                        grad_out * w,
-                                    );
-                                }
-
-                                let bias = prev[base * 2];
-
-                                add_node_grad(
-                                    &mut tape,
-                                    bias,
-                                    grad_out,
-                                );
-                            }
-
-                            Op::Pow(n) => {
-                                let x_id = prev[0];
-                                let x = node_data(&tape, x_id);
-
-                                add_node_grad(
-                                    &mut tape,
-                                    x_id,
-                                    grad * n * x.powf(n - 1.0),
-                                );
-                            }
-
-                            Op::Sigmoid => {
-                                let x_id = prev[0];
-                                let y = node_data(&tape, handle);
-
-                                add_node_grad(
-                                    &mut tape,
-                                    x_id,
-                                    grad * y * (1.0 - y),
-                                );
-                            }
-
-                            Op::Relu => {
-                                let x_id = prev[0];
-                                let x = node_data(&tape, x_id);
-
-                                let local_grad = if x > 0.0 {
-                                    1.0
-                                } else {
-                                    0.01
-                                };
-
-                                add_node_grad(
-                                    &mut tape,
-                                    x_id,
-                                    grad * local_grad,
-                                );
-                            }
-
-                            Op::SoftmaxCrossEntropyOld {
-                                probs,
-                                targets,
-                            } => {
-                                for i in 0..prev.len() {
-                                    let local_grad =
-                                        probs[i] - targets[i];
-
-                                    add_node_grad(
-                                        &mut tape,
-                                        prev[i],
-                                        grad * local_grad,
-                                    );
-                                }
-                            }
-
-                            Op::SoftmaxCrossEntropy {
-                                probs,
-                                target,
-                            } => {
-                                for (i, &prob) in probs.iter()
-                                    .enumerate()
-                                    .take(prev.len())
-                                {
-                                    let mut local_grad = prob;
-
-                                    if i == target {
-                                        local_grad -= 1.0;
-                                    }
-
-                                    add_node_grad(
-                                        &mut tape,
-                                        prev[i],
-                                        grad * local_grad,
-                                    );
-                                }
-                            }
+                            add_node_grad(
+                                &mut tape,
+                                prev[1],
+                                grad,
+                            );
                         }
-                    }
-                    Node::FusedLayer(node) => {
-                        let input_size = node.input_size;
-                        let output_size = node.output_size;
-                        let relu = node.relu;
 
-                        // Copy only handles. These are tiny compared with the old
-                        // outputs/grads clones and, importantly, release the borrow
-                        // on `tape` before we mutate it.
-                        let inputs = node.inputs.clone();
-                        let weights = node.weights.clone();
-                        let biases = node.biases.clone();
-                        let input_values: Vec<f32> = inputs
-                            .iter()
-                            .map(|&h| node_data(&tape, h))
-                            .collect();
-                        let weight_values: Vec<f32> = weights
-                            .iter()
-                            .map(|&h| match &tape.nodes[h.node] {
-                                Node::Scalar(node) => node.data,
-                                Node::FusedLayer(_) => unreachable!(),
-                            })
-                            .collect();
-                        let mut input_grads = vec![0.0f32; input_size];
+                        Op::Sub => {
+                            add_node_grad(
+                                &mut tape,
+                                prev[0],
+                                grad,
+                            );
 
-                        // Read output/grads one element at a time before mutation.
-                        for o in 0..output_size {
-                            let mut grad_out;
-                            let output;
+                            add_node_grad(
+                                &mut tape,
+                                prev[1],
+                                -grad,
+                            );
+                        }
 
-                            match &tape.nodes[id] {
-                                Node::FusedLayer(node) => {
-                                    grad_out = node.grads[o];
-                                    output = node.outputs[o];
-                                }
-                                _ => unreachable!(),
-                            }
+                        Op::Mul => {
+                            let a = prev[0];
+                            let b = prev[1];
 
-                            if relu && output <= 0.0 {
+                            let a_data = node_data(&tape, a);
+                            let b_data = node_data(&tape, b);
+
+                            add_node_grad(
+                                &mut tape,
+                                a,
+                                grad * b_data,
+                            );
+
+                            add_node_grad(
+                                &mut tape,
+                                b,
+                                grad * a_data,
+                            );
+                        }
+
+                        Op::Fma { weight, input } => {
+                            add_node_grad(
+                                &mut tape,
+                                prev[0],
+                                grad,
+                            );
+
+                            add_node_grad(
+                                &mut tape,
+                                prev[1],
+                                grad * input,
+                            );
+
+                            add_node_grad(
+                                &mut tape,
+                                prev[2],
+                                grad * weight,
+                            );
+                        }
+
+                        Op::Linear {
+                            input_size,
+                            relu,
+                            pre_activation,
+                        } => {
+                            let mut grad_out = grad;
+
+                            if relu && pre_activation <= 0.0 {
                                 grad_out *= 0.01;
                             }
 
-                            let weight_base = o * input_size;
+                            let base = input_size;
 
-                            for i in 0..input_size {
-                                let w_id = weights[weight_base + i];
+                            for i in 0..base {
+                                let w_id = prev[i];
+                                let x_id = prev[base + i];
 
-                                let w = weight_values[weight_base + i];
-                                let x = input_values[i];
+                                let w = node_data(&tape, w_id);
+                                let x = node_data(&tape, x_id);
 
-                                match &mut tape.nodes[w_id.node] {
-                                    Node::Scalar(node) => {
-                                        node.grad += grad_out * x;
-                                    }
-                                    Node::FusedLayer(_) => unreachable!(),
-                                }
+                                add_node_grad(
+                                    &mut tape,
+                                    w_id,
+                                    grad_out * x,
+                                );
 
-                                input_grads[i] += grad_out * w;
+                                add_node_grad(
+                                    &mut tape,
+                                    x_id,
+                                    grad_out * w,
+                                );
                             }
 
-                            let bias_id = biases[o];
+                            let bias = prev[base * 2];
 
-                            match &mut tape.nodes[bias_id.node] {
-                                Node::Scalar(node) => {
-                                    node.grad += grad_out;
-                                }
-                                Node::FusedLayer(_) => unreachable!(),
-                            }
-                        }
-                        for i in 0..input_size {
                             add_node_grad(
                                 &mut tape,
-                                inputs[i],
-                                input_grads[i],
+                                bias,
+                                grad_out,
                             );
+                        }
+
+                        Op::Pow(n) => {
+                            let x_id = prev[0];
+                            let x = node_data(&tape, x_id);
+
+                            add_node_grad(
+                                &mut tape,
+                                x_id,
+                                grad * n * x.powf(n - 1.0),
+                            );
+                        }
+
+                        Op::Sigmoid => {
+                            let x_id = prev[0];
+
+                            // The output is already stored in this node.
+                            let y = node_data(
+                                &tape,
+                                handle,
+                            );
+
+                            add_node_grad(
+                                &mut tape,
+                                x_id,
+                                grad * y * (1.0 - y),
+                            );
+                        }
+
+                        Op::Relu => {
+                            let x_id = prev[0];
+                            let x = node_data(&tape, x_id);
+
+                            let local_grad =
+                                if x > 0.0 { 1.0 } else { 0.01 };
+
+                            add_node_grad(
+                                &mut tape,
+                                x_id,
+                                grad * local_grad,
+                            );
+                        }
+
+                        Op::SoftmaxCrossEntropyOld {
+                            probs,
+                            targets,
+                        } => {
+                            for i in 0..prev.len() {
+                                let local_grad =
+                                    probs[i] - targets[i];
+
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[i],
+                                    grad * local_grad,
+                                );
+                            }
+                        }
+
+                        Op::SoftmaxCrossEntropy {
+                            probs,
+                            target,
+                        } => {
+                            for i in 0..prev.len() {
+                                let mut local_grad = probs[i];
+
+                                if i == target {
+                                    local_grad -= 1.0;
+                                }
+
+                                add_node_grad(
+                                    &mut tape,
+                                    prev[i],
+                                    grad * local_grad,
+                                );
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                // ---------------------------------------------------------
+                // Fused layer
+                // ---------------------------------------------------------
+
+                // Temporarily move the fused layer out of the tape.
+                //
+                // This is the important optimization:
+                //
+                //   - no cloning inputs
+                //   - no cloning weights
+                //   - no cloning biases
+                //   - no cloning outputs
+                //   - no cloning grads
+                //   - no unsafe
+                //
+                // Once the FusedLayerData is moved out, we can freely mutate
+                // other nodes in `tape` without fighting the borrow checker.
+                let fused = match std::mem::replace(
+                    &mut tape.nodes[id],
+                    Node::Scalar(TensorData {
+                        data: 0.0,
+                        grad: 0.0,
+                        prev: Vec::new(),
+                        op: Op::Leaf,
+                    }),
+                ) {
+                    Node::FusedLayer(node) => node,
+                    _ => unreachable!(),
+                };
+
+                let input_size = fused.input_size;
+                let output_size = fused.output_size;
+                let relu = fused.relu;
+
+                let weight_count = input_size * output_size;
+
+                // ---------------------------------------------------------
+                // Resize reusable scratch buffers.
+                // ---------------------------------------------------------
+
+                if tape.scratch_inputs.len() < input_size {
+                    tape.scratch_inputs.resize(input_size, 0.0);
+                }
+
+                if tape.scratch_weights.len() < weight_count {
+                    tape.scratch_weights.resize(weight_count, 0.0);
+                }
+
+                if tape.scratch_input_grads.len() < input_size {
+                    tape.scratch_input_grads.resize(input_size, 0.0);
+                }
+
+                // ---------------------------------------------------------
+                // Read inputs into contiguous f32 scratch.
+                // ---------------------------------------------------------
+
+                for i in 0..input_size {
+                    let h = fused.inputs[i];
+
+                    tape.scratch_inputs[i] =
+                        node_data(&tape, h);
+                }
+
+                // ---------------------------------------------------------
+                // Read weights into contiguous f32 scratch.
+                //
+                // This removes the tape lookup from the matrix hot loop.
+                // ---------------------------------------------------------
+
+                for i in 0..weight_count {
+                    let h = fused.weights[i];
+
+                    tape.scratch_weights[i] =
+                        match &tape.nodes[h.node] {
+                            Node::Scalar(node) => node.data,
+                            Node::FusedLayer(_) => unreachable!(),
+                        };
+                }
+
+                // ---------------------------------------------------------
+                // Clear input gradients.
+                // ---------------------------------------------------------
+
+                tape.scratch_input_grads[..input_size]
+                    .fill(0.0);
+
+                // ---------------------------------------------------------
+                // HOT BACKWARD LOOP
+                // ---------------------------------------------------------
+
+                for o in 0..output_size {
+                    let mut grad_out = fused.grads[o];
+
+                    // Leaky ReLU derivative.
+                    if relu && fused.outputs[o] <= 0.0 {
+                        grad_out *= 0.01;
+                    }
+
+                    let base = o * input_size;
+
+                    for i in 0..input_size {
+                        let w =
+                            tape.scratch_weights[base + i];
+
+                        let x =
+                            tape.scratch_inputs[i];
+
+                        // -----------------------------------------------------
+                        // Weight gradient.
+                        // -----------------------------------------------------
+
+                        let weight_id =
+                            fused.weights[base + i];
+
+                        match &mut tape.nodes[weight_id.node] {
+                            Node::Scalar(node) => {
+                                node.grad += grad_out * x;
+                            }
+
+                            Node::FusedLayer(_) => {
+                                unreachable!();
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // Input gradient.
+                        //
+                        // Keep this local instead of touching the tape for every
+                        // multiplication.
+                        // -----------------------------------------------------
+
+                        tape.scratch_input_grads[i] +=
+                            grad_out * w;
+                    }
+
+                    // ---------------------------------------------------------
+                    // Bias gradient.
+                    // ---------------------------------------------------------
+
+                    let bias_id = fused.biases[o];
+
+                    match &mut tape.nodes[bias_id.node] {
+                        Node::Scalar(node) => {
+                            node.grad += grad_out;
+                        }
+
+                        Node::FusedLayer(_) => {
+                            unreachable!();
                         }
                     }
                 }
+
+                // ---------------------------------------------------------
+                // Propagate accumulated input gradients.
+                // ---------------------------------------------------------
+
+                for i in 0..input_size {
+                    let input_id = fused.inputs[i];
+
+                    let grad =
+                        tape.scratch_input_grads[i];
+
+                    match &mut tape.nodes[input_id.node] {
+                        Node::Scalar(node) => {
+                            node.grad += grad;
+                        }
+
+                        Node::FusedLayer(node) => {
+                            node.grads[input_id.index] += grad;
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Put the fused layer back into the tape.
+                //
+                // Its own `grads` are unchanged, just as before.
+                // ---------------------------------------------------------
+
+                tape.nodes[id] =
+                    Node::FusedLayer(fused);
             }
         });
     }

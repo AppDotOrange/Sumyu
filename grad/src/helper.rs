@@ -242,7 +242,7 @@ fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
 }
 
 pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
-     let mut vocab: Vec<String> = vec!["<UNKNOWN>".to_string(), "".to_string()];
+     let mut vocab: Vec<String> = vec!["".to_string(), "".to_string()];
      let mut chars = Vec::new();
      for x in text.chars() {
           let y = x.to_string();
@@ -407,6 +407,30 @@ pub fn tale_v1_mini_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'sta
                 16,
                 40,
                 &[200, 100],
+                epochs,
+    )
+}
+
+pub fn tale_v1_mini_mini_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+    Config::new(lr,
+                batch_size,
+                0, // no limit
+                tale_v1(),
+                16,
+                32,
+                &[100],
+                epochs,
+    )
+}
+
+pub fn tale_v1_scout_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+    Config::new(lr,
+                batch_size,
+                0, // no limit
+                tale_v1(),
+                32,
+                30,
+                &[90],
                 epochs,
     )
 }
