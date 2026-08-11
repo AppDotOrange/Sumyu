@@ -4,10 +4,12 @@ pub mod helper;
 pub mod fnn_lm;
 pub mod chatter;
 pub mod embeddings;
+pub mod batched;
 
 use std::cell::RefCell;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use cblas::{Layout, Transpose};
 
 #[derive(Clone)]
 #[derive(Serialize, Deserialize)]
@@ -75,14 +77,8 @@ struct Tape {
     scratch_inputs: Vec<f32>,
     scratch_weights: Vec<f32>,
     scratch_input_grads: Vec<f32>,
-
-    scratch_outputs: Vec<f32>,
-    scratch_output_grads: Vec<f32>,
-
-    // Reused handle buffers.
-    scratch_inputs_handles: Vec<TensorHandle>,
-    scratch_weights_handles: Vec<TensorHandle>,
-    scratch_bias_handles: Vec<TensorHandle>,
+    scratch_weight_grads: Vec<f32>,
+    scratch_bias_grads: Vec<f32>,
 }
 
 impl Tape {
@@ -92,14 +88,12 @@ impl Tape {
             scratch_inputs: Vec::new(),
             scratch_weights: Vec::new(),
             scratch_input_grads: Vec::new(),
-            scratch_outputs: Vec::new(),
-            scratch_output_grads: Vec::new(),
-            scratch_inputs_handles: Vec::new(),
-            scratch_weights_handles: Vec::new(),
-            scratch_bias_handles: Vec::new(),
+            scratch_weight_grads: Vec::new(),
+            scratch_bias_grads: Vec::new(),
         }
     }
 
+    #[inline]
     fn alloc(
         &mut self,
         data: f32,
@@ -123,15 +117,6 @@ impl Tape {
         }
     }
 
-    fn alloc_fused_layer(
-        &mut self,
-        data: FusedLayerData,
-    ) -> usize {
-        let id = self.nodes.len();
-        self.nodes.push(Node::FusedLayer(data));
-        id
-    }
-
     fn clear_after(&mut self, index: usize) {
         self.nodes.truncate(index);
     }
@@ -150,12 +135,15 @@ pub fn tape_len() -> usize {
     })
 }
 
+#[inline]
+pub(crate) fn handle_data(handle: TensorHandle) -> f32 {
+    TAPE.with(|t| {
+        node_data(&t.borrow(), handle)
+    })
+}
+
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
-    static TOPO_VISITED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-    static TOPO_GENERATION: RefCell<u32> = const { RefCell::new(0) };
-    static TOPO_STACK1: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
-    static TOPO_STACK2: RefCell<Vec<TensorHandle>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn zero_grad_and_update(params: &[Tensor], lr: f32) -> f32 {
@@ -209,6 +197,26 @@ fn add_node_grad(
     }
 }
 
+pub(crate) fn add_handle_grads(
+    grads: &[(TensorHandle, f32)],
+) {
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        for &(handle, grad) in grads {
+            match &mut tape.nodes[handle.node] {
+                Node::Scalar(node) => {
+                    node.grad += grad;
+                }
+
+                Node::FusedLayer(node) => {
+                    node.grads[handle.index] += grad;
+                }
+            }
+        }
+    });
+}
+
 impl Tensor {
     pub fn new(data: f32) -> Self {
         let id = TAPE.with(|t| {
@@ -223,6 +231,7 @@ impl Tensor {
         }
     }
 
+    #[inline(always)]
     fn from_op(
         data: f32,
         prev: Vec<TensorHandle>,
@@ -240,6 +249,7 @@ impl Tensor {
         }
     }
 
+    #[inline(always)]
     pub fn data(&self) -> f32 {
         TAPE.with(|t| {
             match &t.borrow().nodes[self.handle.node] {
@@ -447,34 +457,48 @@ impl Tensor {
                     };
             }
 
-            let mut outputs = Vec::with_capacity(output_size);
+            let mut outputs = vec![0.0f32; output_size];
 
+            // BLAS: outputs = W * inputs
+            //
+            // W is stored row-major as:
+            // [ w00 w01 ... w0n ]
+            // [ w10 w11 ... w1n ]
+            // [ ...           ]
+            //
+            // So this is:
+            // output_size × input_size
+            unsafe {
+                cblas::sgemv(
+                    Layout::RowMajor,
+                    Transpose::None,
+                    output_size as i32,
+                    input_size as i32,
+                    1.0,
+                    &tape.scratch_weights[..weights.len()],
+                    input_size as i32,
+                    &tape.scratch_inputs[..input_size],
+                    1,
+                    0.0,
+                    &mut outputs,
+                    1,
+                );
+            }
+
+            // Add biases.
             for o in 0..output_size {
-                let bias = match &tape.nodes[biases[o].node] {
+                outputs[o] += match &tape.nodes[biases[o].node] {
                     Node::Scalar(node) => node.data,
                     Node::FusedLayer(_) => unreachable!(),
                 };
 
-                let base = o * input_size;
-
-                let mut sum = bias;
-
-                // HOT LOOP
-                for i in 0..input_size {
-                    sum +=
-                        tape.scratch_weights[base + i]
-                            * tape.scratch_inputs[i];
-                }
-
                 if relu {
-                    sum = if sum > 0.0 {
-                        sum
+                    outputs[o] = if outputs[o] > 0.0 {
+                        outputs[o]
                     } else {
-                        sum * 0.01
+                        outputs[o] * 0.01
                     };
                 }
-
-                outputs.push(sum);
             }
 
             let id = tape.nodes.len();
@@ -507,75 +531,7 @@ impl Tensor {
             .collect()
     }
 
-    fn build_reverse_top_order(&self) -> Vec<TensorHandle> {
-        TAPE.with(|t| {
-            let tape = t.borrow();
-            let tape_size = tape.nodes.len();
-
-            TOPO_VISITED.with(|v| {
-                TOPO_STACK1.with(|s1| {
-                    TOPO_STACK2.with(|s2| {
-                        let mut visited = v.borrow_mut();
-                        let mut stack1 = s1.borrow_mut();
-                        let mut stack2 = s2.borrow_mut();
-
-                        if visited.len() < tape_size {
-                            visited.resize(tape_size, 0);
-                        }
-
-                        let generation = TOPO_GENERATION.with(|g| {
-                            let mut g = g.borrow_mut();
-                            *g = g.wrapping_add(1);
-
-                            if *g == 0 {
-                                visited.fill(0);
-                                *g = 1;
-                            }
-
-                            *g
-                        });
-
-                        stack1.clear();
-                        stack2.clear();
-
-                        stack1.push(self.handle);
-
-                        while let Some(handle) = stack1.pop() {
-                            let id = handle.node;
-
-                            if visited[id] == generation {
-                                continue;
-                            }
-
-                            visited[id] = generation;
-
-                            match &tape.nodes[id] {
-                                Node::Scalar(node) => {
-                                    stack1.extend(
-                                        node.prev.iter().rev().copied()
-                                    );
-                                }
-                                Node::FusedLayer(node) => {
-                                    // Only inputs are graph dependencies.
-                                    // Weights and biases are leaves/parameters.
-                                    stack1.extend(
-                                        node.inputs.iter().rev().copied()
-                                    );
-                                }
-                            }
-                            stack2.push(handle);
-                        }
-                        let result = std::mem::take(&mut *stack2);
-                        result
-                    })
-                })
-            })
-        })
-    }
-
-    pub fn backward(&self) {
-        let topo = self.build_reverse_top_order();
-
+    pub fn backward(&self, parameter_boundary: usize) {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
 
@@ -590,39 +546,31 @@ impl Tensor {
                 }
             }
 
-            for &handle in topo.iter() {
-                let id = handle.node;
+            // Every node after parameter_boundary belongs to the current
+            // computation graph. Since nodes are allocated after their
+            // dependencies, reverse node order is already reverse-topological.
+            let tape_end = tape.nodes.len();
 
-                // ---------------------------------------------------------
-                // Get gradient without keeping a borrow alive.
-                // ---------------------------------------------------------
-
-                let grad = match &tape.nodes[id] {
-                    Node::Scalar(node) => node.grad,
-                    Node::FusedLayer(node) => node.grads[handle.index],
-                };
-
+            for id in (parameter_boundary..tape_end).rev() {
                 // ---------------------------------------------------------
                 // Scalar node
                 // ---------------------------------------------------------
 
                 if matches!(&tape.nodes[id], Node::Scalar(_)) {
-                    // Extract everything we need from the node FIRST.
-                    //
-                    // This is the important part:
-                    // after this scope ends, `tape.nodes[id]` is no longer
-                    // immutably borrowed.
+                    // Get gradient without keeping a borrow alive.
+                    let grad = match &tape.nodes[id] {
+                        Node::Scalar(node) => node.grad,
+                        _ => unreachable!(),
+                    };
 
+                    // Extract everything we need from the node.
+                    //
+                    // We still clone these because the current Op representation
+                    // owns its data. This can be optimized separately later.
                     let op = match &tape.nodes[id] {
                         Node::Scalar(node) => node.op.clone(),
                         _ => unreachable!(),
                     };
-
-                    // We unfortunately still clone Op here because your
-                    // SoftmaxCrossEntropy variants contain Vecs.
-                    //
-                    // The common ops themselves are tiny, so the next
-                    // optimization can remove this clone entirely.
 
                     let prev = match &tape.nodes[id] {
                         Node::Scalar(node) => node.prev.clone(),
@@ -759,7 +707,10 @@ impl Tensor {
                             // The output is already stored in this node.
                             let y = node_data(
                                 &tape,
-                                handle,
+                                TensorHandle {
+                                    node: id,
+                                    index: 0,
+                                },
                             );
 
                             add_node_grad(
@@ -828,17 +779,8 @@ impl Tensor {
 
                 // Temporarily move the fused layer out of the tape.
                 //
-                // This is the important optimization:
-                //
-                //   - no cloning inputs
-                //   - no cloning weights
-                //   - no cloning biases
-                //   - no cloning outputs
-                //   - no cloning grads
-                //   - no unsafe
-                //
-                // Once the FusedLayerData is moved out, we can freely mutate
-                // other nodes in `tape` without fighting the borrow checker.
+                // This allows us to mutate parameter/input gradients while
+                // still having ownership of the fused layer's data.
                 let fused = match std::mem::replace(
                     &mut tape.nodes[id],
                     Node::Scalar(TensorData {
@@ -874,6 +816,17 @@ impl Tensor {
                     tape.scratch_input_grads.resize(input_size, 0.0);
                 }
 
+                if tape.scratch_weight_grads.len() < weight_count {
+                    tape.scratch_weight_grads.resize(weight_count, 0.0);
+                }
+
+                if tape.scratch_bias_grads.len() < output_size {
+                    tape.scratch_bias_grads.resize(output_size, 0.0);
+                }
+
+                tape.scratch_weight_grads[..weight_count].fill(0.0);
+                tape.scratch_bias_grads[..output_size].fill(0.0);
+
                 // ---------------------------------------------------------
                 // Read inputs into contiguous f32 scratch.
                 // ---------------------------------------------------------
@@ -887,8 +840,6 @@ impl Tensor {
 
                 // ---------------------------------------------------------
                 // Read weights into contiguous f32 scratch.
-                //
-                // This removes the tape lookup from the matrix hot loop.
                 // ---------------------------------------------------------
 
                 for i in 0..weight_count {
@@ -909,8 +860,12 @@ impl Tensor {
                     .fill(0.0);
 
                 // ---------------------------------------------------------
-                // HOT BACKWARD LOOP
+                // Prepare dY = gradient after activation derivative.
                 // ---------------------------------------------------------
+
+                if tape.scratch_bias_grads.len() < output_size {
+                    tape.scratch_bias_grads.resize(output_size, 0.0);
+                }
 
                 for o in 0..output_size {
                     let mut grad_out = fused.grads[o];
@@ -920,52 +875,83 @@ impl Tensor {
                         grad_out *= 0.01;
                     }
 
-                    let base = o * input_size;
+                    tape.scratch_bias_grads[o] = grad_out;
+                }
 
-                    for i in 0..input_size {
-                        let w =
-                            tape.scratch_weights[base + i];
+                // ---------------------------------------------------------
+                // dX = W^T * dY
+                // ---------------------------------------------------------
 
-                        let x =
-                            tape.scratch_inputs[i];
+                tape.scratch_input_grads[..input_size].fill(0.0);
 
-                        // -----------------------------------------------------
-                        // Weight gradient.
-                        // -----------------------------------------------------
+                let Tape {
+                    scratch_weights,
+                    scratch_bias_grads,
+                    scratch_input_grads,
+                    ..
+                } = &mut *tape;
 
-                        let weight_id =
-                            fused.weights[base + i];
+                unsafe {
+                    cblas::sgemv(
+                        Layout::RowMajor,
+                        Transpose::Ordinary,
+                        output_size as i32,
+                        input_size as i32,
+                        1.0,
+                        &scratch_weights[..weight_count],
+                        input_size as i32,
+                        &scratch_bias_grads[..output_size],
+                        1,
+                        0.0,
+                        &mut scratch_input_grads[..input_size],
+                        1,
+                    );
+                }
 
-                        match &mut tape.nodes[weight_id.node] {
-                            Node::Scalar(node) => {
-                                node.grad += grad_out * x;
-                            }
+                // ---------------------------------------------------------
+                // dW = dY * X^T
+                //
+                // dY: output_size × 1
+                // X^T: 1 × input_size
+                //
+                // Result: output_size × input_size
+                // ---------------------------------------------------------
 
-                            Node::FusedLayer(_) => {
-                                unreachable!();
-                            }
-                        }
+                tape.scratch_weight_grads[..weight_count].fill(0.0);
 
-                        // -----------------------------------------------------
-                        // Input gradient.
-                        //
-                        // Keep this local instead of touching the tape for every
-                        // multiplication.
-                        // -----------------------------------------------------
+                let Tape {
+                    scratch_bias_grads,
+                    scratch_inputs,
+                    scratch_weight_grads,
+                    ..
+                } = &mut *tape;
 
-                        tape.scratch_input_grads[i] +=
-                            grad_out * w;
-                    }
+                unsafe {
+                    cblas::sger(
+                        Layout::RowMajor,
+                        output_size as i32,
+                        input_size as i32,
+                        1.0,
+                        &scratch_bias_grads[..output_size],
+                        1,
+                        &scratch_inputs[..input_size],
+                        1,
+                        &mut scratch_weight_grads[..weight_count],
+                        input_size as i32,
+                    );
+                }
 
-                    // ---------------------------------------------------------
-                    // Bias gradient.
-                    // ---------------------------------------------------------
+                // ---------------------------------------------------------
+                // Accumulate weight gradients.
+                // ---------------------------------------------------------
 
-                    let bias_id = fused.biases[o];
+                for i in 0..weight_count {
+                    let weight_id = fused.weights[i];
+                    let grad = tape.scratch_weight_grads[i];
 
-                    match &mut tape.nodes[bias_id.node] {
+                    match &mut tape.nodes[weight_id.node] {
                         Node::Scalar(node) => {
-                            node.grad += grad_out;
+                            node.grad += grad;
                         }
 
                         Node::FusedLayer(_) => {
@@ -975,14 +961,31 @@ impl Tensor {
                 }
 
                 // ---------------------------------------------------------
-                // Propagate accumulated input gradients.
+                // Accumulate bias gradients.
+                // ---------------------------------------------------------
+
+                for o in 0..output_size {
+                    let bias_id = fused.biases[o];
+                    let grad = tape.scratch_bias_grads[o];
+
+                    match &mut tape.nodes[bias_id.node] {
+                        Node::Scalar(node) => {
+                            node.grad += grad;
+                        }
+
+                        Node::FusedLayer(_) => {
+                            unreachable!();
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Propagate input gradients.
                 // ---------------------------------------------------------
 
                 for i in 0..input_size {
                     let input_id = fused.inputs[i];
-
-                    let grad =
-                        tape.scratch_input_grads[i];
+                    let grad = tape.scratch_input_grads[i];
 
                     match &mut tape.nodes[input_id.node] {
                         Node::Scalar(node) => {
@@ -994,13 +997,9 @@ impl Tensor {
                         }
                     }
                 }
-
                 // ---------------------------------------------------------
-                // Put the fused layer back into the tape.
-                //
-                // Its own `grads` are unchanged, just as before.
+                // Put the fused layer back.
                 // ---------------------------------------------------------
-
                 tape.nodes[id] =
                     Node::FusedLayer(fused);
             }

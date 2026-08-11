@@ -2,6 +2,30 @@ use std::sync::Arc;
 use crate::{Tensor, TensorHandle};
 use rand_distr::{Distribution, Normal as NormalDist};
 use serde::{Serialize, Deserialize};
+use cblas::{Layout, Transpose};
+
+pub(crate) struct BatchLayerCache {
+    pub input_size: usize,
+    pub output_size: usize,
+
+    pub input: Vec<f32>,
+    pub output: Vec<f32>,
+
+    pub weights: Vec<f32>,
+    pub biases: Vec<f32>,
+
+    pub weight_handles: Arc<[TensorHandle]>,
+    pub bias_handles: Arc<[TensorHandle]>,
+
+    pub relu: bool,
+}
+
+pub(crate) struct BatchForward {
+    pub output: Vec<f32>,
+    pub batch_size: usize,
+    pub output_size: usize,
+    pub layers: Vec<BatchLayerCache>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedNeuron {
@@ -223,6 +247,269 @@ impl MLP {
         }
 
         current
+    }
+
+    pub(crate) fn forward_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+        input_size: usize,
+    ) -> BatchForward {
+        debug_assert_eq!(
+            input.len(),
+            batch_size * input_size
+        );
+
+        let mut current = input.to_vec();
+        let mut current_size = input_size;
+
+        let mut layers = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let output_size = layer.neurons.len();
+
+            debug_assert_eq!(
+                layer.fused_weights.len(),
+                output_size * current_size
+            );
+
+            let mut weights =
+                Vec::with_capacity(output_size * current_size);
+
+            for &handle in layer.fused_weights.iter() {
+                weights.push(crate::handle_data(handle));
+            }
+
+            let mut biases =
+                Vec::with_capacity(output_size);
+
+            for &handle in layer.fused_biases.iter() {
+                biases.push(crate::handle_data(handle));
+            }
+
+            let mut output =
+                vec![0.0f32; batch_size * output_size];
+
+            // X [batch × input]
+            // Wᵀ [input × output]
+            //
+            // Y = X Wᵀ
+            //
+            // Our W is stored as:
+            // [output × input]
+            //
+            // BLAS therefore computes:
+            //
+            // C = Wᵀ * Xᵀ
+            //
+            // but C is naturally column-major for that formulation.
+            //
+            // Instead, use row-major:
+            //
+            // C = X * Wᵀ
+            unsafe {
+                cblas::sgemm(
+                    Layout::RowMajor,
+                    Transpose::None,
+                    Transpose::Ordinary,
+                    batch_size as i32,
+                    output_size as i32,
+                    current_size as i32,
+                    1.0,
+                    &current,
+                    current_size as i32,
+                    &weights,
+                    current_size as i32,
+                    0.0,
+                    &mut output,
+                    output_size as i32,
+                );
+            }
+
+            // Bias + activation.
+            for b in 0..batch_size {
+                let base = b * output_size;
+
+                for o in 0..output_size {
+                    let idx = base + o;
+
+                    output[idx] += biases[o];
+
+                    if layer.neurons[0].is_output == false {
+                        if output[idx] <= 0.0 {
+                            output[idx] *= 0.01;
+                        }
+                    }
+                }
+            }
+
+            layers.push(BatchLayerCache {
+                input_size: current_size,
+                output_size,
+                input: current,
+                output: output.clone(),
+                weights,
+                biases,
+                weight_handles: Arc::clone(&layer.fused_weights),
+                bias_handles: Arc::clone(&layer.fused_biases),
+                relu: !layer.neurons[0].is_output,
+            });
+
+            current = output;
+            current_size = output_size;
+        }
+
+        BatchForward {
+            output: current,
+            batch_size,
+            output_size: current_size,
+            layers,
+        }
+    }
+
+    pub(crate) fn backward_batch(
+        &self,
+        forward: &BatchForward,
+        output_grads: &[f32],
+    ) -> Vec<f32> {
+        debug_assert_eq!(
+            output_grads.len(),
+            forward.batch_size * forward.output_size
+        );
+
+        let batch_size = forward.batch_size;
+
+        let mut grad = output_grads.to_vec();
+
+        // Process layers backwards.
+        for layer in forward.layers.iter().rev() {
+            let input_size = layer.input_size;
+            let output_size = layer.output_size;
+
+            // ---------------------------------------------------------
+            // Apply activation derivative.
+            // ---------------------------------------------------------
+
+            if layer.relu {
+                for b in 0..batch_size {
+                    let base = b * output_size;
+
+                    for o in 0..output_size {
+                        let idx = base + o;
+
+                        if layer.output[idx] <= 0.0 {
+                            grad[idx] *= 0.01;
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------
+            // dW = dYᵀ X
+            //
+            // dY = [batch × output]
+            // X  = [batch × input]
+            //
+            // dW = [output × input]
+            // ---------------------------------------------------------
+
+            let mut weight_grads =
+                vec![0.0f32; output_size * input_size];
+
+            unsafe {
+                cblas::sgemm(
+                    Layout::RowMajor,
+                    Transpose::Ordinary,
+                    Transpose::None,
+                    output_size as i32,
+                    input_size as i32,
+                    batch_size as i32,
+                    1.0,
+                    &grad,
+                    output_size as i32,
+                    &layer.input,
+                    input_size as i32,
+                    0.0,
+                    &mut weight_grads,
+                    input_size as i32,
+                );
+            }
+
+            // ---------------------------------------------------------
+            // db = sum(dY)
+            // ---------------------------------------------------------
+
+            let mut bias_grads =
+                vec![0.0f32; output_size];
+
+            for b in 0..batch_size {
+                let base = b * output_size;
+
+                for o in 0..output_size {
+                    bias_grads[o] += grad[base + o];
+                }
+            }
+
+            // ---------------------------------------------------------
+            // dX = dY W
+            //
+            // dY [batch × output]
+            // W  [output × input]
+            //
+            // dX [batch × input]
+            // ---------------------------------------------------------
+
+            let mut input_grads =
+                vec![0.0f32; batch_size * input_size];
+
+            unsafe {
+                cblas::sgemm(
+                    Layout::RowMajor,
+                    Transpose::None,
+                    Transpose::None,
+                    batch_size as i32,
+                    input_size as i32,
+                    output_size as i32,
+                    1.0,
+                    &grad,
+                    output_size as i32,
+                    &layer.weights,
+                    input_size as i32,
+                    0.0,
+                    &mut input_grads,
+                    input_size as i32,
+                );
+            }
+
+            // ---------------------------------------------------------
+            // Accumulate parameter gradients.
+            // ---------------------------------------------------------
+
+            let mut parameter_grads =
+                Vec::with_capacity(
+                    weight_grads.len() + bias_grads.len()
+                );
+
+            for i in 0..weight_grads.len() {
+                parameter_grads.push((
+                    layer.weight_handles[i],
+                    weight_grads[i],
+                ));
+            }
+
+            for i in 0..bias_grads.len() {
+                parameter_grads.push((
+                    layer.bias_handles[i],
+                    bias_grads[i],
+                ));
+            }
+
+            crate::add_handle_grads(&parameter_grads);
+
+            grad = input_grads;
+        }
+
+        grad
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {

@@ -68,6 +68,79 @@ impl Embeddings {
         out
     }
 
+    pub(crate) fn encode_batch(
+        &self,
+        ids: &[usize],
+        batch_size: usize,
+        context_len: usize,
+    ) -> Vec<f32> {
+        let input_size =
+            context_len * self.embedding_dim;
+
+        let mut output =
+            vec![0.0f32; batch_size * input_size];
+
+        for b in 0..batch_size {
+            let sample =
+                &ids[b * context_len..(b + 1) * context_len];
+
+            let dst =
+                &mut output[
+                    b * input_size
+                        ..(b + 1) * input_size
+                    ];
+
+            for (position, &id) in sample.iter().enumerate() {
+                let src = &self.vectors[id];
+
+                let offset =
+                    position * self.embedding_dim;
+
+                for i in 0..self.embedding_dim {
+                    dst[offset + i] = src[i].data();
+                }
+            }
+        }
+        output
+    }
+
+    pub(crate) fn accumulate_batch_grads(
+        &self,
+        ids: &[usize],
+        input_grads: &[f32],
+        batch_size: usize,
+        context_len: usize,
+    ) {
+        let input_size =
+            context_len * self.embedding_dim;
+
+        let mut grads = Vec::new();
+
+        for b in 0..batch_size {
+            for position in 0..context_len {
+                let token = ids[
+                    b * context_len + position
+                    ];
+
+                let input_offset =
+                    b * input_size
+                        + position * self.embedding_dim;
+
+                let embedding =
+                    &self.vectors[token];
+
+                for i in 0..self.embedding_dim {
+                    grads.push((
+                        embedding[i].handle,
+                        input_grads[input_offset + i], // here
+                    ));
+                }
+            }
+        }
+
+        crate::add_handle_grads(&grads);
+    }
+
     pub fn parameters(&self) -> Vec<Tensor> {
         self.vectors
             .iter()

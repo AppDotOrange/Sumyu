@@ -27,7 +27,7 @@ fn main() {
         //------------------------------------------------------------------------------------------
         let mut lm = LM::new(context_len, vocab, hidden_dim, emb_dim);
         lm.params();
-        lm.load_corpus(&text);
+        lm.load_corpus(&poke);
         lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
         lm.train();
     } else if test == 0 {
