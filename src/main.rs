@@ -8,7 +8,7 @@ fn main() {
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
     let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
     let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
-    let test = 4;
+    let test = 2;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
