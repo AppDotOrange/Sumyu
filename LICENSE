@@ -1,0 +1,60 @@
+# Sumyu License
+
+Copyright (c) 2026 AppDotOrange
+
+## Grant of Rights
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, and distribute the Software, subject to the following conditions.
+
+## Commercial Restrictions
+
+The Software itself may **not** be sold, licensed for a fee, or incorporated into a commercial product or service without explicit written permission from the copyright holder.
+
+This includes:
+
+* Selling the source code or compiled binaries
+* Licensing the Software for a fee
+* Incorporating the Software into a commercial application, product, or service
+* Distributing a commercial product that includes or substantially incorporates the Software
+* Offering access to the Software itself as part of a paid service
+
+Commercial use of the Software for the purpose of creating or training machine learning models is permitted under the exception below.
+
+## Exception — Trained Models
+
+You **may freely use the Software for commercial or non-commercial purposes to train machine learning models**.
+
+Any machine learning model trained using the Software, including its weights, checkpoints, and other resulting model files, may be freely sold, licensed, distributed, or incorporated into commercial products and services.
+
+This explicitly permits:
+
+* Selling models trained with the Software
+* Licensing trained models commercially
+* Using trained models in commercial products and services
+* Providing commercial services powered by trained models
+* Training models commercially using the Software
+
+This exception applies to the resulting trained models and does not grant permission to commercially distribute or incorporate the Software itself.
+
+## Attribution
+
+Any distribution of the Software or substantial portions of it must retain this license and attribution to the original author.
+
+## Source Code
+
+If you distribute the Software or a modified version of it, you must provide access to the corresponding source code, including your modifications.
+
+## Modifications
+
+If you modify the Software, you must clearly indicate what changes you have made.
+
+Modified versions of the Software remain subject to this license.
+
+## No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+## Liability
+
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
