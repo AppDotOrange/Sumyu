@@ -4,10 +4,11 @@ use std::{fs, io};
 use std::io::Write;
 
 fn main() {
-    let rust = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
+    let _rust = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
     let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    let test = 5;
+    let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
+    let test = 2;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -76,9 +77,9 @@ fn main() {
         fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
-        println!("{:?}", helper::make_vocab(&text, 250))
+        println!("{:?}.iter().map(|x| {{ String::from(*x) }}).collect()", helper::make_vocab(&recipe, 250))
     } else if test == 2 {
-        let bytes = fs::read("Production/TaleP1_mini.sumyu").unwrap();
+        let bytes = fs::read("Production/RecipeP1.sumyu").unwrap();
         //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
         //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
         let (model, _): (SavedLM, usize) =
@@ -87,8 +88,8 @@ fn main() {
                 bincode::config::standard(),
             ).unwrap();
         let lm = LM::from_saved(model);
-        lm.params();
-        println!("\"{}\"", lm.generate("".to_string(), 1000, 0.7));
+        // lm.params();
+        println!("\"{}\"", lm.generate("".to_string(), 2000, 0.7));
         //lm.generate_one_distribution("".to_string(), 10);
         //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
         //lm.embeds().find_clusters(0.50, helper::ml_v4());
@@ -128,7 +129,7 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::poke_v1_mini_to(0.001, 32, 100_000);
+        let config = helper::poke_v2_mini_to(0.1, 32, 100_000);
         let description = "A Sumyu model trained on a filtered Pokedex.";
 
         //------------------------------------------------------------------------------------------
@@ -136,9 +137,10 @@ fn main() {
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_config(config);
         /*
-        let (description, mut lm) = LM::load("Tests/Poke_V1_134.sumyu");
-        lm.train_options(0.001, 100_000, 32, 0);
+        let (description, mut lm) = LM::load("Production/PokeP1_64_minutes.sumyu");
+        lm.train_options(0.05, 100_000, 32, 0);
         */
+
         lm.params();
         lm.load_corpus(&poke);
         lm.train();
@@ -167,6 +169,29 @@ fn main() {
         lm.train();
         lm.save(
             "Tale_V1.sumyu",
+            &description,
+        );
+    } else if test == 7 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::recipe_v1_to(0.1, 32, 100_000);
+        let description = "A Sumyu model trained on recipes.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_config(config);
+        /*
+        let (description, mut lm) = LM::load("Tests/Tale_V1_scout_10.sumyu");
+        lm.train_options(0.001, 100_000, 32, 0);
+        */
+        lm.params();
+        lm.load_corpus(&recipe);
+        lm.train();
+        lm.save(
+            "RecipeV1.sumyu",
             &description,
         );
     }

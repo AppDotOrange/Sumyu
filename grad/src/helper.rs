@@ -216,6 +216,10 @@ pub fn tale_v1() -> Vec<String> { // 250 tokens
     ["<UNKNOWN>", "", "T", "H", "E", " ", "F", "R", "O", "G", "-", "K", "I", "N", ";", ",", "Y", "\n", "n", "o", "l", "d", "t", "i", "m", "e", "s", "w", "h", "g", "a", "v", "r", "u", "b", "f", "y", "c", ".", "C", "’", "k", "W", "p", "A", "D", "“", "?", "”", "S", "!", "B", "q", "j", "_", "x", ":", "M", "L", "[", "]", "V", "U", "P", "Z", "(", "z", ")", "‘", "J", "Q", "<", ">", "X", "e ", "th", "d ", " th", " a", "er", " the ", "t ", "nd ", "in", " and ", ", ", "s ", "and ", "ou", "en", "he ", "to", "the ", "ed ", "ing", "\n\n", " h", "on", "an", " s", "or", "ll", "ea", " w", "as ", ". ", "at ", "y ", "you", "  ", "hi", "e, ", "ai", "no", "d, ", "ther", "hen", ".\n\n", "”\n\n", "for", "re", "of", "ha", "it", "om", "her", "to ", "st", "the", "ow", "gh", "ll ", "ut ", "was ", ".”\n\n", "ld ", "se", "ing ", "le ", "ver", "ve ", "ch", "ith", " the", "be", "not ", "is ", "ca", "The ", " to ", "she ", " m", "le", "oo", "wa", "had ", "s, ", "    ", " you", "ill ", "with", "aid ", "me ", "ter", "that ", "ck", "ri", "d\n", "sh", "la", "out ", "ti", " was ", "ould ", "ir", " in", "other", " ha", " she ", "li", "him", "a ", "un", "tle ", "ear", "but ", "one ", "t, ", "ght ", "ever", " her", "ly ", "ent ", "ar", "go", "ain", "aid, ", "Then", " he ", ",\n", "when", " it", " said ", "his ", "e\n", "ttle ", "little ", "came ", "es ", "hat ", "ho", " f", " d", "y, ", "ed, ", "rea", "they ", "ng", "said, ", " his ", "all ", "wer", " of", "sel", " be", "ra", " b", "ld", "up", "ke ", "went ", "ust", "But ", " that ", "And ", ",”", " will ", "When", "so", "ing, ", "self", "ce ", " had ", "ed", "own", "gain", "hich", "too", "if", "who", "rou", " they ", "thing ", "est", "com", "ro", "’s ", "here ", " with", "id ", "have ", " p", "sa", "      ", "now", "ven", "and\n", "es", "ked ", "into ", "were ", "ep", "ta", "t\n", "et ", " for", "el", "ell", "fu", "man", "e. ", "ong", "im", "der", "“I", " on", "long", "si", " a ", "ted ", "s\n", "da", " him", "ill", " as ", "could ", "took", "ur", "ne", "rom", "the\n", "King ", "de ", ",\n      ", "them", "pp", " an", "mor", "over", "which", "al", "oman", "ish", "King", "She ", "will ", " them", "did ", " into ", "oor", " have ", " the\n", "ghter", "ughter"].iter().map(|x| { String::from(*x) }).collect()
 }
 
+pub fn recipe_v1() -> Vec<String> { // 250 tokens
+    ["", "", "A", "i", "r", " ", "F", "y", "e", "P", "o", "t", "a", "S", "l", "c", "s", "w", "h", "D", "p", "n", "g", "u", "\n", ":", "T", "f", ",", "v", "d", "b", "k", "m", ".", "—", "'", "I", "3", "/", "4", "1", "2", "W", "C", "B", "5", "R", "0", "(", ")", "-", "G", "7", "z", "j", "8", "9", ";", "6", "M", "E", "?", "!", "q", "¼", "O", "x", "H", "®", "\"", "*", "L", "U", "Q", "N", "½", "Y", "K", "J", "¾", "ñ", "–", "™", "V", "é", "⅓", "°", "⅛", " t", " a", "in", "er", "e ", "es", "on", "d ", "re", ". ", " s", " c", "nd ", " and ", "ea", " th", " the ", "ing", " f", "en", " to", " in", "po", "th", " b", "poon", " m", "ic", "yer", "ryer", " fryer", "ir", "ed ", ".\n", "il", "eas", "easpoon", " teaspoon", "ut", "gre", "ar", " w", "at", " d", "\n1", "ith", " o", "al", " with", " p", "grees", "egrees", " degrees", " degrees ", "et", "an", "ion", "ri", "ou", "ch", "la", "tion", "or", "ow", "st", "ick", " min", " minut", " minutes", " co", "\n\n", " ch", "icken", "ent", "per", " to ", "ok", "is", "ve ", "pper", "epper", "air", "eat", "to", ", ", "and ", "\n\nD", "ed", "ab", "un", "espoon", "lespoon", "ablespoon", " tablespoon", "lic", "rea", "ce ", "til", "until", " until", "co", "ay", "heat", "reheat", " teaspoon ", "li", "sh", ".\n\n", "ction", "ctions", " chicken", " air", "e, ", "el", "alt", "--", "der", "ents", "ients", "dients", "gredients", "ngredients", "ngredients:", "Ingredients:", "gar", "garlic", " of", " (", "ections", "irections", "\n\nDirections", "\n\nDirections:", "le ", "up", " cup", "lace ", "as", "ption", "ription", "cription", "escription", "\n\nDescription", "\n\nDescription:", "\n\nDescription:\n", "\n1/", " for", " tablespoons", " minutes. ", "pepper", "ket", "asket", "Preheat", " sp", "our", " cook", " 1", "ly", "Place ", " on", " an", "ru", "salt", "ver", "out", "oil", "eason", "Air", " basket", "owl", "ter", "em", "with", "Fryer", " Fryer", " Fryer ", " h", "ro", "id", "\n1. ", "gh", " pepper", "the ", "C)", "ato", "tato", " bowl", "ray", " spray", "ge ", "au", " sau", "ure", "Ingredients:\n", "read ", "live ", "cook", "ak", "ture", "tatoes", "utter", " teaspoons", "\n\nAir", " e", "2. ", "---", "owder", " powder", "ees", " chees", "3. ", " into", "all", "00", "s, ", " re", "erve ", "ss", " cooking", "ran", "\n2", "get", " olive ", "her", "chicken", "Co", "ender", " sauc", "ted ", "ix", "ixture", "sp", "mb", " season", "ey", "about", "ra", "ces", "4. ", " over", "ck", "ll", " g", " l", "igh", "it", "Th", "e. ", " are", " mixture", "ry"].iter().map(|x| { String::from(*x) }).collect()
+}
+
 fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
      if v.len() < 2 {
           return None;
@@ -431,6 +435,30 @@ pub fn tale_v1_scout_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'st
                 32,
                 30,
                 &[90],
+                epochs,
+    )
+}
+
+pub fn poke_v2_mini_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+    Config::new(lr,
+                batch_size,
+                0, // no limit
+                poke_v1(),
+                16,
+                32,
+                &[100],
+                epochs,
+    )
+}
+
+pub fn recipe_v1_to(lr: f32, batch_size: usize, epochs: usize) -> Config<'static> { // to is short for train options
+    Config::new(lr,
+                batch_size,
+                0, // no limit
+                recipe_v1(),
+                16,
+                40,
+                &[200, 100],
                 epochs,
     )
 }

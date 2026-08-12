@@ -221,7 +221,7 @@ impl Trainer {
         TrainResult::Finished
     }
 
-    pub fn train_lm(
+    pub fn train_lm( // this one is used for training
         &mut self,
         update_frequency: usize,
         mlp: &mut MLP,
@@ -230,6 +230,7 @@ impl Trainer {
         embeddings: &crate::embeddings::Embeddings,
         params: Vec<Tensor>,
     ) -> TrainResult {
+        let param_count = params.len() as f32;
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
 
@@ -253,9 +254,7 @@ impl Trainer {
             return TrainResult::Finished;
         }
 
-        if self.batch_size == 0 {
-            self.batch_size = data_len;
-        }
+        if self.batch_size == 0 { self.batch_size = data_len }
 
         let parameter_boundary = crate::tape_len();
 
@@ -266,8 +265,7 @@ impl Trainer {
         let mut plateau_count = 0;
 
         // MLP input size = context_len * embedding_dim.
-        let input_size =
-            context_len * embeddings.embedding_dim();
+        let input_size = context_len * embeddings.embedding_dim();
 
         for epoch in 1..self.epochs + 1 {
             let now = Instant::now();
@@ -318,7 +316,6 @@ impl Trainer {
                 {
                     break;
                 }
-
                 let remaining = data_len - count;
 
                 let current_batch =
@@ -378,19 +375,12 @@ impl Trainer {
                 {
                     encode_time += timer.elapsed();
                 }
-
                 // -----------------------------------------------------
                 // Batched MLP forward
-                //
                 // Everything here is SGEMM.
-                //
-                // input:
-                //     batch × input_size
-                //
-                // Each dense layer:
-                //     X × Wᵀ
+                // input: batch × input_size
+                // Each dense layer: X × Wᵀ
                 // -----------------------------------------------------
-
                 #[cfg(feature = "timing")]
                 let timer = Instant::now();
 
@@ -434,20 +424,14 @@ impl Trainer {
                 total_loss += batch_loss;
 
                 #[cfg(feature = "timing")]
-                {
-                    loss_time += timer.elapsed();
-                }
+                { loss_time += timer.elapsed() }
 
                 // -----------------------------------------------------
-                // Batched MLP backward
-                //
+                //                  Batched MLP backward
                 // Each dense layer uses:
-                //
                 // dW = dYᵀ X       SGEMM
                 // dX = dY W        SGEMM
-                //
-                // Parameter gradients are accumulated directly into
-                // the Tensor tape.
+                // Parameter gradients are accumulated directly into the Tensor tape.
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -466,13 +450,8 @@ impl Trainer {
 
                 // -----------------------------------------------------
                 // Embedding gradients
-                //
-                // input_grads is:
-                //
-                //     batch × (context_len × embedding_dim)
-                //
-                // Accumulate each position back into its token's
-                // embedding vector.
+                // input_grads is: batch × (context_len × embedding_dim)
+                // Accumulate each position back into its token's embedding vector.
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -492,18 +471,14 @@ impl Trainer {
 
                 // -----------------------------------------------------
                 // Clear temporary autograd tape.
-                //
-                // The batched path doesn't create the normal per-sample
-                // forward graph, but keep the same tape boundary
-                // contract as the rest of the trainer.
+                // The batched path doesn't create the normal per-sample forward graph,
+                // but keep the same tape boundary contract as the rest of the trainer.
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
                 let timer = Instant::now();
 
-                crate::clear_tape_after(
-                    parameter_boundary
-                );
+                crate::clear_tape_after(parameter_boundary);
 
                 #[cfg(feature = "timing")]
                 {
@@ -538,16 +513,10 @@ impl Trainer {
             }
 
             let samples = count as f32;
+            if samples == 0.0 { continue }
 
-            if samples == 0.0 {
-                continue;
-            }
-
-            let avg_loss =
-                total_loss / samples;
-
-            let perplexity =
-                avg_loss.exp();
+            let avg_loss = total_loss / samples;
+            let perplexity = avg_loss.exp();
 
             // ---------------------------------------------------------
             // Learning-rate plateau detection
@@ -570,15 +539,16 @@ impl Trainer {
             // ---------------------------------------------------------
             // Epoch statistics
             // ---------------------------------------------------------
+            let grad_avg = grad_sum / samples;
 
             if epoch % update_frequency == 0 {
                 let elapsed = now.elapsed();
 
                 println!(
-                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg over samples) = {:.6} | Perplexity = {:.6} | Time elapsed: {:.2?} sec.",
+                    "Epoch {} | Loss (CE) = {:.6} | Grad sum (avg per param) = {:.8} | PPL = {:.6} | Time elapsed: {:.2?}.",
                     epoch,
                     avg_loss,
-                    grad_sum / samples,
+                    grad_avg/param_count,
                     perplexity,
                     elapsed,
                 );
@@ -640,14 +610,10 @@ impl Trainer {
                         pct(update_time)
                     );
                 }
-
-                if grad_sum / samples <= 1e-9 {
-                    println!(
-                        "Early stopping, network will not learn anymore!"
-                    );
-
-                    return TrainResult::Finished;
-                }
+            }
+            if grad_avg <= 1e-9 {
+                println!("Early stopping, network will not learn anymore!");
+                return TrainResult::Finished;
             }
         }
 

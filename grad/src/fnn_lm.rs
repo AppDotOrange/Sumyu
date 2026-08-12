@@ -159,7 +159,7 @@ impl LM {
                 config.emb_dim,
             );
 
-        let trainer = Trainer::new(config.lr / config.batch_size as f32, config.epochs, config.batch_size, config.max_batches_per_epoch);
+        let trainer = Trainer::new(config.lr, config.epochs, config.batch_size, config.max_batches_per_epoch);
         Self {
             trainer,
             mlp: MLP::new(dim[0], &dim[1..]),
@@ -175,10 +175,16 @@ impl LM {
         self.embeddings.encode(ids)
     }
 
-    pub fn train_options(&mut self, lr: f32, epochs: usize, batch_size: usize, max_batches_per_epoch: usize) {
-        self.trainer.reinit_lr(lr/batch_size as f32);
-        self.trainer.reinit_epochs(epochs);
+    pub fn train_options(
+        &mut self,
+        lr: f32,
+        epochs: usize,
+        batch_size: usize,
+        max_batches_per_epoch: usize,
+    ) {
         self.trainer.reinit_batch(batch_size);
+        self.trainer.reinit_lr(lr);
+        self.trainer.reinit_epochs(epochs);
         self.trainer.reinit_batch_per_epoch(max_batches_per_epoch);
     }
 
@@ -325,6 +331,12 @@ impl LM {
             self.dataset.len(),
             self.dataset.len().saturating_sub(self.context_len as usize)
         );
+    }
+
+    pub fn param(&self) -> Vec<f32> {
+        let mut params = self.mlp.parameters();
+        params.extend(self.embeddings.parameters());
+        params.iter().map(|x| {x.data()}).collect()
     }
 
     pub fn train(&mut self) {
