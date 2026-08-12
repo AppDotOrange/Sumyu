@@ -6,6 +6,8 @@ It started as a from-scratch neural-network project and is mainly used for exper
 
 The language-model side of Sumyu currently uses embeddings and fully-connected layers rather than Transformers.
 
+All of the included Sumyu models are under 1 MB and some are under 400 KB!
+
 ## What it has
 
 * Feed-forward neural networks
@@ -327,7 +329,7 @@ A feed-forward language model has obvious limitations:
 * The context is fixed.
 * There is no attention mechanism.
 * It doesn't scale like modern Transformer LMs.
-* Small models have very limited capacity.
+* Small models have very limited capacity, though they still learn writing styles well with bad grammar.
 
 But the architecture is also relatively straightforward, which makes it fun to experiment with.
 
