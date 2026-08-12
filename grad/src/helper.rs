@@ -245,8 +245,8 @@ fn most_common_fused_pair(v: Vec<String>) -> Option<(String, usize)> {
          })
 }
 
-pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
-     let mut vocab: Vec<String> = vec!["".to_string(), "".to_string()];
+pub fn make_vocab(text: &str, token_num: usize, reserved_token_num: usize) -> Vec<String> {
+     let mut vocab: Vec<String> = vec!["".to_string(); reserved_token_num+2];
      let mut chars = Vec::new();
      for x in text.chars() {
           let y = x.to_string();
@@ -254,8 +254,8 @@ pub fn make_vocab(text: &str, token_num: usize) -> Vec<String> {
                chars.push(y)
           }
      }
-     let len = chars.len()+2;
      vocab.extend(chars);
+    let len = vocab.len();
 
      while vocab.len() < len+token_num {
           let split_text: Vec<String> = tokenize(text, &vocab).iter().map(|x1| {vocab[*x1].clone()}).collect();

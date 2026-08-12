@@ -4,11 +4,11 @@ use std::{fs, io};
 use std::io::Write;
 
 fn main() {
-    let _rust = fs::read_to_string("corpus.txt").expect("Can't read corpus.txt!");
+    let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
     let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
     let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
-    let test = 2;
+    let test = 4;
     if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -77,18 +77,16 @@ fn main() {
         fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
-        println!("{:?}.iter().map(|x| {{ String::from(*x) }}).collect()", helper::make_vocab(&recipe, 250))
+        println!("{:?}.iter().map(|x| {{ String::from(*x) }}).collect()", helper::make_vocab(&recipe, 250, 0))
     } else if test == 2 {
-        let bytes = fs::read("Production/RecipeP1.sumyu").unwrap();
-        //let bytes = fs::read("Production/Rustception_P1_mini.sumyu").unwrap();
-        //let bytes = fs::read("Tests/RustceptionV3_2.977054CE.bin").unwrap();
+        let bytes = fs::read("Production/PokeP2_mini.sumyu").unwrap();
         let (model, _): (SavedLM, usize) =
             bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
             ).unwrap();
         let lm = LM::from_saved(model);
-        // lm.params();
+        lm.params();
         println!("\"{}\"", lm.generate("".to_string(), 2000, 0.7));
         //lm.generate_one_distribution("".to_string(), 10);
         //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
@@ -122,8 +120,8 @@ fn main() {
         let mut desc = String::new();
         io::stdin().read_line(&mut desc).expect("Failed to read line!");
         let desc = desc.trim().to_string();
-        let lm = LM::load_legacy("Poke_V1.sumyu");
-        lm.save("Poke_V1_working.sumyu", &desc);
+        let lm = LM::load_legacy("Production/Rustception_P1_mini.sumyu");
+        lm.save("Production/Rustception_P1_mini.sumyu", &desc);
     } else if test == 5 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
