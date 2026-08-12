@@ -1,0 +1,32 @@
+# Sumyu License
+
+## Grant of Rights
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, and distribute the Software, subject to the following conditions:
+
+## Commercial Restrictions
+
+**The Software itself may NOT be sold, licensed for a fee, or otherwise commercialized.** This includes:
+- Selling the source code or compiled binaries
+- Offering the Software as a commercial product or service
+- Using the Software in a commercial offering without explicit written permission from the copyright holder
+
+**Exception - Trained Models:** You MAY freely sell, license, and commercialize any machine learning models, language models, or other derived outputs trained using this Software. This exception explicitly permits:
+- Selling models trained with this engine
+- Licensing trained models commercially
+- Using trained models in commercial products and services
+- Providing commercial services that utilize models trained with this Software
+
+## Other Terms
+
+1. **Attribution:** Any distribution of the Software or substantial portions of it must retain this license and attribution to the original author.
+
+2. **Source Code:** If you distribute the Software, you must provide access to the source code and any modifications you've made.
+
+3. **No Warranty:** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+4. **Liability:** IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+5. **Modifications:** If you modify the Software, you must clearly indicate what changes you've made and distribute your modifications under the same license terms.
+
+Copyright (c) 2026 AppDotOrange
