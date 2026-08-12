@@ -25,6 +25,87 @@ All of the included Sumyu models are under 1 MB and some are under 400 KB!
 
 There are also some simpler experiments in the project, such as an XOR dataset.
 
+## Installation
+
+Sumyu requires a Rust toolchain, Cargo, and OpenBLAS.
+
+### 1. Install Rust
+
+Install Rust and Cargo using [rustup](https://rustup.rs/).
+
+You can check that they are installed with:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### 2. Install OpenBLAS
+
+Sumyu uses OpenBLAS for its matrix operations, so OpenBLAS must be installed before building.
+
+#### Windows
+
+The easiest option is [vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+vcpkg install openblas:x64-windows
+```
+
+Make sure your vcpkg installation is configured so that Cargo can find the OpenBLAS libraries.
+
+#### Debian / Ubuntu
+
+```bash
+sudo apt install libopenblas-dev
+```
+
+#### Fedora
+
+```bash
+sudo dnf install openblas-devel
+```
+
+#### Arch Linux
+
+```bash
+sudo pacman -S openblas
+```
+
+#### macOS
+
+Using Homebrew:
+
+```bash
+brew install openblas
+```
+
+### 3. Clone and build Sumyu
+
+```bash
+git clone https://github.com/AppDotOrange/Sumyu.git
+cd Sumyu
+cargo build --release
+```
+
+The compiled executable will be located in:
+
+```text
+target/release/
+```
+
+You can also run Sumyu directly with:
+
+```bash
+cargo run --release
+```
+
+### Troubleshooting
+
+If Cargo cannot find OpenBLAS, make sure OpenBLAS is installed and that its library/include directories are visible to your compiler.
+
+On Windows, in particular, make sure your vcpkg installation and architecture (`x64-windows`) match the Rust target you are building for.
+
 ## Language models
 
 A Sumyu language model predicts the next token from a fixed context.
