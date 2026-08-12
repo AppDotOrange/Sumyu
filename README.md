@@ -372,12 +372,11 @@ Sumyu isn't limited to one particular dataset or model.
 The repository contains configurations and vocabularies for experiments involving:
 
 * Source code
-* Pokémon descriptions
 * Fairy tales
 * Recipes
 * Small general text datasets
 
-For example, the same language-model code can be configured with a Pokémon-specific vocabulary and trained on a Pokédex, or configured with a different vocabulary and trained on stories.
+For example, the same language-model code can be configured with a Rust-specific vocabulary and trained on Rust code, or configured with a different vocabulary and trained on stories.
 
 There is also an XOR dataset helper:
 
