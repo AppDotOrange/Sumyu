@@ -50,6 +50,7 @@ next-token prediction
 
 For example, you can make a model with a 16-token context, 32-dimensional embeddings, and two hidden layers:
 
+```rust
 use grad::fnn_lm::LM;
 use grad::helper;
 
@@ -65,6 +66,7 @@ fn main() {
 
     model.params();
 }
+```
 
 The architecture is deliberately simple. There is currently no attention mechanism.
 
@@ -72,6 +74,7 @@ The architecture is deliberately simple. There is currently no attention mechani
 
 A text corpus can be loaded into the model and used for training:
 
+```rust
 use grad::fnn_lm::LM;
 use grad::helper;
 use std::fs;
@@ -100,6 +103,7 @@ fn main() {
 
     model.train();
 }
+```
 
 The training options are:
 
@@ -116,6 +120,7 @@ Sumyu doesn't require you to use one fixed vocabulary.
 
 You can generate one from your own text with `make_vocab`:
 
+```rust
 use grad::helper;
 use std::fs;
 
@@ -131,11 +136,13 @@ fn main() {
 
     println!("Vocabulary size: {}", vocab.len());
 }
+```
 
 `make_vocab` starts with the characters found in the dataset and repeatedly adds frequently occurring adjacent token pairs.
 
 For example, a vocabulary might gradually learn tokens such as:
 
+```text
 t
 h
 e
@@ -143,6 +150,7 @@ e
 th
 he
 the
+```
 
 This is similar in spirit to BPE-style vocabulary construction, although Sumyu's algorithm is its own simpler implementation rather than a standard BPE implementation.
 
@@ -154,6 +162,7 @@ The helper module contains several vocabularies that were made for particular ex
 
 For example:
 
+```rust
 helper::char_level_vocab_v1()
 helper::general_vocab_v1()
 helper::token_vocab_v1()
@@ -161,6 +170,7 @@ helper::ml_200_tok_vocab_v3()
 helper::poke_v1()
 helper::tale_v1()
 helper::recipe_v1()
+```
 
 Some of these are character-level vocabularies, while others contain larger tokens learned from particular datasets.
 
@@ -170,6 +180,7 @@ The dataset-specific vocabularies are mostly there because they worked well for 
 
 Instead of constructing a model manually, you can also create a `Config`.
 
+```rust
 use grad::helper;
 
 fn main() {
@@ -186,6 +197,7 @@ fn main() {
 
     println!("Learning rate: {}", config.lr);
 }
+```
 
 This is useful when experimenting with different model configurations.
 
@@ -195,10 +207,12 @@ Sumyu also contains helper configurations for some of the models used during dev
 
 Once you've trained a model, you can save it as a `.sumyu` file:
 
+```rust
 model.save(
     "my_model.sumyu",
     "A model trained on my own dataset.",
 );
+```
 
 The `.sumyu` format stores the trained model along with a description.
 
@@ -208,6 +222,7 @@ This makes it possible to train a model once and then move the resulting file so
 
 Saved models can be loaded again:
 
+```rust
 use grad::fnn_lm::LM;
 
 fn main() {
@@ -218,9 +233,11 @@ fn main() {
 
     model.params();
 }
+```
 
 A loaded model can also be trained further:
 
+```rust
 let (description, mut model) =
     LM::load("my_model.sumyu");
 
@@ -239,11 +256,13 @@ model.save(
     "my_model_updated.sumyu",
     &description,
 );
+```
 
 ## Text generation
 
 After training, language models can generate text:
 
+```rust
 let output = model.generate(
     "Once upon a time".to_string(),
     200,
@@ -251,12 +270,15 @@ let output = model.generate(
 );
 
 println!("{}", output);
+```
 
 The three arguments are:
 
+```text
 prompt
 number of tokens to generate
 temperature
+```
 
 Temperature controls how much randomness is used when choosing the next token.
 
@@ -276,7 +298,9 @@ For example, the same language-model code can be configured with a Pokémon-spec
 
 There is also an XOR dataset helper:
 
+```rust
 let dataset = helper::xor();
+```
 
 which provides the classic four XOR input/output pairs.
 
@@ -313,17 +337,21 @@ You'll need a Rust toolchain and Cargo.
 
 Build the project with:
 
+```bash
 cargo build --release
+```
 
 For running the optimized build:
 
+```bash
 cargo run --release
-
+```
 
 ## Using your own dataset
 
 A basic workflow is:
 
+```text
 1. Prepare a text corpus
           ↓
 2. Create or choose a vocabulary
@@ -337,6 +365,7 @@ A basic workflow is:
 6. Load it later
           ↓
 7. Generate text or continue training
+```
 
 Your dataset does not have to be one of the datasets used in this repository. The point of the framework is to experiment with your own.
 
@@ -360,4 +389,4 @@ The Sumyu software itself may not be sold, licensed for a fee, or incorporated i
 
 Models trained using Sumyu may be sold, licensed, distributed, and used commercially.
 
-See LICENSE for the complete terms.
+See [`LICENSE`](LICENSE) for the complete terms.
