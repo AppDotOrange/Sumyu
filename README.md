@@ -6,6 +6,8 @@ It started as a from-scratch neural-network project and is mainly used for exper
 
 The language-model side of Sumyu currently uses embeddings and fully-connected layers rather than Transformers.
 
+All of the included Sumyu models are under 1 MB and some are under 400 KB!
+
 ## What it has
 
 * Feed-forward neural networks
@@ -22,6 +24,87 @@ The language-model side of Sumyu currently uses embeddings and fully-connected l
 * Continuing training from saved models
 
 There are also some simpler experiments in the project, such as an XOR dataset.
+
+## Installation
+
+Sumyu requires a Rust toolchain, Cargo, and OpenBLAS.
+
+### 1. Install Rust
+
+Install Rust and Cargo using [rustup](https://rustup.rs/).
+
+You can check that they are installed with:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### 2. Install OpenBLAS
+
+Sumyu uses OpenBLAS for its matrix operations, so OpenBLAS must be installed before building.
+
+#### Windows
+
+The easiest option is [vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+vcpkg install openblas:x64-windows
+```
+
+Make sure your vcpkg installation is configured so that Cargo can find the OpenBLAS libraries.
+
+#### Debian / Ubuntu
+
+```bash
+sudo apt install libopenblas-dev
+```
+
+#### Fedora
+
+```bash
+sudo dnf install openblas-devel
+```
+
+#### Arch Linux
+
+```bash
+sudo pacman -S openblas
+```
+
+#### macOS
+
+Using Homebrew:
+
+```bash
+brew install openblas
+```
+
+### 3. Clone and build Sumyu
+
+```bash
+git clone https://github.com/AppDotOrange/Sumyu.git
+cd Sumyu
+cargo build --release
+```
+
+The compiled executable will be located in:
+
+```text
+target/release/
+```
+
+You can also run Sumyu directly with:
+
+```bash
+cargo run --release
+```
+
+### Troubleshooting
+
+If Cargo cannot find OpenBLAS, make sure OpenBLAS is installed and that its library/include directories are visible to your compiler.
+
+On Windows, in particular, make sure your vcpkg installation and architecture (`x64-windows`) match the Rust target you are building for.
 
 ## Language models
 
@@ -289,12 +372,11 @@ Sumyu isn't limited to one particular dataset or model.
 The repository contains configurations and vocabularies for experiments involving:
 
 * Source code
-* Pokémon descriptions
 * Fairy tales
 * Recipes
 * Small general text datasets
 
-For example, the same language-model code can be configured with a Pokémon-specific vocabulary and trained on a Pokédex, or configured with a different vocabulary and trained on stories.
+For example, the same language-model code can be configured with a Rust-specific vocabulary and trained on Rust code, or configured with a different vocabulary and trained on stories.
 
 There is also an XOR dataset helper:
 
@@ -327,7 +409,7 @@ A feed-forward language model has obvious limitations:
 * The context is fixed.
 * There is no attention mechanism.
 * It doesn't scale like modern Transformer LMs.
-* Small models have very limited capacity.
+* Small models have very limited capacity, though they still learn writing styles well with bad grammar.
 
 But the architecture is also relatively straightforward, which makes it fun to experiment with.
 
