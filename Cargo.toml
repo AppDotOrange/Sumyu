@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 grad = {path="grad"}
+sumyu = {path="sumyu"}
 bincode = { version = "2", features = ["serde"] }
 
 [profile.release]

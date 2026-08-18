@@ -197,6 +197,33 @@ pub fn softmax_cross_entropy_batch(
     total_loss
 }
 
+pub fn mse_batch(
+    predictions: &[f32],
+    targets: &[f32],
+    gradients: &mut [f32],
+    batch: usize,
+    output_size: usize,
+) -> f32 {
+    debug_assert_eq!(predictions.len(), batch * output_size);
+    debug_assert_eq!(targets.len(), batch * output_size);
+    debug_assert_eq!(gradients.len(), batch * output_size);
+
+    let n = predictions.len() as f32;
+
+    let mut loss = 0.0f32;
+
+    for i in 0..predictions.len() {
+        let diff = predictions[i] - targets[i];
+
+        loss += diff * diff;
+
+        // d(MSE) / d(prediction)
+        gradients[i] = 2.0 * diff / n;
+    }
+
+    loss / n
+}
+
 /// Applies the derivative of Leaky ReLU in-place.
 ///
 /// The forward activation uses:

@@ -1,14 +1,14 @@
-use std::collections::HashMap;
 use std::fs;
 use crate::neuron::{SavedMLP, MLP, OldSavedMLP};
 use crate::Tensor;
-use crate::trainer::Trainer;
+use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState};
 use crate::embeddings::{Embeddings, OldSavedEmbeddings, SavedEmbeddings};
 use serde::{Serialize, Deserialize};
 use crate::helper::Config;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rng;
+use std::sync::mpsc::Sender;
 
 #[derive(Serialize, Deserialize)]
 pub struct SavedLM {
@@ -18,6 +18,21 @@ pub struct SavedLM {
     context_len: u32,
     hidden_layers: Vec<usize>,
     embeddings: SavedEmbeddings,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedCheckpoint {
+    pub model: SavedLM,
+
+    pub epoch: usize,
+    pub batch: usize,
+    pub sample: usize,
+
+    pub indices: Vec<usize>,
+
+    pub lr: f32,
+    pub best_loss: f32,
+    pub plateau_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -45,75 +60,12 @@ pub enum LegacyLM {
 }
 
 pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
-    struct Node {
-        children: HashMap<char, usize>,
-        id: Option<usize>,
-    }
-    let total_chars: usize = vocab.iter().map(|s| s.len()).sum();
-    let mut nodes: Vec<Node> = Vec::with_capacity(total_chars + 1);
+    let trie = crate::helper::Trie::from_vocab(vocab);
 
-    // Create root node (index 0)
-    nodes.push(Node { children: HashMap::new(), id: None });
-
-    // 1. Build Trie using indices (avoids borrow checker conflicts)
-    for (id, token) in vocab.iter().enumerate() {
-        let mut current_idx = 0; // Start at root
-
-        for ch in token.chars() {
-            // Check if child exists
-            if let Some(&next_idx) = nodes[current_idx].children.get(&ch) {
-                current_idx = next_idx;
-            } else {
-                // Create new node
-                let new_idx = nodes.len();
-                nodes.push(Node { children: HashMap::new(), id: None });
-
-                nodes[current_idx].children.insert(ch, new_idx);
-                current_idx = new_idx;
-            }
-        }
-        // Mark the end of the token
-        nodes[current_idx].id = Some(id);
-    }
-
-    // 2. Encode text (Greedy Longest Match)
-    let chars: Vec<char> = text.chars().collect();
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let mut current_idx = 0;
-        let mut best_match_id: Option<usize> = None;
-        let mut match_len = 0;
-        let mut j = i;
-
-        // Traverse Trie to find longest match starting at i
-        while j < chars.len() {
-            let ch = chars[j];
-            // Use immutable borrow to check children
-            if let Some(&next_idx) = nodes[current_idx].children.get(&ch) {
-                current_idx = next_idx;
-                j += 1;
-
-                // If this node is a valid token end, remember it
-                if let Some(id) = nodes[current_idx].id {
-                    best_match_id = Some(id);
-                    match_len = j - i;
-                }
-            } else {
-                break;
-            }
-        }
-
-        if let Some(id) = best_match_id {
-            result.push(id);
-            i += match_len;
-        } else {
-            result.push(0);  // unknown char
-            i += 1;
-        }
-    }
-    result
+    trie.tokenize_u32(text)
+        .into_iter()
+        .map(|x| x as usize)
+        .collect()
 }
 
 pub struct LM {
@@ -333,24 +285,204 @@ impl LM {
         );
     }
 
+    pub fn load_corpus_silent(&mut self, corpus: &str) {
+        self.dataset = tokenize(corpus, &self.vocab);
+    }
+
     pub fn param(&self) -> Vec<f32> {
         let mut params = self.mlp.parameters();
         params.extend(self.embeddings.parameters());
         params.iter().map(|x| {x.data()}).collect()
     }
 
-    pub fn train(&mut self) {
+    pub fn train(
+        &mut self,
+        batch_update_frequency: Option<usize>,
+        checkpoint: Option<String>,
+        checkpoint_path: Option<String>,
+        checkpoint_frequency: CheckpointFrequency,
+        lr: Option<f32>,
+    ) {
+        // ---------------------------------------------------------
+        // Load an existing checkpoint, if supplied.
+        // ---------------------------------------------------------
+
+        let resume_state = checkpoint
+            .as_deref()
+            .filter(|path| std::path::Path::new(path).exists())
+            .map(|path| {
+                println!("Loading checkpoint: {}", path);
+                self.load_checkpoint(path, lr)
+            });
+
+        // ---------------------------------------------------------
+        // Parameters
+        // ---------------------------------------------------------
+
         let mut params = self.mlp.parameters();
         params.extend(self.embeddings.parameters());
 
+        // ---------------------------------------------------------
+        // Metadata for checkpoint saving.
+        // ---------------------------------------------------------
+
+        let vocab = self.vocab.clone();
+        let context_len = self.context_len;
+        let hidden_layers = self.hidden_layers.clone();
+
+        // IMPORTANT:
+        // Save this before checkpoint_path is moved into the closure.
+        let should_save_checkpoints = checkpoint_path.is_some();
+
+        // ---------------------------------------------------------
+        // Checkpoint save callback
+        // ---------------------------------------------------------
+
+        let mut savefn = move |
+            state: CheckpointState,
+            mlp: &MLP,
+            embeddings: &Embeddings,
+        | {
+            let Some(base_path) = checkpoint_path.as_deref() else {
+                return;
+            };
+
+            let suffix = match state.kind {
+                CheckpointKind::Batch => {
+                    format!("_batch_{}", state.batch)
+                }
+
+                CheckpointKind::Epoch => {
+                    format!("_epoch_{}", state.epoch)
+                }
+            };
+
+            let path = format!("{}{}.check", base_path, suffix);
+
+            let model = SavedLM {
+                description: format!(
+                    "Training checkpoint | Epoch {} | Batch {} | Sample {}",
+                    state.epoch,
+                    state.batch,
+                    state.sample,
+                ),
+                mlp: mlp.save(),
+                vocab: vocab.clone(),
+                context_len,
+                hidden_layers: hidden_layers.clone(),
+                embeddings: embeddings.save().clone(),
+            };
+
+            let saved = SavedCheckpoint {
+                model,
+                epoch: state.epoch,
+                batch: state.batch,
+                sample: state.sample,
+                indices: state.indices,
+                lr: state.lr,
+                best_loss: state.best_loss,
+                plateau_count: state.plateau_count,
+            };
+
+            let bytes = bincode::serde::encode_to_vec(
+                &saved,
+                bincode::config::standard(),
+            )
+                .unwrap();
+
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+
+            fs::write(&path, bytes).unwrap();
+
+            println!("Checkpoint saved: {}", path);
+        };
+
+        let savefn: Option<
+            &mut dyn FnMut(
+                CheckpointState,
+                &MLP,
+                &Embeddings,
+            ),
+        > = if should_save_checkpoints {
+            Some(&mut savefn)
+        } else {
+            None
+        };
+
+        // ---------------------------------------------------------
+        // Training
+        // ---------------------------------------------------------
+
         self.trainer.train_lm(
             1,
+            batch_update_frequency,
+            resume_state,
+            checkpoint_frequency,
+            savefn,
             &mut self.mlp,
             &self.dataset,
             self.context_len as usize,
             &self.embeddings,
             params,
         );
+    }
+
+    pub fn load_checkpoint(&mut self, path: &str, lr: Option<f32>) -> ResumeState {
+        let bytes = fs::read(path).unwrap();
+
+        let (checkpoint, _): (SavedCheckpoint, usize) =
+            bincode::serde::decode_from_slice(
+                &bytes,
+                bincode::config::standard(),
+            ).unwrap();
+
+        self.mlp = MLP::load(&checkpoint.model.mlp);
+        self.vocab = checkpoint.model.vocab;
+        self.context_len = checkpoint.model.context_len;
+        self.hidden_layers = checkpoint.model.hidden_layers;
+        self.embeddings =
+            Embeddings::load(checkpoint.model.embeddings);
+
+        println!(
+            "Loaded checkpoint: epoch {}, batch {}, sample {}.",
+            checkpoint.epoch,
+            checkpoint.batch,
+            checkpoint.sample,
+        );
+
+        let lr_ = match lr {
+            Some(t) => t,
+            None => checkpoint.lr
+        };
+
+        ResumeState {
+            epoch: checkpoint.epoch,
+            batch: checkpoint.batch,
+            sample: checkpoint.sample,
+            indices: checkpoint.indices,
+            lr: lr_,
+            best_loss: checkpoint.best_loss,
+            plateau_count: checkpoint.plateau_count,
+        }
+    }
+
+    pub fn train_sumyu(
+        &mut self,
+        tx: Sender<TrainInfo>,
+    ) -> TrainResult {
+        let mut params = self.mlp.parameters();
+        params.extend(self.embeddings.parameters());
+
+        self.trainer.train_lm_sumyu(
+            &mut self.mlp,
+            &self.dataset,
+            self.context_len as usize,
+            &self.embeddings,
+            params,
+            tx,
+        )
     }
 
     pub fn param_count(&self) -> usize {
@@ -391,6 +523,26 @@ impl LM {
         }
     }
 
+    pub fn params_sumyu(&self) {
+        println!("Parameter count: {}.", self.param_count());
+
+        let mut prev =
+            self.context_len as usize
+                * self.embeddings.embedding_dim();
+        println!(
+            "    Embedding table: {} params",
+            self.embeddings.parameter_count()
+        );
+        println!("    O O O        {} neurons   -   input layer", prev);
+        let mut layers = self.hidden_layers.clone();
+        layers.push(self.vocab.len());
+        for (idx, x) in layers.clone().iter().enumerate() {
+            println!(r"    ЖХЖХЖ           {} weights   -   layer {} weights", prev*x, idx+1);
+            println!(r"    O O O        {} neurons   -   layer {}", x, idx+1);
+            prev = layers[idx]
+        }
+    }
+
     pub fn to_saved(&self, description: &str) -> SavedLM {
         SavedLM {
             description: description.to_string(),
@@ -405,6 +557,18 @@ impl LM {
     pub fn from_saved(saved: SavedLM) -> Self {
         println!("Description:\n{}", saved.description);
         println!("Loading...");
+        Self {
+            trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
+            mlp: MLP::load(&saved.mlp),
+            dataset: Vec::new(),
+            vocab: saved.vocab,
+            context_len: saved.context_len,
+            hidden_layers: saved.hidden_layers,
+            embeddings: Embeddings::load(saved.embeddings),
+        }
+    }
+
+    pub fn from_saved_silent(saved: SavedLM) -> Self {
         Self {
             trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
             mlp: MLP::load(&saved.mlp),
@@ -467,6 +631,16 @@ impl LM {
                 bincode::config::standard(),
             ).unwrap();
         (model.description.clone(), LM::from_saved(model))
+    }
+
+    pub fn load_silent(path: &str) -> (String, Self) {
+        let bytes = fs::read(path).unwrap();
+        let (model, _): (SavedLM, usize) =
+            bincode::serde::decode_from_slice(
+                &bytes,
+                bincode::config::standard(),
+            ).unwrap();
+        (model.description.clone(), LM::from_saved_silent(model))
     }
 
     pub fn load_legacy(path: &str) -> Self {

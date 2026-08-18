@@ -2,14 +2,20 @@ use grad::fnn_lm::{SavedLM, LM};
 use grad::helper;
 use std::{fs, io};
 use std::io::Write;
+use grad::helper::poke_v2;
+use grad::trainer::CheckpointFrequency;
+use sumyu;
 
 fn main() {
     let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
     let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
     let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
     let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
-    let test = 2;
-    if test == -1 {
+    let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
+    let test = 9;
+    if test == -2 {
+        println!("{}", poke_v2().len())
+    } else if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
         //------------------------------------------------------------------------------------------
@@ -30,7 +36,7 @@ fn main() {
         lm.params();
         lm.load_corpus(&poke);
         lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
-        lm.train();
+        //lm.train(None);
     } else if test == 0 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -62,13 +68,13 @@ fn main() {
             lm.params();
             lm.load_corpus(&text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
-            lm.train();
+            //lm.train(None);
         } else {
             let mut lm = LM::new(context_len, vocab, hidden_dim, emb_dim);
             lm.params();
             lm.load_corpus(&text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
-            lm.train();
+            //lm.train(None);
         let saved = lm.to_saved("");
         let bytes = bincode::serde::encode_to_vec(
             &saved,
@@ -77,9 +83,12 @@ fn main() {
         fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
-        println!("{:?}.iter().map(|x| {{ String::from(*x) }}).collect()", helper::make_vocab(&recipe, 250, 0))
+        helper::dump_vocab_as_rust(
+            &helper::make_vocab(&oasst1, 10_000, 0),
+            "oasst1_vocab.rs",
+        ).expect("Failed to dump vocab!");
     } else if test == 2 {
-        let bytes = fs::read("Production/PokeP2_mini.sumyu").unwrap();
+        let bytes = fs::read("ChatterP1.sumyu").unwrap();
         let (model, _): (SavedLM, usize) =
             bincode::serde::decode_from_slice(
                 &bytes,
@@ -87,10 +96,10 @@ fn main() {
             ).unwrap();
         let lm = LM::from_saved(model);
         lm.params();
-        println!("\"{}\"", lm.generate("".to_string(), 2000, 0.7));
-        //lm.generate_one_distribution("".to_string(), 10);
+        println!("\"{}\"", lm.generate("<USER>What are monopsonies?<EOT>\n".to_string(), 100, 0.7));
+        //lm.generate_one_distribution("".to_string(), 25);
         //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
-        //lm.embeds().find_clusters(0.50, helper::ml_v4());
+        //lm.embeds().find_clusters(0.50, helper::recipe_v1());
     } else if test == 3 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -108,7 +117,7 @@ fn main() {
         //*/
         lm.params();
         lm.load_corpus(&text);
-        lm.train();
+        //lm.train(None);
         lm.save(
             "Rustception_optimized.sumyu",
             &description,
@@ -127,7 +136,7 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::poke_v2_mini_to(0.1, 32, 100_000);
+        let config = helper::poke_v4_32_context_to(0.1, 32, 100_000);
         let description = "A Sumyu model trained on a filtered Pokedex.";
 
         //------------------------------------------------------------------------------------------
@@ -141,9 +150,9 @@ fn main() {
 
         lm.params();
         lm.load_corpus(&poke);
-        lm.train();
+        //lm.train(None);
         lm.save(
-            "Poke_V1.sumyu",
+            "PokeP4_32c.sumyu",
             &description,
         );
     } else if test == 6 {
@@ -164,7 +173,7 @@ fn main() {
         //*/
         lm.params();
         lm.load_corpus(&text);
-        lm.train();
+        //lm.train(None);
         lm.save(
             "Tale_V1.sumyu",
             &description,
@@ -187,10 +196,53 @@ fn main() {
         */
         lm.params();
         lm.load_corpus(&recipe);
-        lm.train();
+        //lm.train(None);
         lm.save(
-            "RecipeV1.sumyu",
+            "RecipeP2.sumyu",
             &description,
         );
+    } else if test == 8 {
+        let mut terminal = sumyu::Sumyu::new();
+        terminal.start();
+    } else if test == 9 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        //let config = helper::oasst1_v1_to(0.1, 128, 10);
+        //let description = "A huge Sumyu model trained on dialogue (oasst1 dataset).";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        //let mut lm = LM::from_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        //*
+        let (description, mut lm) = LM::load("ChatterP1.sumyu");
+        lm.train_options(0.01, 10, 128, 0);
+        //*/
+        lm.params();
+        lm.load_corpus(&oasst1);
+        lm.train(Some(10), Some("chatterP1_checks/ChatterV1_batch_4376.check".to_string()), Some("chatterP1_checks/ChatterV1".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.01));
+        lm.save(
+            "ChatterP1.sumyu",
+            &description,
+        );
+    } else if test == 10 {
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(2);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
     }
 }

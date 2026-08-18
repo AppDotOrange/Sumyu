@@ -12,7 +12,6 @@ pub(crate) struct BatchLayerCache {
     pub output: Vec<f32>,
 
     pub weights: Vec<f32>,
-    pub biases: Vec<f32>,
 
     pub weight_handles: Arc<[TensorHandle]>,
     pub bias_handles: Arc<[TensorHandle]>,
@@ -349,7 +348,6 @@ impl MLP {
                 input: current,
                 output: output.clone(),
                 weights,
-                biases,
                 weight_handles: Arc::clone(&layer.fused_weights),
                 bias_handles: Arc::clone(&layer.fused_biases),
                 relu: !layer.neurons[0].is_output,

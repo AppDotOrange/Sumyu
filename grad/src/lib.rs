@@ -252,7 +252,7 @@ impl Tensor {
     #[inline(always)]
     pub fn data(&self) -> f32 {
         TAPE.with(|t| {
-            match &t.borrow().nodes[self.handle.node] {
+            match &t.borrow().nodes[self.handle.node] { // crash here
                 Node::Scalar(node) => node.data,
                 Node::FusedLayer(node) => node.outputs[self.handle.index],
             }
