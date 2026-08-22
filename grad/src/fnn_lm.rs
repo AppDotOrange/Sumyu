@@ -1,15 +1,26 @@
-use std::fs;
 use crate::neuron::{SavedMLP, MLP, OldSavedMLP};
 use crate::Tensor;
 use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState};
 use crate::embeddings::{Embeddings, OldSavedEmbeddings, SavedEmbeddings};
-use serde::{Serialize, Deserialize};
 use crate::helper::Config;
+use std::fs;
+use std::io::Write;
+use std::sync::mpsc::Sender;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rng;
-use std::sync::mpsc::Sender;
+use serde::{Serialize, Deserialize};
 
+///
+/// A struct that contains everything needed for LM inference, but not training.
+///
+/// # Contents:
+/// * description: String
+/// * mlp: SavedMLP
+/// * vocab: Vec<String>
+/// * context_len: u32
+/// * hidden_layers: Vec<usize>
+/// * embeddings: SavedEmbeddings
 #[derive(Serialize, Deserialize)]
 pub struct SavedLM {
     description: String,
@@ -79,6 +90,29 @@ pub struct LM {
 }
 
 impl LM {
+    ///
+    /// LM::new() is used to create a new LM.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_len`: u32
+    /// * `vocab`: Vec<String>
+    /// * `hidden_dim`: &\[usize\]
+    /// * `embedding_dim`: usize
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use grad::fnn_lm::LM;
+    /// use grad::vocabs;
+    ///
+    /// let lm = LM::new(
+    ///     16,  // context length
+    ///     vocabs::fineweb_v2(),  // vocabulary trained on the fineweb dataset family
+    ///     &[300, 300],  // MLP hidden layer dimensions
+    ///     64,  // embedding dimension
+    /// )
+    /// ```
     pub fn new(context_len: u32, vocab: Vec<String>, hidden_dim: &[usize], embedding_dim: usize) -> Self {
         let mut dim = vec![context_len as usize * embedding_dim];
         dim.extend(hidden_dim.to_vec());
@@ -121,6 +155,53 @@ impl LM {
             hidden_layers: config.hidden_dim.to_vec(),
             embeddings,
         }
+    }
+
+    pub fn from_checkpoint(
+        path: &str,
+    ) -> Self {
+        let bytes = fs::read(path).unwrap();
+
+        let (checkpoint, _): (SavedCheckpoint, usize) =
+            bincode::serde::decode_from_slice(
+                &bytes,
+                bincode::config::standard(),
+            ).unwrap();
+
+        let mlp = MLP::load(&checkpoint.model.mlp);
+        let vocab = checkpoint.model.vocab;
+        let context_len = checkpoint.model.context_len;
+        let hidden_layers = checkpoint.model.hidden_layers;
+        let embeddings = Embeddings::load(checkpoint.model.embeddings);
+        let dataset = vec![];
+
+        println!(
+            "Loaded checkpoint: epoch {}, batch {}, sample {}.",
+            checkpoint.epoch,
+            checkpoint.batch,
+            checkpoint.sample,
+        );
+
+        let trainer = Trainer::new(
+            0f32,
+            0,
+            0,
+            0,
+        );
+
+        Self {
+            trainer,
+            mlp,
+            dataset,
+            vocab,
+            context_len,
+            hidden_layers,
+            embeddings,
+        }
+    }
+
+    pub fn dataset_size(&self) -> usize {
+        self.dataset.len()
     }
 
     pub fn encode_embeddings(&self, ids: &[usize]) -> Vec<Tensor> {
@@ -269,6 +350,62 @@ impl LM {
         output
     }
 
+    pub fn generate_gpt(&self, context: String, gen_length: usize, temp: f32) -> String {
+        let mut context_ = context.clone();
+        let mut output = "".to_string();
+        for _ in 0..gen_length {
+            let generation = self.generate_one(context_.clone(), temp);
+            context_.push_str(&generation);
+            output.push_str(&generation);
+            print!("{}", generation);
+            let _ = std::io::stdout().flush();
+        }
+        output
+    }
+
+    pub fn generate_gpt_chatter(&self, context: String, gen_length: usize, temp: f32) -> String {
+        let mut context_ = context.clone();
+        let mut output = "".to_string();
+        for _ in 0..gen_length {
+            let generation = self.generate_one(context_.clone(), temp);
+            if generation.contains("<EOT>") {
+                let gen_before_eot = generation.split("<EOT>").collect::<Vec<&str>>()[0];
+                println!("{}", gen_before_eot);
+                output.push_str(&generation);
+                return output
+            }
+            context_.push_str(&generation);
+            output.push_str(&generation);
+            print!("{}", generation);
+            let _ = std::io::stdout().flush();
+        }
+        println!();
+        output
+    }
+
+    pub fn poison_check(&self) -> usize {
+        let mut count = 0;
+        for x in self.param() {
+            if !x.is_finite() {
+                println!("Non-finite: {}", x);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn poison_check_silent(&self) -> usize {
+        let mut count = 0;
+
+        for x in self.param() {
+            if !x.is_finite() {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
     pub fn set_dataset(&mut self, dataset: Vec<usize>) {
         self.dataset = dataset;
     }
@@ -349,7 +486,7 @@ impl LM {
 
             let suffix = match state.kind {
                 CheckpointKind::Batch => {
-                    format!("_batch_{}", state.batch)
+                    format!("_batch_{}_epoch_{}", state.batch, state.epoch)
                 }
 
                 CheckpointKind::Epoch => {
@@ -632,6 +769,7 @@ impl LM {
             ).unwrap();
         (model.description.clone(), LM::from_saved(model))
     }
+
 
     pub fn load_silent(path: &str) -> (String, Self) {
         let bytes = fs::read(path).unwrap();

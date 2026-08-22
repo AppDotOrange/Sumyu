@@ -572,7 +572,7 @@ fn run_training(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let vocab = grad::helper::make_vocab(&corpus, 200, 0);
+        let vocab = grad::helper::make_vocab(&corpus, 200, 0, None);
 
         let mut lm = LM::new(
             16,

@@ -12,7 +12,8 @@ fn main() {
     let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
     let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
     let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
-    let test = 9;
+    let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
+    let test = 11;
     if test == -2 {
         println!("{}", poke_v2().len())
     } else if test == -1 {
@@ -84,8 +85,8 @@ fn main() {
         }
     } else if test == 1 {
         helper::dump_vocab_as_rust(
-            &helper::make_vocab(&oasst1, 10_000, 0),
-            "oasst1_vocab.rs",
+            &helper::make_vocab(&fineweb, 20_000, 0, Some(&["<EOT>", "<BOT>", "<USER>"])),
+            "vocabs/fineweb_vocab2.rs",
         ).expect("Failed to dump vocab!");
     } else if test == 2 {
         let bytes = fs::read("ChatterP1.sumyu").unwrap();
@@ -96,7 +97,7 @@ fn main() {
             ).unwrap();
         let lm = LM::from_saved(model);
         lm.params();
-        println!("\"{}\"", lm.generate("<USER>What are monopsonies?<EOT>\n".to_string(), 100, 0.7));
+        lm.generate_gpt("<USER>Can you write a story about two birds?<EOT>\n".to_string(), 1000, 0.7);
         //lm.generate_one_distribution("".to_string(), 25);
         //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
         //lm.embeds().find_clusters(0.50, helper::recipe_v1());
@@ -225,14 +226,14 @@ fn main() {
             println!("OpenBLAS threads: {}", openblas_get_num_threads());
         }
         //*
-        let (description, mut lm) = LM::load("ChatterP1.sumyu");
+        let (description, mut lm) = LM::load("Production/ChatterP1-preview.sumyu");
         lm.train_options(0.01, 10, 128, 0);
         //*/
         lm.params();
         lm.load_corpus(&oasst1);
-        lm.train(Some(10), Some("chatterP1_checks/ChatterV1_batch_4376.check".to_string()), Some("chatterP1_checks/ChatterV1".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.01));
+        lm.train(Some(10), Some("chatterP1_checks/ChatterV1_batch_47443_epoch_2.check".to_string()), Some("chatterP1_checks/ChatterV1".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.01));
         lm.save(
-            "ChatterP1.sumyu",
+            "ChatterP2.sumyu",
             &description,
         );
     } else if test == 10 {
@@ -244,5 +245,36 @@ fn main() {
             openblas_set_num_threads(2);
             println!("OpenBLAS threads: {}", openblas_get_num_threads());
         }
+    } else if test == 11 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::fineweb_v2_to(0.01, 256, 1);
+        let description = "A large Sumyu model pre-trained on the FineWeb dataset family.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let (description, mut lm) = LM::load("Production/ChatterP1-preview.sumyu");
+        lm.train_options(0.01, 1, 256, 0);
+        */
+        lm.params();
+        lm.load_corpus(&fineweb);
+        lm.train(Some(10), None, Some("pretraining/pretrainV2".to_string()), CheckpointFrequency::EveryBatch(1000), None);
+        lm.save(
+            "pretrainV2.sumyu",
+            &description,
+        );
     }
 }

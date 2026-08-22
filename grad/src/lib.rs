@@ -5,6 +5,7 @@ pub mod fnn_lm;
 pub mod chatter;
 pub mod embeddings;
 pub mod batched;
+pub mod vocabs;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -147,21 +148,50 @@ thread_local! {
 }
 
 pub fn zero_grad_and_update(params: &[Tensor], lr: f32) -> f32 {
-    let mut grad_sum = 0f32;
+    const MAX_GRAD_NORM: f64 = 1.0;
+
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
+
+        let mut grad_sq_sum = 0.0f64;
+
+        for p in params {
+            match &tape.nodes[p.handle.node] {
+                Node::Scalar(node) => {
+                    let g = node.grad as f64;
+                    grad_sq_sum += g * g;
+                }
+                Node::FusedLayer(_) => {
+                    panic!("Parameter cannot be a fused-layer output.");
+                }
+            }
+        }
+
+        let scale = if grad_sq_sum > MAX_GRAD_NORM * MAX_GRAD_NORM {
+            (MAX_GRAD_NORM / grad_sq_sum.sqrt()) as f32
+        } else {
+            1.0f32
+        };
+
+        let mut grad_sum = 0.0f32;
+
         for p in params {
             match &mut tape.nodes[p.handle.node] {
                 Node::Scalar(node) => {
-                    node.data -= lr * node.grad;
-                    grad_sum += node.grad.abs();
+                    let grad = node.grad * scale;
+
+                    node.data -= lr * grad;
+                    grad_sum += grad.abs();
                     node.grad = 0.0;
                 }
-                Node::FusedLayer(_) => panic!("Parameter cannot be a fused-layer output.")
+                Node::FusedLayer(_) => {
+                    panic!("Parameter cannot be a fused-layer output.");
+                }
             }
         }
-    });
-    grad_sum
+
+        grad_sum
+    })
 }
 
 #[derive(Copy)]

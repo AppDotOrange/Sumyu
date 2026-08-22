@@ -855,8 +855,7 @@ impl Trainer {
 
                         let samples_per_sec =
                             if elapsed_secs > 0.0 {
-                                processed_samples as f64
-                                    / elapsed_secs
+                                (count-epoch_start_count) as f64 / elapsed_secs
                             } else {
                                 0.0
                             };
@@ -873,18 +872,10 @@ impl Trainer {
                             } else {
                                 Duration::ZERO
                             };
-
-                        let samples_per_sec =
-                            if elapsed_secs > 0.0 {
-                                (count-epoch_start_count) as f64 / elapsed_secs
-                            } else {
-                                0.0
-                            };
-                        let avgbatchloss = batch_loss/frequency as f32;
+                        let avgbatchloss = batch_loss/self.batch_size as f32;
                         println!(
-                            "Epoch {} | Batch {}/{} | {:>6.2}% | \
-                         Samples {}/{}\nAvgLoss = {:.6} | AvgPPL = {:.6} | Loss={:.6} | PPL= {:.6}\n\
-                         {:.1} samples/s | Elapsed: {:.2?} | ETA: {:.2?}",
+                            "Epoch {} | Batch {}/{} | {:>6.2}% | Samples {}/{} | AvgLoss = {:.6} | AvgPPL = {:.6}\n\
+                         Loss={:.6} | PPL= {:.6} | {:.1} samples/s | Elapsed: {:.2?} | ETA: {:.2?}",
                             epoch,
                             batches_done,
                             total_batches,
@@ -942,31 +933,18 @@ impl Trainer {
                             Ok(_) => {
                                 match input.trim().to_ascii_lowercase().as_str() {
                                     "y" | "yes" => {
-                                        println!(
-                                            "Training interrupted."
-                                        );
-
+                                        println!("Training interrupted.");
                                         return TrainResult::Interrupted;
                                     }
-
                                     "" | "n" | "no" => {
                                         interrupt_requested.store(
                                             false,
                                             Ordering::SeqCst,
                                         );
-
-                                        println!(
-                                            "Resuming training..."
-                                        );
-
+                                        println!("Resuming training...");
                                         break;
                                     }
-
-                                    _ => {
-                                        println!(
-                                            "Please enter Y or N."
-                                        );
-                                    }
+                                    _ => { println!("Please enter Y or N."); }
                                 }
                             }
 

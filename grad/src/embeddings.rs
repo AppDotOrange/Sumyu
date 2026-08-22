@@ -1,6 +1,6 @@
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use crate::Tensor;
+use crate::{Node, Tensor, TAPE};
 
 #[derive(Clone)]
 #[derive(Serialize, Deserialize)]
@@ -32,7 +32,7 @@ impl Embeddings {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        vectors[1] = (0..embedding_dim)
+        vectors[0] = (0..embedding_dim)
             .map(|_| Tensor::new(0.0))
             .collect();
 
@@ -74,33 +74,26 @@ impl Embeddings {
         batch_size: usize,
         context_len: usize,
     ) -> Vec<f32> {
-        let input_size =
-            context_len * self.embedding_dim;
-
-        let mut output =
-            vec![0.0f32; batch_size * input_size];
+        let input_size = context_len * self.embedding_dim;
+        let mut output = vec![0.0f32; batch_size * input_size];
 
         for b in 0..batch_size {
-            let sample =
-                &ids[b * context_len..(b + 1) * context_len];
+            let sample_start = b * context_len;
+            let dst = &mut output[b * input_size..(b + 1) * input_size];
 
-            let dst =
-                &mut output[
-                    b * input_size
-                        ..(b + 1) * input_size
+            for position in 0..context_len {
+                let src = &self.vectors[ids[sample_start + position]];
+                let dst = &mut dst[
+                    position * self.embedding_dim
+                        ..(position + 1) * self.embedding_dim
                     ];
 
-            for (position, &id) in sample.iter().enumerate() {
-                let src = &self.vectors[id];
-
-                let offset =
-                    position * self.embedding_dim;
-
-                for i in 0..self.embedding_dim {
-                    dst[offset + i] = src[i].data();
+                for (dst, src) in dst.iter_mut().zip(src.iter()) {
+                    *dst = src.data();
                 }
             }
         }
+
         output
     }
 
@@ -111,34 +104,44 @@ impl Embeddings {
         batch_size: usize,
         context_len: usize,
     ) {
-        let input_size =
-            context_len * self.embedding_dim;
+        let input_size = context_len * self.embedding_dim;
 
-        let mut grads = Vec::new();
+        TAPE.with(|t| {
+            let mut tape = t.borrow_mut();
 
-        for b in 0..batch_size {
-            for position in 0..context_len {
-                let token = ids[
-                    b * context_len + position
+            for b in 0..batch_size {
+                let sample = &ids[
+                    b * context_len..(b + 1) * context_len
                     ];
 
-                let input_offset =
-                    b * input_size
-                        + position * self.embedding_dim;
+                let batch_grads = &input_grads[
+                    b * input_size..(b + 1) * input_size
+                    ];
 
-                let embedding =
-                    &self.vectors[token];
+                for (position, &token) in sample.iter().enumerate() {
+                    let embedding = &self.vectors[token];
 
-                for i in 0..self.embedding_dim {
-                    grads.push((
-                        embedding[i].handle,
-                        input_grads[input_offset + i], // here
-                    ));
+                    let start = position * self.embedding_dim;
+                    let input = &batch_grads[
+                        start..start + self.embedding_dim
+                        ];
+
+                    for (embedding, &grad) in
+                        embedding.iter().zip(input.iter())
+                    {
+                        match &mut tape.nodes[embedding.handle.node] {
+                            Node::Scalar(node) => {
+                                node.grad += grad;
+                            }
+
+                            Node::FusedLayer(node) => {
+                                node.grads[embedding.handle.index] += grad;
+                            }
+                        }
+                    }
                 }
             }
-        }
-
-        crate::add_handle_grads(&grads);
+        });
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -179,37 +182,96 @@ impl Embeddings {
     pub fn find_clusters(&self, threshold: f32, vocab: Vec<String>) {
         let n = self.vectors.len();
 
-        let mut norms = vec![0.0; n];
-
-        for (norm, vector) in norms.iter_mut().zip(&self.vectors).take(n) {
-            *norm = vector
-                .iter()
-                .map(|t| {
-                    let x = t.data();
-                    x * x
-                })
-                .sum::<f32>()
-                .sqrt();
+        if n < 2 {
+            println!("Highest similarity: N/A");
+            println!("\nTotal clusters: 0");
+            return;
         }
 
-        let cosine = |a: usize, b: usize| -> f32 {
-            let dot = self.vectors[a]
-                .iter()
-                .zip(self.vectors[b].iter())
-                .map(|(x, y)| x.data() * y.data())
-                .sum::<f32>();
+        let dim = self.embedding_dim;
 
-            dot / (norms[a] * norms[b] + 1e-12)
-        };
+        // Flatten and normalize embeddings once.
+        // After this, cosine similarity is just a dot product.
+        let mut normalized = vec![0.0f32; n * dim];
 
-        let mut graph = vec![Vec::<usize>::new(); n];
+        for id in 0..n {
+            let src = &self.vectors[id];
+            let dst = &mut normalized[id * dim..(id + 1) * dim];
 
-        let mut max_sim = -1.0;
-        let mut max_pair = (0, 0);
+            let mut norm_sq = 0.0f32;
 
+            for i in 0..dim {
+                let x = src[i].data();
+                dst[i] = x;
+                norm_sq += x * x;
+            }
+
+            if norm_sq > 0.0 {
+                let inv_norm = norm_sq.sqrt().recip();
+
+                for x in dst {
+                    *x *= inv_norm;
+                }
+            }
+            // Zero vectors stay zero, matching the old
+            // dot / (norm_a * norm_b + 1e-12) behavior.
+        }
+
+        // Union-find / disjoint-set structure.
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut size = vec![1usize; n];
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        fn union(
+            parent: &mut [usize],
+            size: &mut [usize],
+            a: usize,
+            b: usize,
+        ) {
+            let mut root_a = find(parent, a);
+            let mut root_b = find(parent, b);
+
+            if root_a == root_b {
+                return;
+            }
+
+            // Union by size.
+            if size[root_a] < size[root_b] {
+                std::mem::swap(&mut root_a, &mut root_b);
+            }
+
+            parent[root_b] = root_a;
+            size[root_a] += size[root_b];
+        }
+
+        let mut max_sim = -1.0f32;
+        let mut max_pair = (0usize, 0usize);
+
+        // Exact O(n² * dim) cosine search, but with:
+        // - no repeated Tensor::data() calls
+        // - no sqrt/division per comparison
+        // - no graph allocation
+        // - contiguous f32 memory
         for i in 0..n {
+            let a = &normalized[i * dim..(i + 1) * dim];
+
             for j in (i + 1)..n {
-                let sim = cosine(i, j);
+                let b = &normalized[j * dim..(j + 1) * dim];
+
+                let mut dot = 0.0f32;
+
+                for k in 0..dim {
+                    dot += a[k] * b[k];
+                }
+
+                let sim = dot;
 
                 if sim > max_sim {
                     max_sim = sim;
@@ -217,8 +279,7 @@ impl Embeddings {
                 }
 
                 if sim >= threshold {
-                    graph[i].push(j);
-                    graph[j].push(i);
+                    union(&mut parent, &mut size, i, j);
                 }
             }
         }
@@ -230,38 +291,38 @@ impl Embeddings {
             max_pair.1
         );
 
-        let mut visited = vec![false; n];
+        // Collect connected components.
+        let mut cluster_members: Vec<Vec<usize>> = Vec::new();
+        let mut cluster_index = vec![usize::MAX; n];
+
+        for id in 0..n {
+            let root = find(&mut parent, id);
+
+            if cluster_index[root] == usize::MAX {
+                cluster_index[root] = cluster_members.len();
+                cluster_members.push(Vec::new());
+            }
+
+            cluster_members[cluster_index[root]].push(id);
+        }
+
         let mut clusters = 0;
 
-        for start in 0..n {
-            if visited[start] {
+        for cluster in cluster_members {
+            if cluster.len() <= 1 {
                 continue;
             }
 
-            let mut stack = vec![start];
-            let mut cluster = Vec::new();
+            clusters += 1;
 
-            visited[start] = true;
+            println!(
+                "\nCluster {} ({} tokens):",
+                clusters,
+                cluster.len()
+            );
 
-            while let Some(node) = stack.pop() {
-                cluster.push(node);
-
-                for &next in &graph[node] {
-                    if !visited[next] {
-                        visited[next] = true;
-                        stack.push(next);
-                    }
-                }
-            }
-
-            if cluster.len() > 1 {
-                clusters += 1;
-
-                println!("\nCluster {} ({} tokens):", clusters, cluster.len());
-
-                for id in cluster {
-                    println!("  token {} ({})", id, vocab[id]);
-                }
+            for id in cluster {
+                println!("  token {} ({})", id, vocab[id]);
             }
         }
 
