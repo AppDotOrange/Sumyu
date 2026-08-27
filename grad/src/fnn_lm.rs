@@ -1,7 +1,7 @@
-use crate::neuron::{SavedMLP, MLP, OldSavedMLP};
+use crate::neuron::{LayerSpec, SavedMLP, MLP};
 use crate::Tensor;
 use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState};
-use crate::embeddings::{Embeddings, OldSavedEmbeddings, SavedEmbeddings};
+use crate::embeddings::{Embeddings, SavedEmbeddings};
 use crate::helper::Config;
 use std::fs;
 use std::io::Write;
@@ -46,30 +46,6 @@ pub struct SavedCheckpoint {
     pub lr: f32,
     pub best_loss: f32,
     pub plateau_count: usize,
-}
-
-#[derive(Deserialize)]
-pub struct SavedLMf64 {
-    mlp: OldSavedMLP,
-    vocab: Vec<String>,
-    context_len: u32,
-    hidden_layers: Vec<usize>,
-    embeddings: OldSavedEmbeddings,
-}
-
-#[derive(Deserialize)]
-pub struct SavedLMf64desc {
-    description: String,
-    mlp: OldSavedMLP,
-    vocab: Vec<String>,
-    context_len: u32,
-    hidden_layers: Vec<usize>,
-    embeddings: OldSavedEmbeddings,
-}
-
-pub enum LegacyLM {
-    NoDesc(SavedLMf64),
-    Desc(SavedLMf64desc),
 }
 
 pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
@@ -267,6 +243,29 @@ impl LM {
         }
     }
 
+    pub fn from_layers(
+        context_len: u32,
+        vocab: Vec<String>,
+        layers: &[LayerSpec],
+        embedding_dim: usize,
+    ) -> Self {
+        let embeddings = Embeddings::new(vocab.len(), embedding_dim);
+        let trainer = Trainer::new(0.0, 0, 0, 0);
+
+        Self {
+            trainer,
+            mlp: MLP::from_layers(
+                context_len as usize * embedding_dim,
+                layers,
+            ),
+            dataset: vec![],
+            vocab,
+            context_len,
+            hidden_layers: vec![],
+            embeddings,
+        }
+    }
+
     pub fn from_config(config: Config) -> Self {
         let mut dim = vec![config.context_len * config.emb_dim];
         dim.extend(config.hidden_dim.to_vec());
@@ -377,19 +376,19 @@ impl LM {
         ids: &[usize],
         temp: f32,
     ) -> usize {
-        let tape_start = crate::tape_len();
-        let input =
-            self.encode_embeddings(ids);
+        let input = self.embeddings.encode_batch(
+            ids,
+            1,
+            self.context_len as usize,
+        );
 
-        let out =
-            self.mlp.forward(&input);
+        let forward = self.mlp.forward_batch(
+            &input,
+            1,
+            self.context_len as usize * self.embeddings.embedding_dim(),
+        );
 
-        let logits: Vec<f32> =
-            out.iter()
-                .map(|x| x.data())
-                .collect();
-
-        crate::clear_tape_after(tape_start);
+        let logits = forward.output;
 
         if temp <= 0.0 {
             return logits
@@ -485,9 +484,19 @@ impl LM {
         }
         println!("IDs: {:?}", ids);
         println!("Split text: {:?}", ids.iter().map(|x1| {self.vocab[*x1].clone()}).collect::<Vec<_>>());
-        let input = self.encode_embeddings(&ids);
-        let out: Vec<Tensor> = self.mlp.forward(&input);
-        let logits: Vec<f32> = out.iter().map(|x| x.data()).collect();
+        let input = self.embeddings.encode_batch(
+            &ids,
+            1,
+            self.context_len as usize,
+        );
+
+        let forward = self.mlp.forward_batch(
+            &input,
+            1,
+            self.context_len as usize * self.embeddings.embedding_dim(),
+        );
+
+        let logits = forward.output;
         let max_logit = logits
             .iter()
             .copied()
@@ -998,40 +1007,90 @@ impl LM {
     }
 
     pub fn param_count(&self) -> usize {
-        let input =
-            self.context_len as usize
-                * self.embeddings.embedding_dim();
-        let mut dims = self.hidden_layers.clone();
-        dims.push(self.vocab.len());
-        let mut params = 0;
-        params += dims.iter().sum::<usize>();
-        let mut full_dims = vec![input];
-        full_dims.extend(dims);
-        for x in 1..full_dims.len() {
-            params += full_dims[x] * full_dims[x-1]
-        }
-        params += self.embeddings.parameter_count();
-
-        params
+        self.mlp.parameter_count()
+            + self.embeddings.parameter_count()
     }
 
     pub fn params(&self) {
         println!("Parameter count: {}.", self.param_count());
-
-        let mut prev =
-            self.context_len as usize
-                * self.embeddings.embedding_dim();
         println!(
             "Embedding table: {} params",
             self.embeddings.parameter_count()
         );
-        println!("O O O        {} neurons   -   input layer", prev);
-        let mut layers = self.hidden_layers.clone();
-        layers.push(self.vocab.len());
-        for (idx, x) in layers.clone().iter().enumerate() {
-            println!(r"ЖХЖХЖ           {} weights   -   layer {} weights", prev*x, idx+1);
-            println!(r"O O O        {} neurons   -   layer {}", x, idx+1);
-            prev = layers[idx]
+
+        let mut sequence_length = self.context_len as usize;
+        let mut channels = self.embeddings.embedding_dim();
+
+        println!(
+            "O O O O O O O O O O O O O O O O   [{} × {}]",
+            sequence_length, channels
+        );
+
+        for (idx, layer) in self.mlp.layer_specs().iter().enumerate() {
+            match layer {
+                LayerSpec::Dense { output_size, .. } => {
+                    let input_size = sequence_length * channels;
+                    let weights = input_size * output_size;
+                    let biases = *output_size;
+
+                    println!(
+                        "ЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХ   {} weights + {} biases",
+                        weights, biases
+                    );
+                    println!(
+                        "O O O O O O O O O O O O O O O O   Dense {}: {} neurons",
+                        idx + 1,
+                        output_size
+                    );
+
+                    sequence_length = 1;
+                    channels = *output_size;
+                }
+
+                LayerSpec::Conv1D {
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride,
+                    padding,
+                    ..
+                } => {
+                    debug_assert_eq!(
+                        channels,
+                        *in_channels,
+                        "Conv1D channel mismatch"
+                    );
+
+                    let output_length =
+                        (sequence_length + 2 * padding - kernel_size)
+                            / stride
+                            + 1;
+
+                    let weights =
+                        out_channels * in_channels * kernel_size;
+                    let biases = *out_channels;
+
+                    println!(
+                        "████████████████████████████████   Conv1D {}: [{} × {}] → [{} × {}]",
+                        idx + 1,
+                        sequence_length,
+                        in_channels,
+                        output_length,
+                        out_channels,
+                    );
+                    println!(
+                        "                                  kernel {} stride {} padding {} | {} weights + {} biases",
+                        kernel_size,
+                        stride,
+                        padding,
+                        weights,
+                        biases
+                    );
+
+                    sequence_length = output_length;
+                    channels = *out_channels;
+                }
+            }
         }
     }
 
@@ -1084,40 +1143,6 @@ impl LM {
         }
     }
 
-    pub fn from_saved_legacy(saved: LegacyLM) -> Self {
-        let (mlp, vocab, context_len, hidden_layers, embeddings) = match saved {
-            LegacyLM::NoDesc(x) => (
-                x.mlp,
-                x.vocab,
-                x.context_len,
-                x.hidden_layers,
-                x.embeddings,
-            ),
-            LegacyLM::Desc(y) => {
-                println!("Description:\n{}", y.description);
-                (
-                    y.mlp,
-                    y.vocab,
-                    y.context_len,
-                    y.hidden_layers,
-                    y.embeddings,
-                )
-            }
-        };
-
-        println!("Loading...");
-
-        Self {
-            trainer: Trainer::new(0.0, 0, 0, 0),
-            mlp: MLP::load(&mlp.into()),
-            dataset: Vec::new(),
-            vocab,
-            context_len,
-            hidden_layers,
-            embeddings: Embeddings::load(embeddings.into()),
-        }
-    }
-
     pub fn embeds(&self) -> Embeddings {
         self.embeddings.clone()
     }
@@ -1150,42 +1175,5 @@ impl LM {
                 bincode::config::standard(),
             ).unwrap();
         (model.description.clone(), LM::from_saved_silent(model))
-    }
-
-    pub fn load_legacy(path: &str) -> Self {
-        let bytes = fs::read(path).unwrap();
-
-        let model = match bincode::serde::decode_from_slice::<SavedLMf64desc, _>(
-            &bytes,
-            bincode::config::standard(),
-        ) {
-            Ok((model, _)) => LegacyLM::Desc(model),
-
-            Err(_) => {
-                let (model, _) =
-                    bincode::serde::decode_from_slice::<SavedLMf64, _>(
-                        &bytes,
-                        bincode::config::standard(),
-                    )
-                        .unwrap();
-
-                LegacyLM::NoDesc(model)
-            }
-        };
-
-        LM::from_saved_legacy(model)
-    }
-}
-
-impl From<SavedLMf64> for SavedLM {
-    fn from(old: SavedLMf64) -> Self {
-        SavedLM {
-            description: String::new(),
-            mlp: old.mlp.into(),
-            vocab: old.vocab,
-            context_len: old.context_len,
-            hidden_layers: old.hidden_layers,
-            embeddings: old.embeddings.into(),
-        }
     }
 }

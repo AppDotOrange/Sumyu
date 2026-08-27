@@ -4,7 +4,7 @@ use grad::fnn_lm::{LM};
 
 fn main() {
     let tokens = 10_000;
-    let (_description, lm) = LM::load_silent("Production/RecipeP3.sumyu");
+    let (_description, lm) = LM::load_silent("ConvPokeExperiment.sumyu");
     //lm.params();
     let elapsed = std::time::Instant::now();
     lm.generate_gpt("".to_string(), tokens, 0.7);

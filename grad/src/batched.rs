@@ -14,6 +14,37 @@ pub fn gemm(
     ldb: usize,
     ldc: usize,
 ) {
+    gemm_beta(
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        trans_a,
+        trans_b,
+        lda,
+        ldb,
+        ldc,
+        0.0,
+    );
+}
+
+#[inline]
+pub fn gemm_beta(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    trans_a: Transpose,
+    trans_b: Transpose,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    beta: f32,
+) {
     debug_assert!(m > 0);
     debug_assert!(n > 0);
     debug_assert!(k > 0);
@@ -31,7 +62,7 @@ pub fn gemm(
             lda as i32,
             b,
             ldb as i32,
-            0.0,
+            beta,
             c,
             ldc as i32,
         );

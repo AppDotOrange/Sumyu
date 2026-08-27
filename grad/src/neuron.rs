@@ -1,22 +1,79 @@
 use std::sync::Arc;
-use crate::{Tensor, TensorHandle};
-use rand_distr::{Distribution, Normal as NormalDist};
-use serde::{Serialize, Deserialize};
+
 use cblas::{Layout, Transpose};
+use rand_distr::{Distribution, Normal as NormalDist};
+use serde::{Deserialize, Serialize};
 
-pub(crate) struct BatchLayerCache {
-    pub input_size: usize,
-    pub output_size: usize,
+use crate::{Tensor, TensorHandle};
 
-    pub input: Vec<f32>,
-    pub output: Vec<f32>,
+const CONV1D_TILE: usize = 32;
 
-    pub weights: Vec<f32>,
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Activation {
+    None,
+    LeakyReLU { slope: f32 },
+}
 
-    pub weight_handles: Arc<[TensorHandle]>,
-    pub bias_handles: Arc<[TensorHandle]>,
+impl Activation {
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        match self {
+            Self::None => x,
+            Self::LeakyReLU { slope } => if x <= 0.0 { x * slope } else { x },
+        }
+    }
 
-    pub relu: bool,
+    #[inline]
+    fn backward(&self, x: f32, grad: &mut f32) {
+        if let Self::LeakyReLU { slope } = self {
+            if x <= 0.0 {
+                *grad *= *slope;
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SavedMLP {
+    version: u32,
+    layers: Vec<SavedLayer>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum SavedLayer {
+    Dense {
+        input_size: usize,
+        output_size: usize,
+        activation: Activation,
+        weights: Vec<f32>,
+        biases: Vec<f32>,
+    },
+    Conv1D {
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        activation: Activation,
+        weights: Vec<f32>,
+        biases: Vec<f32>,
+    },
+}
+
+#[derive(Clone)]
+pub enum LayerSpec {
+    Dense {
+        output_size: usize,
+        activation: Activation,
+    },
+    Conv1D {
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        activation: Activation,
+    },
 }
 
 pub(crate) struct BatchForward {
@@ -26,36 +83,31 @@ pub(crate) struct BatchForward {
     pub layers: Vec<BatchLayerCache>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SavedNeuron {
-    weights: Vec<f32>,
-    bias: f32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SavedLayer {
-    neurons: Vec<SavedNeuron>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SavedMLP {
-    layers: Vec<SavedLayer>,
-}
-
-#[derive(Deserialize)]
-struct OldSavedNeuron {
-    weights: Vec<f64>,
-    bias: f64,
-}
-
-#[derive(Deserialize)]
-struct OldSavedLayer {
-    neurons: Vec<OldSavedNeuron>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct OldSavedMLP {
-    layers: Vec<OldSavedLayer>,
+pub(crate) enum BatchLayerCache {
+    Dense {
+        input_size: usize,
+        output_size: usize,
+        input: Vec<f32>,
+        output: Vec<f32>,
+        weights: Vec<f32>,
+        weight_handles: Arc<[TensorHandle]>,
+        bias_handles: Arc<[TensorHandle]>,
+        activation: Activation,
+    },
+    Conv1D {
+        input: Vec<f32>,
+        output: Vec<f32>,
+        input_length: usize,
+        output_length: usize,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        weight_handles: Arc<[TensorHandle]>,
+        bias_handles: Arc<[TensorHandle]>,
+        activation: Activation,
+    },
 }
 
 #[derive(Clone)]
@@ -68,30 +120,21 @@ pub struct Neuron {
 impl Neuron {
     pub fn new(num_inputs: usize, is_output: bool) -> Self {
         let mut rng = rand::rng();
-        let std_dev = (2.0 / (num_inputs as f32)).sqrt();
+        let std_dev = (2.0 / num_inputs as f32).sqrt();
         let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
 
-        let weights: Vec<Tensor> = (0..num_inputs)
-            .map(|_| {
-                let val = normal.sample(&mut rng);
-                Tensor::new(val)
-            })
+        let weights = (0..num_inputs)
+            .map(|_| Tensor::new(normal.sample(&mut rng)))
             .collect();
 
-        let bias = Tensor::new(0.1);
-
-        Neuron {
+        Self {
             weights,
-            bias,
+            bias: Tensor::new(0.1),
             is_output,
         }
     }
 
-    pub fn fwd(
-        &self,
-        inputs: &[Tensor],
-    ) -> Tensor {
-
+    pub fn fwd(&self, inputs: &[Tensor]) -> Tensor {
         Tensor::linear_neuron(
             &self.weights,
             inputs,
@@ -106,114 +149,155 @@ impl Neuron {
         params.push(self.bias);
         params
     }
-
-    pub fn save(&self) -> SavedNeuron {
-        SavedNeuron {
-            weights: self.weights
-                .iter()
-                .map(|x| x.data())
-                .collect(),
-
-            bias: self.bias.data(),
-        }
-    }
-
-    pub fn load(saved: &SavedNeuron) -> Self {
-        Neuron {
-            weights: saved.weights
-                .iter()
-                .map(|x| Tensor::new(*x))
-                .collect(),
-
-            bias: Tensor::new(saved.bias),
-
-            is_output: false,
-        }
-    }
 }
 
 #[derive(Clone)]
-pub struct Layer {
+pub struct DenseLayer {
     neurons: Vec<Neuron>,
     fused_weights: Arc<[TensorHandle]>,
     fused_biases: Arc<[TensorHandle]>,
+    activation: Activation,
 }
 
-impl Layer {
-    pub fn new(num_inputs: usize, num_outputs: usize, is_output: bool) -> Self {
-        let neurons: Vec<Neuron> = (0..num_outputs)
-            .map(|_| Neuron::new(num_inputs, is_output))
-            .collect();
+impl DenseLayer {
+    fn new(num_inputs: usize, num_outputs: usize, activation: Activation) -> Self {
+        let is_output = matches!(activation, Activation::None);
 
-        let fused_weights: Arc<[TensorHandle]> = neurons
+        let neurons = (0..num_outputs)
+            .map(|_| Neuron::new(num_inputs, is_output))
+            .collect::<Vec<_>>();
+
+        let fused_weights = neurons
             .iter()
             .flat_map(|n| n.weights.iter().map(|w| w.handle))
             .collect();
 
-        let fused_biases: Arc<[TensorHandle]> = neurons
-            .iter()
-            .map(|n| n.bias.handle)
-            .collect();
+        let fused_biases = neurons.iter().map(|n| n.bias.handle).collect();
 
-        Layer {
+        Self {
             neurons,
             fused_weights,
             fused_biases,
+            activation,
         }
     }
 
-    pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let input_handles: Vec<TensorHandle> =
-            inputs.iter().map(|x| x.handle).collect();
+    fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
+        let input_handles: Vec<TensorHandle> = inputs.iter().map(|x| x.handle).collect();
 
         Tensor::fused_layer(
             Arc::clone(&self.fused_weights),
             &input_handles,
             Arc::clone(&self.fused_biases),
-            !self.neurons[0].is_output,
+            matches!(self.activation, Activation::None),
         )
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
-        self.neurons
-            .iter()
-            .flat_map(|neuron| neuron.parameters())
-            .collect()
+    fn parameters(&self) -> Vec<Tensor> {
+        self.neurons.iter().flat_map(|n| n.parameters()).collect()
     }
 
-    pub fn save(&self) -> SavedLayer {
-        SavedLayer {
-            neurons: self.neurons
-                .iter()
-                .map(|n| n.save())
-                .collect(),
+    fn spec(&self) -> LayerSpec {
+        LayerSpec::Dense {
+            output_size: self.fused_biases.len(),
+            activation: self.activation.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Conv1DLayer {
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    activation: Activation,
+    weights: Vec<Tensor>,
+    biases: Vec<Tensor>,
+    weight_handles: Arc<[TensorHandle]>,
+    bias_handles: Arc<[TensorHandle]>,
+}
+
+impl Conv1DLayer {
+    fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        activation: Activation,
+    ) -> Self {
+        assert!(in_channels > 0);
+        assert!(out_channels > 0);
+        assert!(kernel_size > 0);
+        assert!(stride > 0);
+
+        let fan_in = in_channels * kernel_size;
+        let std_dev = (2.0 / fan_in as f32).sqrt();
+        let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
+        let mut rng = rand::rng();
+
+        let weights = (0..out_channels * fan_in)
+            .map(|_| Tensor::new(normal.sample(&mut rng)))
+            .collect::<Vec<_>>();
+
+        let biases = (0..out_channels)
+            .map(|_| Tensor::new(0.1))
+            .collect::<Vec<_>>();
+
+        let weight_handles = weights.iter().map(|x| x.handle).collect();
+        let bias_handles = biases.iter().map(|x| x.handle).collect();
+
+        Self {
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            activation,
+            weights,
+            biases,
+            weight_handles,
+            bias_handles,
         }
     }
 
-    pub fn load(saved: &SavedLayer, is_output: bool) -> Self {
-        let neurons: Vec<Neuron> = saved.neurons
-            .iter()
-            .map(|n| {
-                let mut neuron = Neuron::load(n);
-                neuron.is_output = is_output;
-                neuron
-            })
-            .collect();
+    #[inline]
+    fn output_length(&self, input_length: usize) -> usize {
+        assert!(input_length + 2 * self.padding >= self.kernel_size);
+        (input_length + 2 * self.padding - self.kernel_size) / self.stride + 1
+    }
 
-        let fused_weights: Arc<[TensorHandle]> = neurons
-            .iter()
-            .flat_map(|n| n.weights.iter().map(|w| w.handle))
-            .collect();
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = self.weights.clone();
+        params.extend_from_slice(&self.biases);
+        params
+    }
 
-        let fused_biases: Arc<[TensorHandle]> = neurons
-            .iter()
-            .map(|n| n.bias.handle)
-            .collect();
+    fn spec(&self) -> LayerSpec {
+        LayerSpec::Conv1D {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+            padding: self.padding,
+            activation: self.activation.clone(),
+        }
+    }
+}
 
-        Layer {
-            neurons,
-            fused_weights,
-            fused_biases,
+#[derive(Clone)]
+pub enum Layer {
+    Dense(DenseLayer),
+    Conv1D(Conv1DLayer),
+}
+
+impl Layer {
+    fn spec(&self) -> LayerSpec {
+        match self {
+            Layer::Dense(layer) => layer.spec(),
+            Layer::Conv1D(layer) => layer.spec(),
         }
     }
 }
@@ -225,24 +309,81 @@ pub struct MLP {
 
 impl MLP {
     pub fn new(num_inputs: usize, layer_sizes: &[usize]) -> Self {
-        let mut layers = Vec::new();
-        let mut input_size = num_inputs;
+        let specs = layer_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &output_size)| LayerSpec::Dense {
+                output_size,
+                activation: if i + 1 == layer_sizes.len() {
+                    Activation::None
+                } else {
+                    Activation::LeakyReLU { slope: 0.01 }
+                },
+            })
+            .collect::<Vec<_>>();
 
-        for (i, &output_size) in layer_sizes.iter().enumerate() {
-            let is_last_layer = i == layer_sizes.len() - 1;
-            layers.push(Layer::new(input_size, output_size, is_last_layer));
-            input_size = output_size;
+        Self::from_layers(num_inputs, &specs)
+    }
+
+    pub fn from_layers(num_inputs: usize, specs: &[LayerSpec]) -> Self {
+        let mut layers = Vec::with_capacity(specs.len());
+        let mut current_size = num_inputs;
+
+        for spec in specs {
+            let layer = match spec {
+                LayerSpec::Dense {
+                    output_size,
+                    activation,
+                } => Layer::Dense(DenseLayer::new(
+                    current_size,
+                    *output_size,
+                    activation.clone(),
+                )),
+
+                LayerSpec::Conv1D {
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride,
+                    padding,
+                    activation,
+                } => {
+                    assert_eq!(current_size % in_channels, 0);
+                    Layer::Conv1D(Conv1DLayer::new(
+                        *in_channels,
+                        *out_channels,
+                        *kernel_size,
+                        *stride,
+                        *padding,
+                        activation.clone(),
+                    ))
+                }
+            };
+
+            current_size = match &layer {
+                Layer::Dense(layer) => layer.neurons.len(),
+                Layer::Conv1D(layer) => {
+                    let input_length = current_size / layer.in_channels;
+                    layer.output_length(input_length) * layer.out_channels
+                }
+            };
+
+            layers.push(layer);
         }
 
-        MLP { layers }
+        Self { layers }
     }
 
     pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let mut current = Vec::with_capacity(inputs.len());
-        current.extend_from_slice(inputs);
+        let mut current = inputs.to_vec();
 
         for layer in &self.layers {
-            current = layer.forward(&current);
+            match layer {
+                Layer::Dense(layer) => current = layer.forward(&current),
+                Layer::Conv1D(_) => {
+                    panic!("Conv1D is only supported by forward_batch");
+                }
+            }
         }
 
         current
@@ -254,107 +395,106 @@ impl MLP {
         batch_size: usize,
         input_size: usize,
     ) -> BatchForward {
-        debug_assert_eq!(
-            input.len(),
-            batch_size * input_size
-        );
+        debug_assert_eq!(input.len(), batch_size * input_size);
 
         let mut current = input.to_vec();
         let mut current_size = input_size;
-
         let mut layers = Vec::with_capacity(self.layers.len());
 
         for layer in &self.layers {
-            let output_size = layer.neurons.len();
+            match layer {
+                Layer::Dense(layer) => {
+                    let output_size = layer.neurons.len();
 
-            debug_assert_eq!(
-                layer.fused_weights.len(),
-                output_size * current_size
-            );
+                    let weights = layer
+                        .fused_weights
+                        .iter()
+                        .map(|&h| crate::handle_data(h))
+                        .collect::<Vec<_>>();
 
-            let mut weights =
-                Vec::with_capacity(output_size * current_size);
+                    let biases = layer
+                        .fused_biases
+                        .iter()
+                        .map(|&h| crate::handle_data(h))
+                        .collect::<Vec<_>>();
 
-            for &handle in layer.fused_weights.iter() {
-                weights.push(crate::handle_data(handle));
-            }
+                    let mut output = vec![0.0; batch_size * output_size];
 
-            let mut biases =
-                Vec::with_capacity(output_size);
+                    unsafe {
+                        cblas::sgemm(
+                            Layout::RowMajor,
+                            Transpose::None,
+                            Transpose::Ordinary,
+                            batch_size as i32,
+                            output_size as i32,
+                            current_size as i32,
+                            1.0,
+                            &current,
+                            current_size as i32,
+                            &weights,
+                            current_size as i32,
+                            0.0,
+                            &mut output,
+                            output_size as i32,
+                        );
+                    }
 
-            for &handle in layer.fused_biases.iter() {
-                biases.push(crate::handle_data(handle));
-            }
-
-            let mut output =
-                vec![0.0f32; batch_size * output_size];
-
-            // X [batch × input]
-            // Wᵀ [input × output]
-            //
-            // Y = X Wᵀ
-            //
-            // Our W is stored as:
-            // [output × input]
-            //
-            // BLAS therefore computes:
-            //
-            // C = Wᵀ * Xᵀ
-            //
-            // but C is naturally column-major for that formulation.
-            //
-            // Instead, use row-major:
-            //
-            // C = X * Wᵀ
-            unsafe {
-                cblas::sgemm(
-                    Layout::RowMajor,
-                    Transpose::None,
-                    Transpose::Ordinary,
-                    batch_size as i32,
-                    output_size as i32,
-                    current_size as i32,
-                    1.0,
-                    &current,
-                    current_size as i32,
-                    &weights,
-                    current_size as i32,
-                    0.0,
-                    &mut output,
-                    output_size as i32,
-                );
-            }
-
-            // Bias + activation.
-            for b in 0..batch_size {
-                let base = b * output_size;
-
-                for o in 0..output_size {
-                    let idx = base + o;
-
-                    output[idx] += biases[o];
-
-                    if layer.neurons[0].is_output == false {
-                        if output[idx] <= 0.0 {
-                            output[idx] *= 0.01;
+                    for b in 0..batch_size {
+                        let base = b * output_size;
+                        for o in 0..output_size {
+                            let i = base + o;
+                            output[i] = layer.activation.apply(output[i] + biases[o]);
                         }
                     }
+
+                    layers.push(BatchLayerCache::Dense {
+                        input_size: current_size,
+                        output_size,
+                        input: current,
+                        output: output.clone(),
+                        weights,
+                        weight_handles: Arc::clone(&layer.fused_weights),
+                        bias_handles: Arc::clone(&layer.fused_biases),
+                        activation: layer.activation.clone(),
+                    });
+
+                    current = output;
+                    current_size = output_size;
+                }
+
+                Layer::Conv1D(layer) => {
+                    assert_eq!(current_size % layer.in_channels, 0);
+
+                    let input_length = current_size / layer.in_channels;
+                    let output_length = layer.output_length(input_length);
+
+                    let output = conv1d_forward(
+                        layer,
+                        &current,
+                        batch_size,
+                        input_length,
+                        output_length,
+                    );
+
+                    layers.push(BatchLayerCache::Conv1D {
+                        input: current,
+                        output: output.clone(),
+                        input_length,
+                        output_length,
+                        in_channels: layer.in_channels,
+                        out_channels: layer.out_channels,
+                        kernel_size: layer.kernel_size,
+                        stride: layer.stride,
+                        padding: layer.padding,
+                        weight_handles: Arc::clone(&layer.weight_handles),
+                        bias_handles: Arc::clone(&layer.bias_handles),
+                        activation: layer.activation.clone(),
+                    });
+
+                    current = output;
+                    current_size = output_length * layer.out_channels;
                 }
             }
-
-            layers.push(BatchLayerCache {
-                input_size: current_size,
-                output_size,
-                input: current,
-                output: output.clone(),
-                weights,
-                weight_handles: Arc::clone(&layer.fused_weights),
-                bias_handles: Arc::clone(&layer.fused_biases),
-                relu: !layer.neurons[0].is_output,
-            });
-
-            current = output;
-            current_size = output_size;
         }
 
         BatchForward {
@@ -375,136 +515,126 @@ impl MLP {
             forward.batch_size * forward.output_size
         );
 
+        let mut grad = output_grads.to_vec();
         let batch_size = forward.batch_size;
 
-        let mut grad = output_grads.to_vec();
-
-        // Process layers backwards.
         for layer in forward.layers.iter().rev() {
-            let input_size = layer.input_size;
-            let output_size = layer.output_size;
-
-            // ---------------------------------------------------------
-            // Apply activation derivative.
-            // ---------------------------------------------------------
-
-            if layer.relu {
-                for b in 0..batch_size {
-                    let base = b * output_size;
-
-                    for o in 0..output_size {
-                        let idx = base + o;
-
-                        if layer.output[idx] <= 0.0 {
-                            grad[idx] *= 0.01;
+            match layer {
+                BatchLayerCache::Dense {
+                    input_size,
+                    output_size,
+                    input,
+                    output,
+                    weights,
+                    weight_handles,
+                    bias_handles,
+                    activation,
+                } => {
+                    for b in 0..batch_size {
+                        let base = b * *output_size;
+                        for o in 0..*output_size {
+                            activation.backward(output[base + o], &mut grad[base + o]);
                         }
                     }
+
+                    let mut weight_grads = vec![0.0; output_size * input_size];
+
+                    unsafe {
+                        cblas::sgemm(
+                            Layout::RowMajor,
+                            Transpose::Ordinary,
+                            Transpose::None,
+                            *output_size as i32,
+                            *input_size as i32,
+                            batch_size as i32,
+                            1.0,
+                            &grad,
+                            *output_size as i32,
+                            input,
+                            *input_size as i32,
+                            0.0,
+                            &mut weight_grads,
+                            *input_size as i32,
+                        );
+                    }
+
+                    let mut bias_grads = vec![0.0; *output_size];
+
+                    for b in 0..batch_size {
+                        let base = b * *output_size;
+                        for o in 0..*output_size {
+                            bias_grads[o] += grad[base + o];
+                        }
+                    }
+
+                    let mut input_grads = vec![0.0; batch_size * *input_size];
+
+                    unsafe {
+                        cblas::sgemm(
+                            Layout::RowMajor,
+                            Transpose::None,
+                            Transpose::None,
+                            batch_size as i32,
+                            *input_size as i32,
+                            *output_size as i32,
+                            1.0,
+                            &grad,
+                            *output_size as i32,
+                            weights,
+                            *input_size as i32,
+                            0.0,
+                            &mut input_grads,
+                            *input_size as i32,
+                        );
+                    }
+
+                    let mut parameter_grads =
+                        Vec::with_capacity(weight_grads.len() + bias_grads.len());
+
+                    for i in 0..weight_grads.len() {
+                        parameter_grads.push((weight_handles[i], weight_grads[i]));
+                    }
+
+                    for i in 0..bias_grads.len() {
+                        parameter_grads.push((bias_handles[i], bias_grads[i]));
+                    }
+
+                    crate::add_handle_grads(&parameter_grads);
+                    grad = input_grads;
+                }
+
+                BatchLayerCache::Conv1D {
+                    input,
+                    output,
+                    input_length,
+                    output_length,
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride,
+                    padding,
+                    weight_handles,
+                    bias_handles,
+                    activation,
+                } => {
+                    grad = conv1d_backward(
+                        input,
+                        output,
+                        &mut grad,
+                        batch_size,
+                        *input_length,
+                        *output_length,
+                        *in_channels,
+                        *out_channels,
+                        *kernel_size,
+                        *stride,
+                        *padding,
+                        weight_handles,
+                        bias_handles,
+                        activation,
+                    );
                 }
             }
-
-            // ---------------------------------------------------------
-            // dW = dYᵀ X
-            //
-            // dY = [batch × output]
-            // X  = [batch × input]
-            //
-            // dW = [output × input]
-            // ---------------------------------------------------------
-
-            let mut weight_grads =
-                vec![0.0f32; output_size * input_size];
-
-            unsafe {
-                cblas::sgemm(
-                    Layout::RowMajor,
-                    Transpose::Ordinary,
-                    Transpose::None,
-                    output_size as i32,
-                    input_size as i32,
-                    batch_size as i32,
-                    1.0,
-                    &grad,
-                    output_size as i32,
-                    &layer.input,
-                    input_size as i32,
-                    0.0,
-                    &mut weight_grads,
-                    input_size as i32,
-                );
-            }
-
-            // ---------------------------------------------------------
-            // db = sum(dY)
-            // ---------------------------------------------------------
-
-            let mut bias_grads =
-                vec![0.0f32; output_size];
-
-            for b in 0..batch_size {
-                let base = b * output_size;
-
-                for o in 0..output_size {
-                    bias_grads[o] += grad[base + o];
-                }
-            }
-
-            // ---------------------------------------------------------
-            // dX = dY W
-            //
-            // dY [batch × output]
-            // W  [output × input]
-            //
-            // dX [batch × input]
-            // ---------------------------------------------------------
-
-            let mut input_grads =
-                vec![0.0f32; batch_size * input_size];
-
-            unsafe {
-                cblas::sgemm(
-                    Layout::RowMajor,
-                    Transpose::None,
-                    Transpose::None,
-                    batch_size as i32,
-                    input_size as i32,
-                    output_size as i32,
-                    1.0,
-                    &grad,
-                    output_size as i32,
-                    &layer.weights,
-                    input_size as i32,
-                    0.0,
-                    &mut input_grads,
-                    input_size as i32,
-                );
-            }
-
-            // ---------------------------------------------------------
-            // Accumulate parameter gradients.
-            // ---------------------------------------------------------
-
-            let mut parameter_grads =
-                Vec::with_capacity(
-                    weight_grads.len() + bias_grads.len()
-                );
-
-            for i in 0..weight_grads.len() {
-                parameter_grads.push((
-                    layer.weight_handles[i],
-                    weight_grads[i],
-                ));
-            }
-
-            for i in 0..bias_grads.len() {
-                parameter_grads.push((
-                    layer.bias_handles[i],
-                    bias_grads[i],
-                ));
-            }
-
-            crate::add_handle_grads(&parameter_grads);
-
-            grad = input_grads;
         }
 
         grad
@@ -514,7 +644,10 @@ impl MLP {
         let mut params = Vec::new();
 
         for layer in &self.layers {
-            params.extend(layer.parameters());
+            match layer {
+                Layer::Dense(layer) => params.extend(layer.parameters()),
+                Layer::Conv1D(layer) => params.extend(layer.parameters()),
+            }
         }
 
         params
@@ -522,55 +655,337 @@ impl MLP {
 
     pub fn save(&self) -> SavedMLP {
         SavedMLP {
-            layers: self.layers
-                .iter()
-                .map(|l| l.save())
-                .collect(),
+            version: 1,
+            layers: self.layers.iter().map(|layer| match layer {
+                Layer::Dense(layer) => SavedLayer::Dense {
+                    input_size: layer.neurons[0].weights.len(),
+                    output_size: layer.neurons.len(),
+                    activation: layer.activation.clone(),
+                    weights: layer.neurons
+                        .iter()
+                        .flat_map(|n| n.weights.iter().map(|w| w.data()))
+                        .collect(),
+                    biases: layer.neurons.iter().map(|n| n.bias.data()).collect(),
+                },
+
+                Layer::Conv1D(layer) => SavedLayer::Conv1D {
+                    in_channels: layer.in_channels,
+                    out_channels: layer.out_channels,
+                    kernel_size: layer.kernel_size,
+                    stride: layer.stride,
+                    padding: layer.padding,
+                    activation: layer.activation.clone(),
+                    weights: layer.weights.iter().map(|x| x.data()).collect(),
+                    biases: layer.biases.iter().map(|x| x.data()).collect(),
+                },
+            }).collect(),
         }
     }
 
     pub fn load(saved: &SavedMLP) -> Self {
-        let last = saved.layers.len() - 1;
+        assert_eq!(saved.version, 1);
 
-        MLP {
-            layers: saved.layers
-                .iter()
-                .enumerate()
-                .map(|(i, layer)| {
-                    Layer::load(layer, i == last)
+        let layers = saved.layers.iter().map(|layer| match layer {
+            SavedLayer::Dense {
+                input_size,
+                output_size,
+                activation,
+                weights,
+                biases,
+            } => {
+                assert_eq!(weights.len(), input_size * output_size);
+                assert_eq!(biases.len(), *output_size);
+
+                let neurons = (0..*output_size)
+                    .map(|o| Neuron {
+                        weights: (0..*input_size)
+                            .map(|i| Tensor::new(weights[o * *input_size + i]))
+                            .collect(),
+                        bias: Tensor::new(biases[o]),
+                        is_output: matches!(activation, Activation::None),
+                    })
+                    .collect::<Vec<_>>();
+
+                let fused_weights = neurons
+                    .iter()
+                    .flat_map(|n| n.weights.iter().map(|w| w.handle))
+                    .collect();
+
+                let fused_biases = neurons.iter().map(|n| n.bias.handle).collect();
+
+                Layer::Dense(DenseLayer {
+                    neurons,
+                    fused_weights,
+                    fused_biases,
+                    activation: activation.clone(),
                 })
-                .collect(),
-        }
+            }
+
+            SavedLayer::Conv1D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                activation,
+                weights,
+                biases,
+            } => {
+                assert_eq!(
+                    weights.len(),
+                    in_channels * out_channels * kernel_size
+                );
+                assert_eq!(biases.len(), *out_channels);
+
+                let weights = weights.iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+                let biases = biases.iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+                let weight_handles = weights.iter().map(|x| x.handle).collect();
+                let bias_handles = biases.iter().map(|x| x.handle).collect();
+
+                Layer::Conv1D(Conv1DLayer {
+                    in_channels: *in_channels,
+                    out_channels: *out_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    activation: activation.clone(),
+                    weights,
+                    biases,
+                    weight_handles,
+                    bias_handles,
+                })
+            }
+        }).collect();
+
+        Self { layers }
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.parameters().len()
+    }
+
+    pub fn layer_specs(&self) -> Vec<LayerSpec> {
+        self.layers.iter().map(|layer| layer.spec()).collect()
     }
 }
 
-impl From<OldSavedNeuron> for SavedNeuron {
-    fn from(old: OldSavedNeuron) -> Self {
-        SavedNeuron {
-            weights: old.weights.into_iter()
-                .map(|x| x as f32)
-                .collect(),
-            bias: old.bias as f32,
+fn conv1d_forward(
+    layer: &Conv1DLayer,
+    input: &[f32],
+    batch_size: usize,
+    input_length: usize,
+    output_length: usize,
+) -> Vec<f32> {
+    let kernel_width = layer.kernel_size * layer.in_channels;
+    let mut output = vec![0.0; batch_size * output_length * layer.out_channels];
+
+    let weights = layer.weight_handles
+        .iter()
+        .map(|&h| crate::handle_data(h))
+        .collect::<Vec<_>>();
+
+    let biases = layer.bias_handles
+        .iter()
+        .map(|&h| crate::handle_data(h))
+        .collect::<Vec<_>>();
+
+    let mut col = vec![0.0; CONV1D_TILE * output_length * kernel_width];
+
+    for batch_start in (0..batch_size).step_by(CONV1D_TILE) {
+        let tile_batch = (batch_size - batch_start).min(CONV1D_TILE);
+        let rows = tile_batch * output_length;
+
+        col[..rows * kernel_width].fill(0.0);
+
+        for b in 0..tile_batch {
+            for out_pos in 0..output_length {
+                let row = b * output_length + out_pos;
+
+                for k in 0..layer.kernel_size {
+                    let pos = out_pos * layer.stride + k;
+                    let src_pos = pos as isize - layer.padding as isize;
+
+                    if src_pos >= 0 && (src_pos as usize) < input_length {
+                        let src = ((batch_start + b) * input_length + src_pos as usize)
+                            * layer.in_channels;
+                        let dst = row * kernel_width + k * layer.in_channels;
+
+                        col[dst..dst + layer.in_channels]
+                            .copy_from_slice(&input[src..src + layer.in_channels]);
+                    }
+                }
+            }
+        }
+
+        let output_offset = batch_start * output_length * layer.out_channels;
+        let output_tile = &mut output[
+            output_offset..output_offset + rows * layer.out_channels
+            ];
+
+        crate::batched::gemm(
+            &col[..rows * kernel_width],
+            &weights,
+            output_tile,
+            rows,
+            layer.out_channels,
+            kernel_width,
+            Transpose::None,
+            Transpose::Ordinary,
+            kernel_width,
+            kernel_width,
+            layer.out_channels,
+        );
+
+        for row in 0..rows {
+            for oc in 0..layer.out_channels {
+                let i = row * layer.out_channels + oc;
+                output_tile[i] = layer.activation.apply(output_tile[i] + biases[oc]);
+            }
         }
     }
+
+    output
 }
 
-impl From<OldSavedLayer> for SavedLayer {
-    fn from(old: OldSavedLayer) -> Self {
-        SavedLayer {
-            neurons: old.neurons.into_iter()
-                .map(Into::into)
-                .collect(),
-        }
-    }
-}
+fn conv1d_backward(
+    input: &[f32],
+    output: &[f32],
+    grad: &mut [f32],
+    batch_size: usize,
+    input_length: usize,
+    output_length: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    weight_handles: &[TensorHandle],
+    bias_handles: &[TensorHandle],
+    activation: &Activation,
+) -> Vec<f32> {
+    let kernel_width = kernel_size * in_channels;
 
-impl From<OldSavedMLP> for SavedMLP {
-    fn from(old: OldSavedMLP) -> Self {
-        SavedMLP {
-            layers: old.layers.into_iter()
-                .map(Into::into)
-                .collect(),
+    let weights = weight_handles
+        .iter()
+        .map(|&h| crate::handle_data(h))
+        .collect::<Vec<_>>();
+
+    let mut weight_grads = vec![0.0; out_channels * kernel_width];
+    let mut bias_grads = vec![0.0; out_channels];
+    let mut input_grads = vec![0.0; input.len()];
+
+    for i in 0..grad.len() {
+        activation.backward(output[i], &mut grad[i]);
+    }
+
+    let mut col = vec![0.0; CONV1D_TILE * output_length * kernel_width];
+    let mut col_grads = vec![0.0; CONV1D_TILE * output_length * kernel_width];
+
+    for batch_start in (0..batch_size).step_by(CONV1D_TILE) {
+        let tile_batch = (batch_size - batch_start).min(CONV1D_TILE);
+        let rows = tile_batch * output_length;
+
+        col[..rows * kernel_width].fill(0.0);
+
+        for b in 0..tile_batch {
+            for out_pos in 0..output_length {
+                let row = b * output_length + out_pos;
+
+                for k in 0..kernel_size {
+                    let pos = out_pos * stride + k;
+                    let src_pos = pos as isize - padding as isize;
+
+                    if src_pos >= 0 && (src_pos as usize) < input_length {
+                        let src = ((batch_start + b) * input_length + src_pos as usize)
+                            * in_channels;
+                        let dst = row * kernel_width + k * in_channels;
+
+                        col[dst..dst + in_channels]
+                            .copy_from_slice(&input[src..src + in_channels]);
+                    }
+                }
+            }
+        }
+
+        let grad_offset = batch_start * output_length * out_channels;
+        let grad_tile =
+            &grad[grad_offset..grad_offset + rows * out_channels];
+
+        crate::batched::gemm_beta(
+            grad_tile,
+            &col[..rows * kernel_width],
+            &mut weight_grads,
+            out_channels,
+            kernel_width,
+            rows,
+            Transpose::Ordinary,
+            Transpose::None,
+            out_channels,
+            kernel_width,
+            kernel_width,
+            1.0,
+        );
+
+        for row in 0..rows {
+            for oc in 0..out_channels {
+                bias_grads[oc] += grad_tile[row * out_channels + oc];
+            }
+        }
+
+        crate::batched::gemm(
+            grad_tile,
+            &weights,
+            &mut col_grads[..rows * kernel_width],
+            rows,
+            kernel_width,
+            out_channels,
+            Transpose::None,
+            Transpose::None,
+            out_channels,
+            kernel_width,
+            kernel_width,
+        );
+
+        for b in 0..tile_batch {
+            for out_pos in 0..output_length {
+                let row = b * output_length + out_pos;
+
+                for k in 0..kernel_size {
+                    let pos = out_pos * stride + k;
+                    let src_pos = pos as isize - padding as isize;
+
+                    if src_pos >= 0 && (src_pos as usize) < input_length {
+                        let dst = ((batch_start + b) * input_length + src_pos as usize)
+                            * in_channels;
+                        let src = row * kernel_width + k * in_channels;
+
+                        for c in 0..in_channels {
+                            input_grads[dst + c] += col_grads[src + c];
+                        }
+                    }
+                }
+            }
         }
     }
+
+    let mut parameter_grads =
+        Vec::with_capacity(weight_grads.len() + bias_grads.len());
+
+    for i in 0..weight_grads.len() {
+        parameter_grads.push((weight_handles[i], weight_grads[i]));
+    }
+
+    for i in 0..bias_grads.len() {
+        parameter_grads.push((bias_handles[i], bias_grads[i]));
+    }
+
+    crate::add_handle_grads(&parameter_grads);
+
+    input_grads
 }

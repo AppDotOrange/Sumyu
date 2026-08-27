@@ -1,8 +1,8 @@
 use grad::fnn_lm::{SavedLM, LM};
 use grad::helper;
-use std::{fs, io};
-use std::io::Write;
-use grad::helper::poke_v2;
+use std::fs;
+use grad::helper::{poke_v2, recipe_v3};
+use grad::neuron::{Activation, LayerSpec};
 use grad::trainer::CheckpointFrequency;
 use sumyu;
 
@@ -18,12 +18,12 @@ fn main() {
 
     //let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
     //let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
-    //let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    //let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
+    // let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
+    let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
     let recipe_full = fs::read_to_string("Datasets/recipes.txt").expect("Can't read recipes.txt!").replace("\r\n", "\n");
     //let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
     //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
-    let test = 7;
+    let test = 12;
     if test == -2 {
         println!("{}", poke_v2().len())
     } else if test == -1 {
@@ -133,15 +133,6 @@ fn main() {
             "Rustception_optimized.sumyu",
             &description,
         );
-    } else if test == 4 {
-        println!("Updating save format to .sumyu quality...");
-        print!("Description: ");
-        io::stdout().flush().expect("Failed to flush.");
-        let mut desc = String::new();
-        io::stdin().read_line(&mut desc).expect("Failed to read line!");
-        let desc = desc.trim().to_string();
-        let lm = LM::load_legacy("Production/Rustception_P1_mini.sumyu");
-        lm.save("Production/Rustception_P1_mini.sumyu", &desc);
     } else if test == 5 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -290,5 +281,69 @@ fn main() {
             "pretrainV2.sumyu",
             description,
         );
+    } else if test == 12 {
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let description = "Conv1D Recipe experiment.";
+        let mut lm = LM::from_layers(
+            32,
+            recipe_v3(),
+            &[
+                LayerSpec::Conv1D {
+                    in_channels: 30,
+                    out_channels: 128,
+                    kernel_size: 3,
+                    stride: 1,
+                    padding: 1,
+                    activation: Activation::LeakyReLU { slope: 0.01 },
+                },
+                LayerSpec::Conv1D {
+                    in_channels: 128,
+                    out_channels: 64,
+                    kernel_size: 3,
+                    stride: 2,
+                    padding: 1,
+                    activation: Activation::LeakyReLU { slope: 0.01 },
+                },
+                LayerSpec::Conv1D {
+                    in_channels: 64,
+                    out_channels: 32,
+                    kernel_size: 3,
+                    stride: 2,
+                    padding: 1,
+                    activation: Activation::LeakyReLU { slope: 0.01 },
+                },
+                LayerSpec::Dense {
+                    output_size: 30,
+                    activation: Activation::LeakyReLU { slope: 0.01 },
+                },
+                LayerSpec::Dense {
+                    output_size: recipe_v3().len(),
+                    activation: Activation::None,
+                },
+            ],
+            30,
+        );
+        */
+        let (description, mut lm) = LM::load("RecipeConvExperiment.sumyu");
+
+        lm.train_options(0.5, 100_000, 128, 0);
+        lm.params();
+        lm.load_corpus(&recipe);
+        lm.train(
+            None,
+            None,
+            None,
+            CheckpointFrequency::Disabled,
+            None,
+        );
+        lm.save("RecipeConvExperiment.sumyu", &description);
     }
 }
