@@ -17,10 +17,12 @@ use serde::{Serialize, Deserialize};
 /// # Contents:
 /// * description: String
 /// * mlp: SavedMLP
-/// * vocab: Vec<String>
+/// * vocab: Vec\<String\>
 /// * context_len: u32
 /// * hidden_layers: Vec<usize>
 /// * embeddings: SavedEmbeddings
+///
+/// This struct is serialized into a .sumyu file using serde.
 #[derive(Serialize, Deserialize)]
 pub struct SavedLM {
     description: String,
@@ -87,6 +89,136 @@ pub struct LM {
     context_len: u32,
     hidden_layers: Vec<usize>,
     embeddings: Embeddings,
+}
+
+fn stream_token(
+    token: &str,
+    byte_buffer: &mut Vec<u8>,
+) {
+    let bytes = token.as_bytes();
+    let mut i = 0;
+    let mut normal_start = 0;
+
+    while i < bytes.len() {
+        if i + 5 < bytes.len()
+            && bytes[i] == b'<'
+            && bytes[i + 1] == b'0'
+            && bytes[i + 2] == b'x'
+            && bytes[i + 5] == b'>'
+        {
+            if let Ok(byte) =
+                u8::from_str_radix(&token[i + 3..i + 5], 16)
+            {
+                // Print ordinary text before the byte token.
+                if normal_start < i {
+                    if !byte_buffer.is_empty() {
+                        print!("{}", String::from_utf8_lossy(byte_buffer));
+                        byte_buffer.clear();
+                    }
+
+                    print!("{}", &token[normal_start..i]);
+                }
+
+                byte_buffer.push(byte);
+
+                // If this is now a complete UTF-8 sequence,
+                // print it immediately.
+                if let Ok(text) = std::str::from_utf8(byte_buffer) {
+                    print!("{}", text);
+                    byte_buffer.clear();
+                }
+
+                i += 6;
+                normal_start = i;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    // Print ordinary text remaining after the final byte token.
+    if normal_start < bytes.len() {
+        if !byte_buffer.is_empty() {
+            print!("{}", String::from_utf8_lossy(byte_buffer));
+            byte_buffer.clear();
+        }
+
+        print!("{}", &token[normal_start..]);
+    }
+}
+
+fn decode_token_stream(tokens: &[String]) -> String {
+    let mut output = String::new();
+    let mut byte_buffer = Vec::<u8>::new();
+
+    for token in tokens {
+        let bytes = token.as_bytes();
+        let mut i = 0;
+        let mut text_start = 0;
+
+        while i < bytes.len() {
+            if i + 5 < bytes.len()
+                && bytes[i] == b'<'
+                && bytes[i + 1] == b'0'
+                && bytes[i + 2] == b'x'
+                && bytes[i + 5] == b'>'
+            {
+                if let Ok(byte) =
+                    u8::from_str_radix(&token[i + 3..i + 5], 16)
+                {
+                    // Flush normal text before the byte token.
+                    if text_start < i {
+                        if !byte_buffer.is_empty() {
+                            output.push_str(
+                                &String::from_utf8_lossy(&byte_buffer)
+                            );
+                            byte_buffer.clear();
+                        }
+
+                        output.push_str(&token[text_start..i]);
+                    }
+
+                    byte_buffer.push(byte);
+
+                    // If we now have valid UTF-8, emit it.
+                    if let Ok(text) =
+                        std::str::from_utf8(&byte_buffer)
+                    {
+                        output.push_str(text);
+                        byte_buffer.clear();
+                    }
+
+                    i += 6;
+                    text_start = i;
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+
+        // Flush normal text after the final byte token.
+        if text_start < bytes.len() {
+            if !byte_buffer.is_empty() {
+                output.push_str(
+                    &String::from_utf8_lossy(&byte_buffer)
+                );
+                byte_buffer.clear();
+            }
+
+            output.push_str(&token[text_start..]);
+        }
+    }
+
+    // Handle an incomplete/invalid sequence at the very end.
+    if !byte_buffer.is_empty() {
+        output.push_str(
+            &String::from_utf8_lossy(&byte_buffer)
+        );
+    }
+
+    output
 }
 
 impl LM {
@@ -240,64 +372,103 @@ impl LM {
         best
     }
 
-    pub fn generate_one(&self, context: String, temp: f32) -> String {
-        let mut ids = self.encode_nums(context);
+    pub fn generate_one_ids(
+        &self,
+        ids: &[usize],
+        temp: f32,
+    ) -> usize {
+        let tape_start = crate::tape_len();
+        let input =
+            self.encode_embeddings(ids);
 
-        if ids.len() > self.context_len as usize {
-            ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
-        } else if ids.len() < self.context_len as usize {
-            let num_to_add = self.context_len as usize - ids.len();
-            let mut new_ids = vec![1usize; num_to_add];
-            new_ids.extend(ids);
-            ids = new_ids;
-        }
-        let input = self.encode_embeddings(&ids);
-        let out: Vec<Tensor> = self.mlp.forward(&input);
+        let out =
+            self.mlp.forward(&input);
 
-        let logits: Vec<f32> = out.iter()
-            .map(|x| x.data())
-            .collect();
+        let logits: Vec<f32> =
+            out.iter()
+                .map(|x| x.data())
+                .collect();
+
+        crate::clear_tape_after(tape_start);
 
         if temp <= 0.0 {
-            let idx = logits
+            return logits
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap()
                 .0;
-
-            return self.vocab[idx].clone();
         }
 
-        // Apply temperature
-        let scaled_logits: Vec<f32> = logits
-            .iter()
-            .map(|&x| x / temp)
-            .collect();
+        let scaled_logits: Vec<f32> =
+            logits
+                .iter()
+                .map(|&x| x / temp)
+                .collect();
 
-        // Stable softmax
-        let max_logit = scaled_logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_logit =
+            scaled_logits
+                .iter()
+                .copied()
+                .fold(
+                    f32::NEG_INFINITY,
+                    f32::max,
+                );
 
-        let exp_logits: Vec<f32> = scaled_logits
-            .iter()
-            .map(|&x| (x - max_logit).exp())
-            .collect();
+        let exp_logits: Vec<f32> =
+            scaled_logits
+                .iter()
+                .map(|&x| {
+                    (x - max_logit).exp()
+                })
+                .collect();
 
-        let sum_exp: f32 = exp_logits.iter().sum();
+        let sum_exp: f32 =
+            exp_logits.iter().sum();
 
-        let probs: Vec<f32> = exp_logits
-            .iter()
-            .map(|&x| x / sum_exp)
-            .collect();
+        let probs: Vec<f32> =
+            exp_logits
+                .iter()
+                .map(|&x| x / sum_exp)
+                .collect();
 
-        // Sample
-        let dist = WeightedIndex::new(&probs).unwrap();
-        let mut rng = rng();
+        let dist =
+            WeightedIndex::new(&probs)
+                .unwrap();
 
-        let idx = dist.sample(&mut rng);
+        dist.sample(&mut rng())
+    }
+
+    pub fn generate_one(
+        &self,
+        context: String,
+        temp: f32,
+    ) -> String {
+        let mut ids =
+            self.encode_nums(context);
+
+        if ids.len() > self.context_len as usize {
+            ids =
+                ids[ids.len() -
+                    self.context_len as usize..]
+                    .to_vec();
+        } else if ids.len() < self.context_len as usize {
+            let num_to_add =
+                self.context_len as usize -
+                    ids.len();
+
+            let mut new_ids =
+                vec![1usize; num_to_add];
+
+            new_ids.extend(ids);
+            ids = new_ids;
+        }
+
+        let idx =
+            self.generate_one_ids(
+                &ids,
+                temp,
+            );
 
         self.vocab[idx].clone()
     }
@@ -339,47 +510,251 @@ impl LM {
         }
     }
 
-    pub fn generate(&self, context: String, gen_length: usize, temp: f32) -> String {
-        let mut context_ = context.clone();
-        let mut output = "".to_string();
+    pub fn generate(
+        &self,
+        context: String,
+        gen_length: usize,
+        temp: f32,
+    ) -> String {
+        let mut context_ = context;
+        let mut tokens = Vec::<String>::new();
+
         for _ in 0..gen_length {
-            let generation = self.generate_one(context_.clone(), temp);
-            context_.push_str(&generation);
-            output.push_str(&generation);
+            let token = self.generate_one(context_.clone(), temp);
+
+            context_.push_str(&token);
+            tokens.push(token);
         }
-        output
+
+        decode_token_stream(&tokens)
     }
 
-    pub fn generate_gpt(&self, context: String, gen_length: usize, temp: f32) -> String {
-        let mut context_ = context.clone();
-        let mut output = "".to_string();
-        for _ in 0..gen_length {
-            let generation = self.generate_one(context_.clone(), temp);
-            context_.push_str(&generation);
-            output.push_str(&generation);
-            print!("{}", generation);
-            let _ = std::io::stdout().flush();
-        }
-        output
-    }
+    pub fn generate_gpt(
+        &self,
+        context: String,
+        gen_length: usize,
+        temp: f32,
+    ) -> String {
+        let trie =
+            crate::helper::Trie::from_vocab(
+                &self.vocab
+            );
 
-    pub fn generate_gpt_chatter(&self, context: String, gen_length: usize, temp: f32) -> String {
-        let mut context_ = context.clone();
-        let mut output = "".to_string();
-        for _ in 0..gen_length {
-            let generation = self.generate_one(context_.clone(), temp);
-            if generation.contains("<EOT>") {
-                let gen_before_eot = generation.split("<EOT>").collect::<Vec<&str>>()[0];
-                println!("{}", gen_before_eot);
-                output.push_str(&generation);
-                return output
+        let context_len =
+            self.context_len as usize;
+
+        let mut tokenizer =
+            crate::helper::IncrementalTokenizer::new(
+                &trie,
+                context_len,
+            );
+
+        // Tokenize the initial prompt once.
+        let initial_ids =
+            trie.tokenize_u32(&context);
+
+        // Feed the prompt through the same incremental
+        // machinery. Reconstructing these bytes is unnecessary
+        // if the prompt is huge, so we simply initialize the
+        // stable state from its exact tokenization.
+        //
+        // Since this is only the initial prompt, this one-time
+        // allocation is fine.
+        tokenizer.push_raw_bytes(
+            context.as_bytes()
+        );
+
+        // The model should start from the exact tokenization
+        // of the prompt, including its EOF boundary.
+        debug_assert_eq!(
+            tokenizer.current_ids(
+                context_len,
+                1,
+            ),
+            {
+                let mut expected = initial_ids
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect::<Vec<_>>();
+
+                if expected.len() > context_len {
+                    expected =
+                        expected[
+                            expected.len() -
+                                context_len..
+                            ]
+                            .to_vec();
+                } else if expected.len() < context_len {
+                    let mut padded =
+                        vec![1usize;
+                             context_len -
+                                 expected.len()];
+
+                    padded.extend(expected);
+                    expected = padded;
+                }
+
+                expected
             }
-            context_.push_str(&generation);
-            output.push_str(&generation);
-            print!("{}", generation);
+        );
+
+        let mut output =
+            String::new();
+
+        let mut byte_buffer =
+            Vec::<u8>::new();
+
+        for _ in 0..gen_length {
+            // IMPORTANT:
+            // current_ids() tokenizes the unresolved suffix as EOF,
+            // so this exactly matches tokenize_u32() on the current
+            // complete context.
+            let ids =
+                tokenizer.current_ids(
+                    context_len,
+                    1,
+                );
+
+            let idx =
+                self.generate_one_ids(
+                    &ids,
+                    temp,
+                );
+
+            let generation =
+                &self.vocab[idx];
+
+            // Add the model's actual vocabulary token to the
+            // incremental tokenizer. This may cause a previous
+            // "pending" token such as "th" to become "the".
+            tokenizer.push_token(generation);
+
+            output.push_str(generation);
+
+            stream_token(
+                generation,
+                &mut byte_buffer,
+            );
+
+            let _ =
+                std::io::stdout().flush();
+        }
+
+        if !byte_buffer.is_empty() {
+            print!(
+                "{}",
+                String::from_utf8_lossy(
+                    &byte_buffer
+                )
+            );
+        }
+
+        let _ =
+            std::io::stdout().flush();
+
+        output
+    }
+
+    pub fn generate_gpt_chatter(
+        &self,
+        context: String,
+        gen_length: usize,
+        temp: f32,
+    ) -> String {
+        let trie =
+            crate::helper::Trie::from_vocab(
+                &self.vocab
+            );
+
+        let context_len =
+            self.context_len as usize;
+
+        let mut tokenizer =
+            crate::helper::IncrementalTokenizer::new(
+                &trie,
+                context_len,
+            );
+
+        tokenizer.push_raw_bytes(
+            context.as_bytes()
+        );
+
+        let mut output =
+            String::new();
+
+        let mut byte_buffer =
+            Vec::<u8>::new();
+
+        for _ in 0..gen_length {
+            let ids =
+                tokenizer.current_ids(
+                    context_len,
+                    1,
+                );
+
+            let idx =
+                self.generate_one_ids(
+                    &ids,
+                    temp,
+                );
+
+            let generation =
+                &self.vocab[idx];
+
+            if generation.contains("<EOT>") {
+                let before_eot =
+                    generation
+                        .split("<EOT>")
+                        .next()
+                        .unwrap();
+
+                stream_token(
+                    before_eot,
+                    &mut byte_buffer,
+                );
+
+                if !byte_buffer.is_empty() {
+                    print!(
+                        "{}",
+                        String::from_utf8_lossy(
+                            &byte_buffer
+                        )
+                    );
+
+                    byte_buffer.clear();
+                }
+
+                let _ = std::io::stdout().flush();
+
+                output.push_str(generation);
+
+                return output;
+            }
+
+            tokenizer.push_token(generation);
+
+            output.push_str(generation);
+
+            stream_token(
+                generation,
+                &mut byte_buffer,
+            );
+
             let _ = std::io::stdout().flush();
         }
+
+        if !byte_buffer.is_empty() {
+            print!(
+                "{}",
+                String::from_utf8_lossy(
+                    &byte_buffer
+                )
+            );
+        }
+
+        let _ = std::io::stdout().flush();
         println!();
+
         output
     }
 
@@ -694,15 +1069,7 @@ impl LM {
     pub fn from_saved(saved: SavedLM) -> Self {
         println!("Description:\n{}", saved.description);
         println!("Loading...");
-        Self {
-            trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
-            mlp: MLP::load(&saved.mlp),
-            dataset: Vec::new(),
-            vocab: saved.vocab,
-            context_len: saved.context_len,
-            hidden_layers: saved.hidden_layers,
-            embeddings: Embeddings::load(saved.embeddings),
-        }
+        LM::from_saved_silent(saved)
     }
 
     pub fn from_saved_silent(saved: SavedLM) -> Self {
@@ -718,32 +1085,36 @@ impl LM {
     }
 
     pub fn from_saved_legacy(saved: LegacyLM) -> Self {
-        match saved {
-            LegacyLM::NoDesc(x) => {
-                println!("Loading...");
-                Self {
-                    trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
-                    mlp: MLP::load(&x.mlp.into()),
-                    dataset: Vec::new(),
-                    vocab: x.vocab,
-                    context_len: x.context_len,
-                    hidden_layers: x.hidden_layers,
-                    embeddings: Embeddings::load(x.embeddings.into()),
-                }
-            }
+        let (mlp, vocab, context_len, hidden_layers, embeddings) = match saved {
+            LegacyLM::NoDesc(x) => (
+                x.mlp,
+                x.vocab,
+                x.context_len,
+                x.hidden_layers,
+                x.embeddings,
+            ),
             LegacyLM::Desc(y) => {
                 println!("Description:\n{}", y.description);
-                println!("Loading...");
-                Self {
-                    trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
-                    mlp: MLP::load(&y.mlp.into()),
-                    dataset: Vec::new(),
-                    vocab: y.vocab,
-                    context_len: y.context_len,
-                    hidden_layers: y.hidden_layers,
-                    embeddings: Embeddings::load(y.embeddings.into()),
-                }
+                (
+                    y.mlp,
+                    y.vocab,
+                    y.context_len,
+                    y.hidden_layers,
+                    y.embeddings,
+                )
             }
+        };
+
+        println!("Loading...");
+
+        Self {
+            trainer: Trainer::new(0.0, 0, 0, 0),
+            mlp: MLP::load(&mlp.into()),
+            dataset: Vec::new(),
+            vocab,
+            context_len,
+            hidden_layers,
+            embeddings: Embeddings::load(embeddings.into()),
         }
     }
 

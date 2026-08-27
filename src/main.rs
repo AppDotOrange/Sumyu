@@ -7,13 +7,23 @@ use grad::trainer::CheckpointFrequency;
 use sumyu;
 
 fn main() {
-    let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
-    let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
-    let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
-    let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
-    let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
-    let test = 11;
+    // to save ram:
+    let _rust = "";
+    let text = "";
+    let poke = "";
+    let recipe = "";
+    let recipe_full = "";
+    let oasst1 = "";
+    let fineweb = "";
+
+    //let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
+    //let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
+    //let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
+    //let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
+    let recipe_full = fs::read_to_string("Datasets/recipes.txt").expect("Can't read recipes.txt!").replace("\r\n", "\n");
+    //let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
+    //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
+    let test = 7;
     if test == -2 {
         println!("{}", poke_v2().len())
     } else if test == -1 {
@@ -85,8 +95,8 @@ fn main() {
         }
     } else if test == 1 {
         helper::dump_vocab_as_rust(
-            &helper::make_vocab(&fineweb, 20_000, 0, Some(&["<EOT>", "<BOT>", "<USER>"])),
-            "vocabs/fineweb_vocab2.rs",
+            &helper::make_vocab(&recipe_full, 500, 0, None),
+            "vocabs/recipe_full_2.rs",
         ).expect("Failed to dump vocab!");
     } else if test == 2 {
         let bytes = fs::read("ChatterP1.sumyu").unwrap();
@@ -97,7 +107,7 @@ fn main() {
             ).unwrap();
         let lm = LM::from_saved(model);
         lm.params();
-        lm.generate_gpt("<USER>Can you write a story about two birds?<EOT>\n".to_string(), 1000, 0.7);
+        //lm.generate_gpt("<USER>Can you write a story about two birds?<EOT>\n".to_string(), 1000, 0.7);
         //lm.generate_one_distribution("".to_string(), 25);
         //println!("\"{}\"", lm.generate("pub fn ".to_string(), 100, 0.7))
         //lm.embeds().find_clusters(0.50, helper::recipe_v1());
@@ -184,22 +194,26 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::recipe_v1_to(0.1, 32, 100_000);
+        let config = helper::recipe_v3_to(0.1, 128, 100_000);
         let description = "A Sumyu model trained on recipes.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(3);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
         let mut lm = LM::from_config(config);
-        /*
-        let (description, mut lm) = LM::load("Tests/Tale_V1_scout_10.sumyu");
-        lm.train_options(0.001, 100_000, 32, 0);
-        */
         lm.params();
-        lm.load_corpus(&recipe);
-        //lm.train(None);
+        lm.load_corpus(&recipe_full);
+        lm.train(None, None, None, CheckpointFrequency::Disabled, None);
         lm.save(
-            "RecipeP2.sumyu",
+            "RecipeP4.sumyu",
             &description,
         );
     } else if test == 8 {
@@ -271,10 +285,10 @@ fn main() {
         */
         lm.params();
         lm.load_corpus(&fineweb);
-        lm.train(Some(10), None, Some("pretraining/pretrainV2".to_string()), CheckpointFrequency::EveryBatch(1000), None);
+        lm.train(Some(10), Some("pretraining/pretrainV2_batch_88714_epoch_1.check".to_string()), Some("pretraining/pretrainV2".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.08));
         lm.save(
             "pretrainV2.sumyu",
-            &description,
+            description,
         );
     }
 }

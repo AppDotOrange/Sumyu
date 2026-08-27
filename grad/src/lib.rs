@@ -6,6 +6,8 @@ pub mod chatter;
 pub mod embeddings;
 pub mod batched;
 pub mod vocabs;
+pub mod model_configs;
+pub mod datasets;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -234,17 +236,26 @@ pub(crate) fn add_handle_grads(
         let mut tape = t.borrow_mut();
 
         for &(handle, grad) in grads {
-            match &mut tape.nodes[handle.node] {
-                Node::Scalar(node) => {
-                    node.grad += grad;
-                }
-
-                Node::FusedLayer(node) => {
-                    node.grads[handle.index] += grad;
-                }
-            }
+            add_node_grad(&mut tape, handle, grad)
         }
     });
+}
+
+#[inline(always)]
+fn add_scalar_grad(
+    tape: &mut Tape,
+    handle: TensorHandle,
+    grad: f32,
+) {
+    match &mut tape.nodes[handle.node] {
+        Node::Scalar(node) => {
+            node.grad += grad;
+        }
+
+        Node::FusedLayer(_) => {
+            unreachable!();
+        }
+    }
 }
 
 impl Tensor {
@@ -979,15 +990,7 @@ impl Tensor {
                     let weight_id = fused.weights[i];
                     let grad = tape.scratch_weight_grads[i];
 
-                    match &mut tape.nodes[weight_id.node] {
-                        Node::Scalar(node) => {
-                            node.grad += grad;
-                        }
-
-                        Node::FusedLayer(_) => {
-                            unreachable!();
-                        }
-                    }
+                    add_scalar_grad(&mut tape, weight_id, grad);
                 }
 
                 // ---------------------------------------------------------
@@ -998,15 +1001,7 @@ impl Tensor {
                     let bias_id = fused.biases[o];
                     let grad = tape.scratch_bias_grads[o];
 
-                    match &mut tape.nodes[bias_id.node] {
-                        Node::Scalar(node) => {
-                            node.grad += grad;
-                        }
-
-                        Node::FusedLayer(_) => {
-                            unreachable!();
-                        }
-                    }
+                    add_scalar_grad(&mut tape, bias_id, grad);
                 }
 
                 // ---------------------------------------------------------
@@ -1017,15 +1012,7 @@ impl Tensor {
                     let input_id = fused.inputs[i];
                     let grad = tape.scratch_input_grads[i];
 
-                    match &mut tape.nodes[input_id.node] {
-                        Node::Scalar(node) => {
-                            node.grad += grad;
-                        }
-
-                        Node::FusedLayer(node) => {
-                            node.grads[input_id.index] += grad;
-                        }
-                    }
+                    add_node_grad(&mut tape, input_id, grad)
                 }
                 // ---------------------------------------------------------
                 // Put the fused layer back.

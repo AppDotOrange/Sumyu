@@ -2,13 +2,11 @@ use std::time::{Duration, Instant};
 use rand::prelude::SliceRandom;
 use crate::neuron::MLP;
 use crate::{Op, Tensor};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::sync::mpsc::Sender;
 use crate::batched::softmax_cross_entropy_batch;
 use crate::embeddings::Embeddings;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::io::{self, Write};
+use std::sync::mpsc::Sender;
 
 pub enum TrainResult {
     Finished,
@@ -428,12 +426,6 @@ impl Trainer {
         embeddings: &Embeddings,
         params: Vec<Tensor>,
     ) -> TrainResult {
-        use std::io::{self, Write};
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
         let param_count = params.len() as f32;
 
         // ---------------------------------------------------------
@@ -1109,7 +1101,7 @@ impl Trainer {
         mlp: &mut MLP,
         tokens: &[usize],
         context_len: usize,
-        embeddings: &crate::embeddings::Embeddings,
+        embeddings: &Embeddings,
         params: Vec<Tensor>,
         tx: Sender<TrainInfo>,
     ) -> TrainResult {
