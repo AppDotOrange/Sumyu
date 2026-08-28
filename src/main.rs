@@ -19,11 +19,11 @@ fn main() {
     //let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
     //let text = fs::read_to_string("Datasets/Grimm's Fairy Tales").expect("Can't read Grimm's Fairy Tales!").replace("\r\n", "\n");
     // let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
-    let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
-    let recipe_full = fs::read_to_string("Datasets/recipes.txt").expect("Can't read recipes.txt!").replace("\r\n", "\n");
+    //let recipe = fs::read_to_string("Datasets/150recipes.txt").expect("Can't read 150recipes.txt!").replace("\r\n", "\n");
+    //let recipe_full = fs::read_to_string("Datasets/recipes.txt").expect("Can't read recipes.txt!").replace("\r\n", "\n");
     //let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
-    //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
-    let test = 12;
+    let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
+    let test = 13;
     if test == -2 {
         println!("{}", poke_v2().len())
     } else if test == -1 {
@@ -290,40 +290,129 @@ fn main() {
             openblas_set_num_threads(4);
             println!("OpenBLAS threads: {}", openblas_get_num_threads());
         }
-        /*
-        let description = "Conv1D Recipe experiment.";
+        //*
+        let description = "Conv1D recipe experiment.";
+
         let mut lm = LM::from_layers(
             32,
             recipe_v3(),
             &[
+                // Initial feature extraction.
                 LayerSpec::Conv1D {
                     in_channels: 30,
-                    out_channels: 128,
+                    out_channels: 96,
                     kernel_size: 3,
                     stride: 1,
                     padding: 1,
+                    causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
+
+                LayerSpec::ChannelScale {
+                    channels: 96,
+                },
+
+                // Residual feature-processing block.
+                LayerSpec::Residual {
+                    layers: vec![
+                        LayerSpec::DepthwiseConv1D {
+                            in_channels: 96,
+                            kernel_size: 3,
+                            stride: 1,
+                            padding: 1,
+                            causal: false,
+                            activation: Activation::LeakyReLU { slope: 0.01 },
+                        },
+
+                        LayerSpec::ChannelScale {
+                            channels: 96,
+                        },
+
+                        LayerSpec::Conv1D {
+                            in_channels: 96,
+                            out_channels: 96,
+                            kernel_size: 1,
+                            stride: 1,
+                            padding: 0,
+                            causal: false,
+                            activation: Activation::LeakyReLU { slope: 0.01 },
+                        },
+
+                        LayerSpec::ChannelScale {
+                            channels: 96,
+                        },
+                    ],
+                },
+
+                // Downsample and reduce width.
                 LayerSpec::Conv1D {
-                    in_channels: 128,
+                    in_channels: 96,
                     out_channels: 64,
                     kernel_size: 3,
                     stride: 2,
                     padding: 1,
+                    causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
+
+                LayerSpec::ChannelScale {
+                    channels: 64,
+                },
+
+                // Second residual feature-processing block.
+                LayerSpec::Residual {
+                    layers: vec![
+                        LayerSpec::DepthwiseConv1D {
+                            in_channels: 64,
+                            kernel_size: 3,
+                            stride: 1,
+                            padding: 1,
+                            causal: false,
+                            activation: Activation::LeakyReLU { slope: 0.01 },
+                        },
+
+                        LayerSpec::ChannelScale {
+                            channels: 64,
+                        },
+
+                        LayerSpec::Conv1D {
+                            in_channels: 64,
+                            out_channels: 64,
+                            kernel_size: 1,
+                            stride: 1,
+                            padding: 0,
+                            causal: false,
+                            activation: Activation::LeakyReLU { slope: 0.01 },
+                        },
+
+                        LayerSpec::ChannelScale {
+                            channels: 64,
+                        },
+                    ],
+                },
+
+                // Final downsampling.
                 LayerSpec::Conv1D {
                     in_channels: 64,
                     out_channels: 32,
                     kernel_size: 3,
                     stride: 2,
                     padding: 1,
+                    causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
+
+                LayerSpec::ChannelScale {
+                    channels: 32,
+                },
+
+                // Bottleneck.
                 LayerSpec::Dense {
                     output_size: 30,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
+
+                // Vocabulary projection.
                 LayerSpec::Dense {
                     output_size: recipe_v3().len(),
                     activation: Activation::None,
@@ -331,8 +420,8 @@ fn main() {
             ],
             30,
         );
-        */
-        let (description, mut lm) = LM::load("RecipeConvExperiment.sumyu");
+        //*/
+        //let (description, mut lm) = LM::load("MiniRecipe.sumyu");
 
         lm.train_options(0.5, 100_000, 128, 0);
         lm.params();
@@ -344,6 +433,37 @@ fn main() {
             CheckpointFrequency::Disabled,
             None,
         );
-        lm.save("RecipeConvExperiment.sumyu", &description);
+        lm.save("MiniRecipe.sumyu", &description);
+    } else if test == 13 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::fineweb_hybrid_v2_to(0.55, 256, 1);
+        let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_hybrid_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let (description, mut lm) = LM::load("Production/ChatterP1-preview.sumyu");
+        lm.train_options(0.01, 1, 256, 0);
+        */
+        lm.params();
+        lm.load_corpus(&fineweb);
+        lm.train(Some(10), Some("pretraining/pretrainConV1_batch_1186_epoch_1.check".to_string()), Some("pretraining/pretrainConV1".to_string()), CheckpointFrequency::EveryBatch(1000), None);
+        lm.save(
+            "pretrainV2.sumyu",
+            description,
+        );
     }
 }

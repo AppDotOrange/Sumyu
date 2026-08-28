@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use rand::prelude::SliceRandom;
 use crate::neuron::MLP;
-use crate::{Op, Tensor};
+use crate::Tensor;
 use crate::batched::softmax_cross_entropy_batch;
 use crate::embeddings::Embeddings;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -82,81 +82,6 @@ impl Trainer {
 
     pub fn reinit_batch_per_epoch(&mut self, max_batches_per_epoch: usize) {
         self.max_batches_per_epoch = max_batches_per_epoch
-    }
-
-    pub fn softmax_cross_entropy(
-        logits: &[Tensor],
-        target: usize,
-    ) -> Tensor {
-        let n = logits.len();
-
-        let max_val = logits
-            .iter()
-            .map(|t| t.data())
-            .fold(f32::NEG_INFINITY, f32::max);
-
-        let mut exps = Vec::with_capacity(n);
-        let mut sum_exp = 0.0;
-
-        for t in logits {
-            let val = t.data();
-            let e = (val - max_val).exp();
-            exps.push(e);
-            sum_exp += e;
-        }
-
-        let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
-
-        let loss = -probs[target].max(1e-7).ln();
-
-        Tensor::from_op(
-            loss,
-            logits.iter().map(|x| x.handle).collect(),
-            Op::SoftmaxCrossEntropy {
-                probs,
-                target,
-            },
-        )
-    }
-
-    pub fn softmax_cross_entropy_old(
-        logits: &[Tensor],
-        targets: &[f32],
-    ) -> Tensor {
-        let n = logits.len();
-
-        let max_val = logits
-            .iter()
-            .map(|t| t.data())
-            .fold(f32::NEG_INFINITY, f32::max);
-
-        let mut exps = Vec::with_capacity(n);
-        let mut sum_exp = 0.0;
-
-        for t in logits {
-            let val = t.data();
-            let e = (val - max_val).exp();
-            exps.push(e);
-            sum_exp += e;
-        }
-
-        let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
-
-        let mut loss = 0.0;
-        for (i, &target) in targets.iter().enumerate() {
-            if target > 0.5 {
-                loss -= probs[i].max(1e-7).ln();
-            }
-        }
-
-        Tensor::from_op(
-            loss,
-            logits.iter().map(|x| x.handle).collect(),
-            Op::SoftmaxCrossEntropyOld {
-                probs,
-                targets: targets.to_vec(),
-            },
-        )
     }
 
     pub fn train(
@@ -541,6 +466,15 @@ impl Trainer {
         // Process epochs
         // ---------------------------------------------------------
 
+        let mut batch_ids =
+            Vec::with_capacity(self.batch_size * context_len);
+
+        let mut targets =
+            Vec::with_capacity(self.batch_size);
+
+        let mut output_grads =
+            Vec::<f32>::new();
+
         for epoch in start_epoch..self.epochs + 1 {
             let now = Instant::now();
 
@@ -629,11 +563,8 @@ impl Trainer {
                 //   + 1 target token
                 // -----------------------------------------------------
 
-                let mut batch_ids =
-                    Vec::with_capacity(current_batch * context_len);
-
-                let mut targets =
-                    Vec::with_capacity(current_batch);
+                batch_ids.clear();
+                targets.clear();
 
                 for batch_index in 0..current_batch {
                     let sample = indices[count + batch_index];
@@ -687,8 +618,14 @@ impl Trainer {
 
                 let output_size = forward.output_size;
 
-                let mut output_grads =
-                    vec![0.0f32; current_batch * output_size];
+                let grad_len =
+                    current_batch * output_size;
+
+                if output_grads.len() != grad_len {
+                    output_grads.resize(grad_len, 0.0);
+                } else {
+                    output_grads.fill(0.0);
+                }
 
                 #[cfg(feature = "timing")]
                 let timer = Instant::now();

@@ -2,7 +2,7 @@ use crate::neuron::{LayerSpec, SavedMLP, MLP};
 use crate::Tensor;
 use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState};
 use crate::embeddings::{Embeddings, SavedEmbeddings};
-use crate::helper::Config;
+use crate::helper::{Config, HybridConfig};
 use std::fs;
 use std::io::Write;
 use std::sync::mpsc::Sender;
@@ -197,6 +197,351 @@ fn decode_token_stream(tokens: &[String]) -> String {
     output
 }
 
+fn print_layer_specs(
+    specs: &[LayerSpec],
+    mut sequence_length: usize,
+    mut channels: usize,
+    indent: usize,
+) -> (usize, usize) {
+    let prefix = "  ".repeat(indent);
+
+    for (idx, layer) in specs.iter().enumerate() {
+        match layer {
+            LayerSpec::Dense {
+                output_size,
+                ..
+            } => {
+                let input_size =
+                    sequence_length * channels;
+
+                let weights =
+                    input_size * output_size;
+
+                let biases =
+                    *output_size;
+
+                println!(
+                    "{}ЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХ   {} weights + {} biases",
+                    prefix,
+                    weights,
+                    biases
+                );
+
+                println!(
+                    "{}O O O O O O O O O O O O O O O O   Dense {}: {} neurons",
+                    prefix,
+                    idx + 1,
+                    output_size
+                );
+
+                sequence_length = 1;
+                channels = *output_size;
+            }
+
+            LayerSpec::Conv1D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                causal,
+                ..
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *in_channels,
+                    "Conv1D channel mismatch"
+                );
+
+                let output_length =
+                    if *causal {
+                        (sequence_length - 1) / stride + 1
+                    } else {
+                        (sequence_length + 2 * padding - kernel_size)
+                            / stride
+                            + 1
+                    };
+
+                let weights =
+                    out_channels
+                        * in_channels
+                        * kernel_size;
+
+                let biases =
+                    *out_channels;
+
+                println!(
+                    "{}████████████████████████████████   Conv1D {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    in_channels,
+                    output_length,
+                    out_channels,
+                );
+
+                println!(
+                    "{}                                  kernel {} stride {} padding {} causal {} | {} weights + {} biases",
+                    prefix,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    weights,
+                    biases
+                );
+
+                sequence_length = output_length;
+                channels = *out_channels;
+            }
+
+            LayerSpec::DepthwiseConv1D {
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                causal,
+                ..
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *in_channels,
+                    "DepthwiseConv1D channel mismatch"
+                );
+
+                let output_length =
+                    if *causal {
+                        (sequence_length - 1) / stride + 1
+                    } else {
+                        (sequence_length + 2 * padding - kernel_size)
+                            / stride
+                            + 1
+                    };
+
+                let weights =
+                    in_channels * kernel_size;
+
+                let biases =
+                    *in_channels;
+
+                println!(
+                    "{}████████████████████████████████   DepthwiseConv1D {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    in_channels,
+                    output_length,
+                    in_channels,
+                );
+
+                println!(
+                    "{}                                  kernel {} stride {} padding {} causal {} | {} weights + {} biases",
+                    prefix,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    weights,
+                    biases
+                );
+
+                sequence_length = output_length;
+                channels = *in_channels;
+            }
+
+            LayerSpec::GroupedConv1D {
+                in_channels,
+                out_channels,
+                groups,
+                kernel_size,
+                stride,
+                padding,
+                causal,
+                ..
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *in_channels,
+                    "GroupedConv1D channel mismatch"
+                );
+
+                let output_length =
+                    if *causal {
+                        (sequence_length - 1) / stride + 1
+                    } else {
+                        (sequence_length + 2 * padding - kernel_size)
+                            / stride
+                            + 1
+                    };
+
+                let group_in =
+                    in_channels / groups;
+
+                let weights =
+                    out_channels
+                        * group_in
+                        * kernel_size;
+
+                let biases =
+                    *out_channels;
+
+                println!(
+                    "{}████████████████████████████████   GroupedConv1D {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    in_channels,
+                    output_length,
+                    out_channels,
+                );
+
+                println!(
+                    "{}                                  groups {} kernel {} stride {} padding {} causal {} | {} weights + {} biases",
+                    prefix,
+                    groups,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    weights,
+                    biases
+                );
+
+                sequence_length = output_length;
+                channels = *out_channels;
+            }
+
+            LayerSpec::LowRankPointwise {
+                in_channels,
+                rank,
+                out_channels,
+                ..
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *in_channels,
+                    "LowRankPointwise channel mismatch"
+                );
+
+                let first_weights =
+                    in_channels * rank;
+
+                let first_biases =
+                    *rank;
+
+                let second_weights =
+                    rank * out_channels;
+
+                let second_biases =
+                    *out_channels;
+
+                let total =
+                    first_weights
+                        + first_biases
+                        + second_weights
+                        + second_biases;
+
+                println!(
+                    "{}████████████████████████████████   LowRankPointwise {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    in_channels,
+                    sequence_length,
+                    out_channels,
+                );
+
+                println!(
+                    "{}                                  rank {} | {} + {} + {} + {} = {} params",
+                    prefix,
+                    rank,
+                    first_weights,
+                    first_biases,
+                    second_weights,
+                    second_biases,
+                    total
+                );
+
+                sequence_length = sequence_length;
+                channels = *out_channels;
+            }
+
+            LayerSpec::ChannelScale {
+                channels: scale_channels,
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *scale_channels,
+                    "ChannelScale channel mismatch"
+                );
+
+                let scales =
+                    *scale_channels;
+
+                let biases =
+                    *scale_channels;
+
+                println!(
+                    "{}████████████████████████████████   ChannelScale {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    scale_channels,
+                    sequence_length,
+                    scale_channels,
+                );
+
+                println!(
+                    "{}                                  {} scales + {} biases",
+                    prefix,
+                    scales,
+                    biases
+                );
+
+                channels = *scale_channels;
+            }
+
+            LayerSpec::Residual {
+                layers: inner_layers,
+            } => {
+                println!(
+                    "{}╔══════════════════════════════════   Residual {}",
+                    prefix,
+                    idx + 1
+                );
+
+                let (inner_sequence_length, inner_channels) =
+                    print_layer_specs(
+                        inner_layers,
+                        sequence_length,
+                        channels,
+                        indent + 1,
+                    );
+
+                debug_assert_eq!(
+                    inner_sequence_length,
+                    sequence_length,
+                    "Residual block changed sequence length"
+                );
+
+                debug_assert_eq!(
+                    inner_channels,
+                    channels,
+                    "Residual block changed channel count"
+                );
+
+                println!(
+                    "{}╚══════════════════════════════════   Residual {}",
+                    prefix,
+                    idx + 1
+                );
+            }
+        }
+    }
+
+    (sequence_length, channels)
+}
+
 impl LM {
     ///
     /// LM::new() is used to create a new LM.
@@ -284,6 +629,28 @@ impl LM {
             vocab: config.vocab,
             context_len: config.context_len as u32,
             hidden_layers: config.hidden_dim.to_vec(),
+            embeddings,
+        }
+    }
+
+    pub fn from_hybrid_config(config: HybridConfig) -> Self {
+        let embeddings =
+            Embeddings::new(
+                config.vocab.len(),
+                config.emb_dim,
+            );
+
+        let trainer = Trainer::new(config.lr, config.epochs, config.batch_size, config.max_batches_per_epoch);
+        Self {
+            trainer,
+            mlp: MLP::from_layers(
+                config.context_len * config.emb_dim,
+                &config.layer_specs,
+            ),
+            dataset: vec![],
+            vocab: config.vocab,
+            context_len: config.context_len as u32,
+            hidden_layers: vec![],
             embeddings,
         }
     }
@@ -1018,80 +1385,20 @@ impl LM {
             self.embeddings.parameter_count()
         );
 
-        let mut sequence_length = self.context_len as usize;
-        let mut channels = self.embeddings.embedding_dim();
+        let sequence_length = self.context_len as usize;
+        let channels = self.embeddings.embedding_dim();
 
         println!(
             "O O O O O O O O O O O O O O O O   [{} × {}]",
             sequence_length, channels
         );
 
-        for (idx, layer) in self.mlp.layer_specs().iter().enumerate() {
-            match layer {
-                LayerSpec::Dense { output_size, .. } => {
-                    let input_size = sequence_length * channels;
-                    let weights = input_size * output_size;
-                    let biases = *output_size;
-
-                    println!(
-                        "ЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХ   {} weights + {} biases",
-                        weights, biases
-                    );
-                    println!(
-                        "O O O O O O O O O O O O O O O O   Dense {}: {} neurons",
-                        idx + 1,
-                        output_size
-                    );
-
-                    sequence_length = 1;
-                    channels = *output_size;
-                }
-
-                LayerSpec::Conv1D {
-                    in_channels,
-                    out_channels,
-                    kernel_size,
-                    stride,
-                    padding,
-                    ..
-                } => {
-                    debug_assert_eq!(
-                        channels,
-                        *in_channels,
-                        "Conv1D channel mismatch"
-                    );
-
-                    let output_length =
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
-                            + 1;
-
-                    let weights =
-                        out_channels * in_channels * kernel_size;
-                    let biases = *out_channels;
-
-                    println!(
-                        "████████████████████████████████   Conv1D {}: [{} × {}] → [{} × {}]",
-                        idx + 1,
-                        sequence_length,
-                        in_channels,
-                        output_length,
-                        out_channels,
-                    );
-                    println!(
-                        "                                  kernel {} stride {} padding {} | {} weights + {} biases",
-                        kernel_size,
-                        stride,
-                        padding,
-                        weights,
-                        biases
-                    );
-
-                    sequence_length = output_length;
-                    channels = *out_channels;
-                }
-            }
-        }
+        print_layer_specs(
+            &self.mlp.layer_specs(),
+            sequence_length,
+            channels,
+            0,
+        );
     }
 
     pub fn params_sumyu(&self) {

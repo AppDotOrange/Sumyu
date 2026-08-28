@@ -145,6 +145,19 @@ pub(crate) fn handle_data(handle: TensorHandle) -> f32 {
     })
 }
 
+#[inline]
+pub(crate) fn handle_data_slice(handles: &[TensorHandle], out: &mut [f32]) {
+    debug_assert_eq!(handles.len(), out.len());
+
+    TAPE.with(|t| {
+        let tape = t.borrow();
+
+        for (handle, value) in handles.iter().zip(out.iter_mut()) {
+            *value = node_data(&tape, *handle);
+        }
+    });
+}
+
 thread_local! {
     static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
 }
@@ -293,7 +306,7 @@ impl Tensor {
     #[inline(always)]
     pub fn data(&self) -> f32 {
         TAPE.with(|t| {
-            match &t.borrow().nodes[self.handle.node] { // crash here
+            match &t.borrow().nodes[self.handle.node] {
                 Node::Scalar(node) => node.data,
                 Node::FusedLayer(node) => node.outputs[self.handle.index],
             }
