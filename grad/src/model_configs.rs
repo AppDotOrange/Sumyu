@@ -1,5 +1,5 @@
 use crate::neuron::{Activation, LayerSpec};
-use crate::vocabs::{ml_200_tok_vocab_v3, ml_v4, poke_v1, poke_v2, recipe_v1, recipe_v2, tale_v1, oasst1, fineweb, fineweb_v2, recipe_v3};
+use crate::vocabs::{ml_200_tok_vocab_v3, ml_v4, poke_v1, poke_v2, recipe_v1, recipe_v2, tale_v1, oasst1, fineweb, fineweb_v2, recipe_v3, fineweb_v3};
 
 pub struct Config<'a> {
     pub lr: f32,
@@ -695,6 +695,380 @@ pub fn fineweb_hybrid_v2_to(
                 output_size: fineweb_v2().len(),
                 activation: Activation::None,
             },
+        ],
+        epochs,
+    )
+}
+
+pub fn fineweb_hybrid_v3_to(
+    lr: f32,
+    batch_size: usize,
+    epochs: usize,
+) -> HybridConfig {
+    HybridConfig::new(
+        lr,
+        batch_size,
+        0, // unlimited batches
+        fineweb_v2(),
+        128, // context length: unchanged
+        64,  // embedding dimension: unchanged
+        vec![
+            // ============================================================
+            // Stage 1
+            // 128 positions × 64 channels
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 64,
+                out_channels: 96,
+                kernel_size: 3,
+                stride: 1,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 96,
+            },
+
+            // ============================================================
+            // Residual Block 1
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 96,
+                        kernel_size: 5,
+                        stride: 1,
+                        padding: 2,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 96,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 96,
+                        rank: 24,
+                        out_channels: 96,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 96,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Downsample 1
+            // 128 → 64 positions
+            // 96 → 128 channels
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 96,
+                out_channels: 128,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 128,
+            },
+
+            // ============================================================
+            // Residual Block 2
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 128,
+                        kernel_size: 5,
+                        stride: 1,
+                        padding: 2,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 128,
+                        rank: 32,
+                        out_channels: 128,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Downsample 2
+            // 64 → 32 positions
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 128,
+                out_channels: 128,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 128,
+            },
+
+            // ============================================================
+            // Residual Block 3
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 128,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 128,
+                        rank: 32,
+                        out_channels: 128,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Global representation
+            //
+            // 32 positions × 128 channels = 4096 inputs.
+            //
+            // Bottleneck = 64 = embedding dimension.
+            // ============================================================
+            LayerSpec::Dense {
+                output_size: 64,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            // ============================================================
+            // Tied vocabulary projection
+            //
+            // Reuses the input embedding matrix:
+            //     logits[token] = dot(hidden, embedding[token])
+            //
+            // Adds ZERO new parameters.
+            // ============================================================
+            LayerSpec::WeightTying,
+        ],
+        epochs,
+    )
+}
+
+pub fn fineweb_hybrid_v4_to(
+    lr: f32,
+    batch_size: usize,
+    epochs: usize,
+) -> HybridConfig {
+    HybridConfig::new(
+        lr,
+        batch_size,
+        0, // unlimited batches
+        fineweb_v3(),
+        128, // context length: unchanged
+        64,  // embedding dimension: unchanged
+        vec![
+            // ============================================================
+            // Stage 1
+            // 128 positions × 64 channels
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 64,
+                out_channels: 96,
+                kernel_size: 3,
+                stride: 1,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 96,
+            },
+
+            // ============================================================
+            // Residual Block 1
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 96,
+                        kernel_size: 5,
+                        stride: 1,
+                        padding: 2,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 96,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 96,
+                        rank: 24,
+                        out_channels: 96,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 96,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Downsample 1
+            // 128 → 64 positions
+            // 96 → 128 channels
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 96,
+                out_channels: 128,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 128,
+            },
+
+            // ============================================================
+            // Residual Block 2
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 128,
+                        kernel_size: 5,
+                        stride: 1,
+                        padding: 2,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 128,
+                        rank: 32,
+                        out_channels: 128,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Downsample 2
+            // 64 → 32 positions
+            // ============================================================
+            LayerSpec::Conv1D {
+                in_channels: 128,
+                out_channels: 128,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 128,
+            },
+
+            // ============================================================
+            // Residual Block 3
+            // ============================================================
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 128,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 128,
+                        rank: 32,
+                        out_channels: 128,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+                ],
+            },
+
+            // ============================================================
+            // Global representation
+            //
+            // 32 positions × 128 channels = 4096 inputs.
+            //
+            // Bottleneck = 64 = embedding dimension.
+            // ============================================================
+            LayerSpec::Dense {
+                output_size: 64,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            // ============================================================
+            // Tied vocabulary projection
+            //
+            // Reuses the input embedding matrix:
+            //     logits[token] = dot(hidden, embedding[token])
+            //
+            // Adds ZERO new parameters.
+            // ============================================================
+            LayerSpec::WeightTying,
         ],
         epochs,
     )

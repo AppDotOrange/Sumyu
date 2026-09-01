@@ -1,11 +1,12 @@
 use crate::neuron::{LayerSpec, SavedMLP, MLP};
 use crate::Tensor;
-use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState};
+use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState, PermutationSampler};
 use crate::embeddings::{Embeddings, SavedEmbeddings};
 use crate::helper::{Config, HybridConfig};
+pub use crate::miscelaneous::{decode_token_stream, print_layer_specs, stream_token};
 use std::fs;
 use std::io::Write;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc::Sender};
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rng;
@@ -41,7 +42,9 @@ pub struct SavedCheckpoint {
     pub batch: usize,
     pub sample: usize,
 
-    pub indices: Vec<usize>,
+    pub sampler_seed: u64,
+    pub sampler_version: u32,
+    pub sampler_data_len: usize,
 
     pub lr: f32,
     pub best_loss: f32,
@@ -49,12 +52,27 @@ pub struct SavedCheckpoint {
 }
 
 pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
-    let trie = crate::helper::Trie::from_vocab(vocab);
+    let trie = crate::helper::Trie::from_vocab(vocab, byte_fallback_base(Vec::from(vocab)));
 
     trie.tokenize_u32(text)
         .into_iter()
         .map(|x| x as usize)
         .collect()
+}
+
+#[inline]
+fn byte_fallback_base(vocab: Vec<String>) -> u32 {
+    let base = vocab
+        .iter()
+        .position(|t| t == "<0x00>")
+        .expect("Vocabulary missing <0x00>") as u32;
+
+    debug_assert!(
+        base + 256 <= vocab.len() as u32,
+        "Byte fallback block incomplete"
+    );
+
+    base
 }
 
 pub struct LM {
@@ -64,482 +82,7 @@ pub struct LM {
     vocab: Vec<String>,
     context_len: u32,
     hidden_layers: Vec<usize>,
-    embeddings: Embeddings,
-}
-
-fn stream_token(
-    token: &str,
-    byte_buffer: &mut Vec<u8>,
-) {
-    let bytes = token.as_bytes();
-    let mut i = 0;
-    let mut normal_start = 0;
-
-    while i < bytes.len() {
-        if i + 5 < bytes.len()
-            && bytes[i] == b'<'
-            && bytes[i + 1] == b'0'
-            && bytes[i + 2] == b'x'
-            && bytes[i + 5] == b'>'
-        {
-            if let Ok(byte) =
-                u8::from_str_radix(&token[i + 3..i + 5], 16)
-            {
-                // Print ordinary text before the byte token.
-                if normal_start < i {
-                    if !byte_buffer.is_empty() {
-                        print!("{}", String::from_utf8_lossy(byte_buffer));
-                        byte_buffer.clear();
-                    }
-
-                    print!("{}", &token[normal_start..i]);
-                }
-
-                byte_buffer.push(byte);
-
-                // If this is now a complete UTF-8 sequence,
-                // print it immediately.
-                if let Ok(text) = std::str::from_utf8(byte_buffer) {
-                    print!("{}", text);
-                    byte_buffer.clear();
-                }
-
-                i += 6;
-                normal_start = i;
-                continue;
-            }
-        }
-
-        i += 1;
-    }
-
-    // Print ordinary text remaining after the final byte token.
-    if normal_start < bytes.len() {
-        if !byte_buffer.is_empty() {
-            print!("{}", String::from_utf8_lossy(byte_buffer));
-            byte_buffer.clear();
-        }
-
-        print!("{}", &token[normal_start..]);
-    }
-}
-
-fn decode_token_stream(tokens: &[String]) -> String {
-    let mut output = String::new();
-    let mut byte_buffer = Vec::<u8>::new();
-
-    for token in tokens {
-        let bytes = token.as_bytes();
-        let mut i = 0;
-        let mut text_start = 0;
-
-        while i < bytes.len() {
-            if i + 5 < bytes.len()
-                && bytes[i] == b'<'
-                && bytes[i + 1] == b'0'
-                && bytes[i + 2] == b'x'
-                && bytes[i + 5] == b'>'
-            {
-                if let Ok(byte) =
-                    u8::from_str_radix(&token[i + 3..i + 5], 16)
-                {
-                    // Flush normal text before the byte token.
-                    if text_start < i {
-                        if !byte_buffer.is_empty() {
-                            output.push_str(
-                                &String::from_utf8_lossy(&byte_buffer)
-                            );
-                            byte_buffer.clear();
-                        }
-
-                        output.push_str(&token[text_start..i]);
-                    }
-
-                    byte_buffer.push(byte);
-
-                    // If we now have valid UTF-8, emit it.
-                    if let Ok(text) =
-                        std::str::from_utf8(&byte_buffer)
-                    {
-                        output.push_str(text);
-                        byte_buffer.clear();
-                    }
-
-                    i += 6;
-                    text_start = i;
-                    continue;
-                }
-            }
-
-            i += 1;
-        }
-
-        // Flush normal text after the final byte token.
-        if text_start < bytes.len() {
-            if !byte_buffer.is_empty() {
-                output.push_str(
-                    &String::from_utf8_lossy(&byte_buffer)
-                );
-                byte_buffer.clear();
-            }
-
-            output.push_str(&token[text_start..]);
-        }
-    }
-
-    // Handle an incomplete/invalid sequence at the very end.
-    if !byte_buffer.is_empty() {
-        output.push_str(
-            &String::from_utf8_lossy(&byte_buffer)
-        );
-    }
-
-    output
-}
-
-fn print_layer_specs(
-    specs: &[LayerSpec],
-    mut sequence_length: usize,
-    mut channels: usize,
-    indent: usize,
-) -> (usize, usize) {
-    let prefix = "  ".repeat(indent);
-
-    for (idx, layer) in specs.iter().enumerate() {
-        match layer {
-            LayerSpec::Dense {
-                output_size,
-                ..
-            } => {
-                let input_size =
-                    sequence_length * channels;
-
-                let weights =
-                    input_size * output_size;
-
-                let biases =
-                    *output_size;
-
-                println!(
-                    "{}ЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХЖХ   {} weights + {} biases",
-                    prefix,
-                    weights,
-                    biases
-                );
-
-                println!(
-                    "{}O O O O O O O O O O O O O O O O   Dense {}: {} neurons",
-                    prefix,
-                    idx + 1,
-                    output_size
-                );
-
-                sequence_length = 1;
-                channels = *output_size;
-            }
-
-            LayerSpec::Conv1D {
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                ..
-            } => {
-                debug_assert_eq!(
-                    channels,
-                    *in_channels,
-                    "Conv1D channel mismatch"
-                );
-
-                let output_length =
-                    if *causal {
-                        (sequence_length - 1) / stride + 1
-                    } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
-                            + 1
-                    };
-
-                let weights =
-                    out_channels
-                        * in_channels
-                        * kernel_size;
-
-                let biases =
-                    *out_channels;
-
-                println!(
-                    "{}████████████████████████████████   Conv1D {}: [{} × {}] → [{} × {}]",
-                    prefix,
-                    idx + 1,
-                    sequence_length,
-                    in_channels,
-                    output_length,
-                    out_channels,
-                );
-
-                println!(
-                    "{}                                  kernel {} stride {} padding {} causal {} | {} weights + {} biases",
-                    prefix,
-                    kernel_size,
-                    stride,
-                    padding,
-                    causal,
-                    weights,
-                    biases
-                );
-
-                sequence_length = output_length;
-                channels = *out_channels;
-            }
-
-            LayerSpec::DepthwiseConv1D {
-                in_channels,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                ..
-            } => {
-                debug_assert_eq!(
-                    channels,
-                    *in_channels,
-                    "DepthwiseConv1D channel mismatch"
-                );
-
-                let output_length =
-                    if *causal {
-                        (sequence_length - 1) / stride + 1
-                    } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
-                            + 1
-                    };
-
-                let weights =
-                    in_channels * kernel_size;
-
-                let biases =
-                    *in_channels;
-
-                println!(
-                    "{}████████████████████████████████   DepthwiseConv1D {}: [{} × {}] → [{} × {}]",
-                    prefix,
-                    idx + 1,
-                    sequence_length,
-                    in_channels,
-                    output_length,
-                    in_channels,
-                );
-
-                println!(
-                    "{}                                  kernel {} stride {} padding {} causal {} | {} weights + {} biases",
-                    prefix,
-                    kernel_size,
-                    stride,
-                    padding,
-                    causal,
-                    weights,
-                    biases
-                );
-
-                sequence_length = output_length;
-                channels = *in_channels;
-            }
-
-            LayerSpec::GroupedConv1D {
-                in_channels,
-                out_channels,
-                groups,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                ..
-            } => {
-                debug_assert_eq!(
-                    channels,
-                    *in_channels,
-                    "GroupedConv1D channel mismatch"
-                );
-
-                let output_length =
-                    if *causal {
-                        (sequence_length - 1) / stride + 1
-                    } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
-                            + 1
-                    };
-
-                let group_in =
-                    in_channels / groups;
-
-                let weights =
-                    out_channels
-                        * group_in
-                        * kernel_size;
-
-                let biases =
-                    *out_channels;
-
-                println!(
-                    "{}████████████████████████████████   GroupedConv1D {}: [{} × {}] → [{} × {}]",
-                    prefix,
-                    idx + 1,
-                    sequence_length,
-                    in_channels,
-                    output_length,
-                    out_channels,
-                );
-
-                println!(
-                    "{}                                  groups {} kernel {} stride {} padding {} causal {} | {} weights + {} biases",
-                    prefix,
-                    groups,
-                    kernel_size,
-                    stride,
-                    padding,
-                    causal,
-                    weights,
-                    biases
-                );
-
-                sequence_length = output_length;
-                channels = *out_channels;
-            }
-
-            LayerSpec::LowRankPointwise {
-                in_channels,
-                rank,
-                out_channels,
-                ..
-            } => {
-                debug_assert_eq!(
-                    channels,
-                    *in_channels,
-                    "LowRankPointwise channel mismatch"
-                );
-
-                let first_weights =
-                    in_channels * rank;
-
-                let first_biases =
-                    *rank;
-
-                let second_weights =
-                    rank * out_channels;
-
-                let second_biases =
-                    *out_channels;
-
-                let total =
-                    first_weights
-                        + first_biases
-                        + second_weights
-                        + second_biases;
-
-                println!(
-                    "{}████████████████████████████████   LowRankPointwise {}: [{} × {}] → [{} × {}]",
-                    prefix,
-                    idx + 1,
-                    sequence_length,
-                    in_channels,
-                    sequence_length,
-                    out_channels,
-                );
-
-                println!(
-                    "{}                                  rank {} | {} + {} + {} + {} = {} params",
-                    prefix,
-                    rank,
-                    first_weights,
-                    first_biases,
-                    second_weights,
-                    second_biases,
-                    total
-                );
-
-                sequence_length = sequence_length;
-                channels = *out_channels;
-            }
-
-            LayerSpec::ChannelScale {
-                channels: scale_channels,
-            } => {
-                debug_assert_eq!(
-                    channels,
-                    *scale_channels,
-                    "ChannelScale channel mismatch"
-                );
-
-                let scales =
-                    *scale_channels;
-
-                let biases =
-                    *scale_channels;
-
-                println!(
-                    "{}████████████████████████████████   ChannelScale {}: [{} × {}] → [{} × {}]",
-                    prefix,
-                    idx + 1,
-                    sequence_length,
-                    scale_channels,
-                    sequence_length,
-                    scale_channels,
-                );
-
-                println!(
-                    "{}                                  {} scales + {} biases",
-                    prefix,
-                    scales,
-                    biases
-                );
-
-                channels = *scale_channels;
-            }
-
-            LayerSpec::Residual {
-                layers: inner_layers,
-            } => {
-                println!(
-                    "{}╔══════════════════════════════════   Residual {}",
-                    prefix,
-                    idx + 1
-                );
-
-                let (inner_sequence_length, inner_channels) =
-                    print_layer_specs(
-                        inner_layers,
-                        sequence_length,
-                        channels,
-                        indent + 1,
-                    );
-
-                debug_assert_eq!(
-                    inner_sequence_length,
-                    sequence_length,
-                    "Residual block changed sequence length"
-                );
-
-                debug_assert_eq!(
-                    inner_channels,
-                    channels,
-                    "Residual block changed channel count"
-                );
-
-                println!(
-                    "{}╚══════════════════════════════════   Residual {}",
-                    prefix,
-                    idx + 1
-                );
-            }
-        }
-    }
-
-    (sequence_length, channels)
+    embeddings: Arc<Embeddings>,
 }
 
 impl LM {
@@ -570,13 +113,15 @@ impl LM {
         let mut dim = vec![context_len as usize * embedding_dim];
         dim.extend(hidden_dim.to_vec());
         dim.push(vocab.len());
-        let embeddings =
+        let embeddings = Arc::new(
             Embeddings::new(
                 vocab.len(),
                 embedding_dim,
-            );
+            )
+        );
 
         let trainer = Trainer::new(0.0, 0, 0, 0);
+
         Self {
             trainer,
             mlp: MLP::new(dim[0], &dim[1..]),
@@ -594,14 +139,21 @@ impl LM {
         layers: &[LayerSpec],
         embedding_dim: usize,
     ) -> Self {
-        let embeddings = Embeddings::new(vocab.len(), embedding_dim);
+        let embeddings = Arc::new(
+            Embeddings::new(
+                vocab.len(),
+                embedding_dim,
+            )
+        );
+
         let trainer = Trainer::new(0.0, 0, 0, 0);
 
         Self {
             trainer,
-            mlp: MLP::from_layers(
+            mlp: MLP::from_layers_with_embeddings(
                 context_len as usize * embedding_dim,
                 layers,
+                Arc::clone(&embeddings),
             ),
             dataset: vec![],
             vocab,
@@ -615,11 +167,12 @@ impl LM {
         let mut dim = vec![config.context_len * config.emb_dim];
         dim.extend(config.hidden_dim.to_vec());
         dim.push(config.vocab.len());
-        let embeddings =
+        let embeddings = Arc::new(
             Embeddings::new(
                 config.vocab.len(),
                 config.emb_dim,
-            );
+            )
+        );
 
         let trainer = Trainer::new(config.lr, config.epochs, config.batch_size, config.max_batches_per_epoch);
         Self {
@@ -634,18 +187,26 @@ impl LM {
     }
 
     pub fn from_hybrid_config(config: HybridConfig) -> Self {
-        let embeddings =
+        let embeddings = Arc::new(
             Embeddings::new(
                 config.vocab.len(),
                 config.emb_dim,
-            );
+            )
+        );
 
-        let trainer = Trainer::new(config.lr, config.epochs, config.batch_size, config.max_batches_per_epoch);
+        let trainer = Trainer::new(
+            config.lr,
+            config.epochs,
+            config.batch_size,
+            config.max_batches_per_epoch,
+        );
+
         Self {
             trainer,
-            mlp: MLP::from_layers(
+            mlp: MLP::from_layers_with_embeddings(
                 config.context_len * config.emb_dim,
                 &config.layer_specs,
+                Arc::clone(&embeddings),
             ),
             dataset: vec![],
             vocab: config.vocab,
@@ -666,11 +227,19 @@ impl LM {
                 bincode::config::standard(),
             ).unwrap();
 
-        let mlp = MLP::load(&checkpoint.model.mlp);
         let vocab = checkpoint.model.vocab;
         let context_len = checkpoint.model.context_len;
         let hidden_layers = checkpoint.model.hidden_layers;
-        let embeddings = Embeddings::load(checkpoint.model.embeddings);
+        let embeddings = Arc::new(
+            Embeddings::load(
+                checkpoint.model.embeddings
+            )
+        );
+
+        let mlp = MLP::load_with_embeddings(
+            &checkpoint.model.mlp,
+            Arc::clone(&embeddings),
+        );
         let dataset = vec![];
 
         println!(
@@ -913,7 +482,8 @@ impl LM {
     ) -> String {
         let trie =
             crate::helper::Trie::from_vocab(
-                &self.vocab
+                &self.vocab,
+                byte_fallback_base(self.vocab.clone())
             );
 
         let context_len =
@@ -1039,7 +609,8 @@ impl LM {
     ) -> String {
         let trie =
             crate::helper::Trie::from_vocab(
-                &self.vocab
+                &self.vocab,
+                byte_fallback_base(self.vocab.clone()),
             );
 
         let context_len =
@@ -1190,6 +761,7 @@ impl LM {
         checkpoint_path: Option<String>,
         checkpoint_frequency: CheckpointFrequency,
         lr: Option<f32>,
+        seed: Option<u64>,
     ) {
         // ---------------------------------------------------------
         // Load an existing checkpoint, if supplied.
@@ -1266,7 +838,11 @@ impl LM {
                 epoch: state.epoch,
                 batch: state.batch,
                 sample: state.sample,
-                indices: state.indices,
+
+                sampler_seed: state.sampler_seed,
+                sampler_version: state.sampler_version,
+                sampler_data_len: state.sampler_data_len,
+
                 lr: state.lr,
                 best_loss: state.best_loss,
                 plateau_count: state.plateau_count,
@@ -1314,6 +890,7 @@ impl LM {
             self.context_len as usize,
             &self.embeddings,
             params,
+            seed.unwrap_or(PermutationSampler::DEFAULT_SEED),
         );
     }
 
@@ -1326,12 +903,18 @@ impl LM {
                 bincode::config::standard(),
             ).unwrap();
 
-        self.mlp = MLP::load(&checkpoint.model.mlp);
         self.vocab = checkpoint.model.vocab;
         self.context_len = checkpoint.model.context_len;
         self.hidden_layers = checkpoint.model.hidden_layers;
-        self.embeddings =
-            Embeddings::load(checkpoint.model.embeddings);
+        self.embeddings = Arc::new(
+            Embeddings::load(
+                checkpoint.model.embeddings
+            )
+        );
+        self.mlp = MLP::load_with_embeddings(
+            &checkpoint.model.mlp,
+            Arc::clone(&self.embeddings),
+        );
 
         println!(
             "Loaded checkpoint: epoch {}, batch {}, sample {}.",
@@ -1349,7 +932,11 @@ impl LM {
             epoch: checkpoint.epoch,
             batch: checkpoint.batch,
             sample: checkpoint.sample,
-            indices: checkpoint.indices,
+
+            sampler_seed: checkpoint.sampler_seed,
+            sampler_version: checkpoint.sampler_version,
+            sampler_data_len: checkpoint.sampler_data_len,
+
             lr: lr_,
             best_loss: checkpoint.best_loss,
             plateau_count: checkpoint.plateau_count,
@@ -1397,6 +984,7 @@ impl LM {
             &self.mlp.layer_specs(),
             sequence_length,
             channels,
+            self.vocab.len(),
             0,
         );
     }
@@ -1439,19 +1027,28 @@ impl LM {
     }
 
     pub fn from_saved_silent(saved: SavedLM) -> Self {
+        let embeddings = Arc::new(
+            Embeddings::load(
+                saved.embeddings
+            )
+        );
+
         Self {
             trainer: Trainer::new(0.0, 0, 0, 0), // defaults; configure later
-            mlp: MLP::load(&saved.mlp),
+            mlp: MLP::load_with_embeddings(
+                &saved.mlp,
+                Arc::clone(&embeddings),
+            ),
             dataset: Vec::new(),
             vocab: saved.vocab,
             context_len: saved.context_len,
             hidden_layers: saved.hidden_layers,
-            embeddings: Embeddings::load(saved.embeddings),
+            embeddings,
         }
     }
 
     pub fn embeds(&self) -> Embeddings {
-        self.embeddings.clone()
+        (*self.embeddings).clone()
     }
 
     pub fn save(&self, path: &str, description: &str) {

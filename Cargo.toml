@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-grad = {path="grad"}
-sumyu = {path="sumyu"}
+grad = { path = "grad" }
 bincode = { version = "2", features = ["serde"] }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
+debug = false
+incremental = false
+overflow-checks = false

@@ -8,6 +8,287 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::io::{self, Write};
 use std::sync::mpsc::Sender;
 
+const PERMUTATION_SAMPLER_VERSION: u32 = 1;
+const DEFAULT_SAMPLER_SEED: u64 = 1;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PermutationSampler {
+    seed: u64,
+    epoch: u64,
+    len: usize,
+    bits: u32,
+    mask: u64,
+    key: u64,
+}
+
+impl PermutationSampler {
+    pub const VERSION: u32 = PERMUTATION_SAMPLER_VERSION;
+    pub const DEFAULT_SEED: u64 = DEFAULT_SAMPLER_SEED;
+
+    pub fn new(seed: u64, epoch: usize, len: usize) -> Self {
+        assert!(len > 0, "PermutationSampler length must be > 0");
+
+        let bits = if len <= 1 {
+            0
+        } else {
+            usize::BITS - (len - 1).leading_zeros()
+        };
+
+        let mask = Self::mask_for_bits(bits);
+
+        let key = Self::derive_epoch_key(
+            seed,
+            epoch as u64,
+        );
+
+        Self {
+            seed,
+            epoch: epoch as u64,
+            len,
+            bits,
+            mask,
+            key,
+        }
+    }
+
+    #[inline]
+    fn mask_for_bits(bits: u32) -> u64 {
+        match bits {
+            0 => 0,
+            64 => u64::MAX,
+            _ => (1u64 << bits) - 1,
+        }
+    }
+
+    #[inline]
+    fn derive_epoch_key(seed: u64, epoch: u64) -> u64 {
+        // Cheap SplitMix-style key derivation.
+        // This does not need to be reversible; it only needs to
+        // deterministically derive a different key for each epoch.
+        let mut x =
+            seed ^ epoch.wrapping_mul(0x9E3779B97F4A7C15);
+
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30))
+            .wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27))
+            .wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    }
+
+    #[inline]
+    fn permute_power_of_two(
+        mut x: u64,
+        bits: u32,
+        mask: u64,
+        key: u64,
+    ) -> u64 {
+        if bits == 0 {
+            return 0;
+        }
+
+        // Every operation here is bijective modulo 2^bits:
+        //
+        //   x + c                  => bijective
+        //   x ^= x >> n            => bijective
+        //   x *= odd_constant      => bijective
+        //   x ^= x << n            => bijective
+        //
+        // Mask after operations which can overflow the k-bit domain.
+
+        x = x.wrapping_add(key) & mask;
+
+        x ^= x >> 17;
+
+        x = x
+            .wrapping_mul(0xD6E8FEB86659FD93)
+            & mask;
+
+        x ^= (x << 13) & mask;
+
+        x = x
+            .wrapping_mul(0xA5A3564E27F8863D)
+            & mask;
+
+        x ^= x >> 11;
+
+        x = x
+            .wrapping_add(key.rotate_left(29))
+            & mask;
+
+        x ^= (x << 7) & mask;
+
+        x
+    }
+
+    /// Returns the dataset index corresponding to `position`
+    /// in this epoch's deterministic permutation.
+    ///
+    /// `position` must be in `0..self.len`.
+    #[inline]
+    pub fn index(&self, position: usize) -> usize {
+        debug_assert!(
+            position < self.len,
+            "PermutationSampler position out of bounds"
+        );
+
+        if self.len == 1 {
+            return 0;
+        }
+
+        let mut x = Self::permute_power_of_two(
+            position as u64,
+            self.bits,
+            self.mask,
+            self.key,
+        );
+
+        // Cycle walking converts the permutation of [0, 2^k)
+        // into a permutation of [0, len).
+        //
+        // Starting from a valid position means we remain inside
+        // that position's permutation cycle until we hit another
+        // valid value.
+        while x >= self.len as u64 {
+            x = Self::permute_power_of_two(
+                x,
+                self.bits,
+                self.mask,
+                self.key,
+            );
+        }
+
+        x as usize
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(test)]
+mod permutation_sampler_tests {
+    use super::PermutationSampler;
+
+    #[test]
+    fn permutation_is_complete_and_unique() {
+        let lengths = [
+            1usize,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            16,
+            17,
+            31,
+            32,
+            33,
+            100,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            1000,
+            10_000,
+        ];
+
+        for len in lengths {
+            let sampler =
+                PermutationSampler::new(12345, 7, len);
+
+            let mut seen = vec![false; len];
+
+            for position in 0..len {
+                let index = sampler.index(position);
+
+                assert!(
+                    index < len,
+                    "index {} >= len {}",
+                    index,
+                    len
+                );
+
+                assert!(
+                    !seen[index],
+                    "duplicate index {} for len {}",
+                    index,
+                    len
+                );
+
+                seen[index] = true;
+            }
+
+            assert!(
+                seen.iter().all(|&x| x),
+                "not every index was visited for len {}",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn permutation_is_deterministic() {
+        let a = PermutationSampler::new(12345, 3, 1000);
+        let b = PermutationSampler::new(12345, 3, 1000);
+
+        for position in 0..1000 {
+            assert_eq!(
+                a.index(position),
+                b.index(position)
+            );
+        }
+    }
+
+    #[test]
+    fn different_epochs_change_the_permutation() {
+        let a = PermutationSampler::new(12345, 1, 1000);
+        let b = PermutationSampler::new(12345, 2, 1000);
+
+        let differences = (0..1000)
+            .filter(|&position| {
+                a.index(position) != b.index(position)
+            })
+            .count();
+
+        assert!(
+            differences > 900,
+            "epoch permutations are suspiciously similar: {} differences",
+            differences
+        );
+    }
+
+    #[test]
+    fn random_access_matches_repeated_access() {
+        let sampler =
+            PermutationSampler::new(987654321, 42, 10_000);
+
+        let expected: Vec<usize> =
+            (0..10_000)
+                .map(|position| sampler.index(position))
+                .collect();
+
+        for position in [0, 1, 17, 999, 5000, 9999] {
+            assert_eq!(
+                sampler.index(position),
+                expected[position]
+            );
+        }
+    }
+}
+
 pub enum TrainResult {
     Finished,
     Interrupted,
@@ -39,7 +320,11 @@ pub struct ResumeState {
     pub epoch: usize,
     pub batch: usize,
     pub sample: usize,
-    pub indices: Vec<usize>,
+
+    pub sampler_seed: u64,
+    pub sampler_version: u32,
+    pub sampler_data_len: usize,
+
     pub lr: f32,
     pub best_loss: f32,
     pub plateau_count: usize,
@@ -50,7 +335,11 @@ pub struct CheckpointState {
     pub epoch: usize,
     pub batch: usize,
     pub sample: usize,
-    pub indices: Vec<usize>,
+
+    pub sampler_seed: u64,
+    pub sampler_version: u32,
+    pub sampler_data_len: usize,
+
     pub lr: f32,
     pub best_loss: f32,
     pub plateau_count: usize,
@@ -350,6 +639,7 @@ impl Trainer {
         context_len: usize,
         embeddings: &Embeddings,
         params: Vec<Tensor>,
+        sampler_seed: u64,
     ) -> TrainResult {
         let param_count = params.len() as f32;
 
@@ -375,8 +665,6 @@ impl Trainer {
             );
         })
             .expect("Error setting Ctrl+C handler");
-
-        let mut rng = rand::rng();
 
         let data_len = tokens.len().saturating_sub(context_len);
 
@@ -428,6 +716,27 @@ impl Trainer {
             None => (1, None),
         };
 
+        let sampler_seed = match resume_state.as_ref() {
+            Some(state) => {
+                assert_eq!(
+                    state.sampler_version,
+                    PermutationSampler::VERSION,
+                    "Unsupported permutation sampler version in checkpoint"
+                );
+
+                assert_eq!(
+                    state.sampler_data_len,
+                    data_len,
+                    "Dataset length differs from checkpoint. \
+             Exact deterministic resume is impossible."
+                );
+
+                state.sampler_seed
+            }
+
+            None => sampler_seed,
+        };
+
         // MLP input size = context_len * embedding_dim.
         let input_size = context_len * embeddings.embedding_dim();
 
@@ -440,7 +749,8 @@ impl Trainer {
              epoch: usize,
              batch: usize,
              sample: usize,
-             indices: &[usize],
+             sampler_seed: u64,
+             sampler_data_len: usize,
              lr: f32,
              best_loss: f32,
              plateau_count: usize| {
@@ -451,7 +761,11 @@ impl Trainer {
                             epoch,
                             batch,
                             sample,
-                            indices: indices.to_vec(),
+
+                            sampler_seed,
+                            sampler_version: PermutationSampler::VERSION,
+                            sampler_data_len,
+
                             lr,
                             best_loss,
                             plateau_count,
@@ -478,24 +792,22 @@ impl Trainer {
         for epoch in start_epoch..self.epochs + 1 {
             let now = Instant::now();
 
-            let mut indices: Vec<usize>;
             let mut count: usize;
             let mut batches_done: usize;
 
             let mut grad_sum = 0.0f32;
             let mut total_loss = 0.0f32;
 
-            // ---------------------------------------------------------
-            // Restore the checkpoint ONLY for its exact epoch.
-            //
-            // Since resume_state is consumed with take(), this can
-            // happen only once: on the first epoch after loading.
-            // ---------------------------------------------------------
+            let sampler =
+                PermutationSampler::new(
+                    sampler_seed,
+                    epoch,
+                    data_len,
+                );
 
             if let Some(state) = resume_state.take() {
                 debug_assert_eq!(state.epoch, epoch);
 
-                indices = state.indices;
                 count = state.sample;
                 batches_done = state.batch;
 
@@ -505,12 +817,10 @@ impl Trainer {
                     batches_done,
                 );
             } else {
-                indices = (0..data_len).collect();
-                indices.shuffle(&mut rng);
-
                 count = 0;
                 batches_done = 0;
             }
+
             let epoch_start_count = count;
 
             let total_batches =
@@ -567,7 +877,7 @@ impl Trainer {
                 targets.clear();
 
                 for batch_index in 0..current_batch {
-                    let sample = indices[count + batch_index];
+                    let sample = sampler.index(count + batch_index);
 
                     batch_ids.extend_from_slice(
                         &tokens[sample..sample + context_len]
@@ -711,6 +1021,8 @@ impl Trainer {
                     lr,
                 );
 
+                embeddings.sync_flat_values();
+
                 #[cfg(feature = "timing")]
                 {
                     update_time += timer.elapsed();
@@ -737,7 +1049,8 @@ impl Trainer {
                         epoch,
                         batches_done,
                         count,
-                        &indices,
+                        sampler_seed,
+                        data_len,
                         lr,
                         best_loss,
                         plateau_count,
@@ -846,7 +1159,8 @@ impl Trainer {
                         epoch,
                         batches_done,
                         count,
-                        &indices,
+                        sampler_seed,
+                        data_len,
                         lr,
                         best_loss,
                         plateau_count,
@@ -940,7 +1254,8 @@ impl Trainer {
                     epoch,
                     batches_done,
                     count,
-                    &indices,
+                    sampler_seed,
+                    data_len,
                     lr,
                     best_loss,
                     plateau_count,
@@ -1189,6 +1504,8 @@ impl Trainer {
                     &params,
                     lr,
                 );
+
+                embeddings.sync_flat_values();
 
                 if !running.load(Ordering::SeqCst) {
                     return TrainResult::Interrupted;

@@ -8,6 +8,9 @@ pub mod batched;
 pub mod vocabs;
 pub mod model_configs;
 pub mod datasets;
+pub mod forwards;
+pub mod backwards;
+pub mod miscelaneous;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -269,6 +272,49 @@ fn add_scalar_grad(
             unreachable!();
         }
     }
+}
+
+#[inline]
+pub(crate) fn add_handle_grad_slices(
+    handles: &[TensorHandle],
+    grads: &[f32],
+) {
+    debug_assert_eq!(handles.len(), grads.len());
+
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        for i in 0..handles.len() {
+            add_node_grad(
+                &mut tape,
+                handles[i],
+                grads[i],
+            );
+        }
+    });
+}
+
+#[inline]
+pub(crate) fn add_handle_grad_slices_2(
+    handles_a: &[TensorHandle],
+    grads_a: &[f32],
+    handles_b: &[TensorHandle],
+    grads_b: &[f32],
+) {
+    debug_assert_eq!(handles_a.len(), grads_a.len());
+    debug_assert_eq!(handles_b.len(), grads_b.len());
+
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        for (&handle, &grad) in handles_a.iter().zip(grads_a) {
+            add_node_grad(&mut tape, handle, grad);
+        }
+
+        for (&handle, &grad) in handles_b.iter().zip(grads_b) {
+            add_node_grad(&mut tape, handle, grad);
+        }
+    });
 }
 
 impl Tensor {
