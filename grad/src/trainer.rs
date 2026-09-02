@@ -786,6 +786,13 @@ impl Trainer {
         let mut targets =
             Vec::with_capacity(self.batch_size);
 
+        let mut batch_input =
+            Vec::with_capacity(
+                self.batch_size
+                    * context_len
+                    * embeddings.embedding_dim()
+            );
+
         let mut output_grads =
             Vec::<f32>::new();
 
@@ -893,10 +900,11 @@ impl Trainer {
                 #[cfg(feature = "timing")]
                 let timer = Instant::now();
 
-                let input = embeddings.encode_batch(
+                embeddings.encode_batch_into(
                     &batch_ids,
                     current_batch,
                     context_len,
+                    &mut batch_input,
                 );
 
                 #[cfg(feature = "timing")]
@@ -912,7 +920,7 @@ impl Trainer {
                 let timer = Instant::now();
 
                 let forward = mlp.forward_batch(
-                    &input,
+                    &batch_input,
                     current_batch,
                     input_size,
                 );
@@ -1016,12 +1024,11 @@ impl Trainer {
                 #[cfg(feature = "timing")]
                 let timer = Instant::now();
 
-                grad_sum += crate::zero_grad_and_update(
+                grad_sum += crate::zero_grad_and_update_embeddings(
                     &params,
                     lr,
+                    embeddings,
                 );
-
-                embeddings.sync_flat_values();
 
                 #[cfg(feature = "timing")]
                 {
@@ -1500,12 +1507,11 @@ impl Trainer {
                 // Update
                 // ---------------------------------------------------------
 
-                grad_sum += crate::zero_grad_and_update(
+                grad_sum += crate::zero_grad_and_update_embeddings(
                     &params,
                     lr,
+                    embeddings,
                 );
-
-                embeddings.sync_flat_values();
 
                 if !running.load(Ordering::SeqCst) {
                     return TrainResult::Interrupted;

@@ -4,10 +4,11 @@ use grad::fnn_lm::{LM};
 
 fn main() {
     let tokens = 10_000;
-    let lm = LM::from_checkpoint("pretraining/pretrainConV3_batch_18000_epoch_1.check");
+    let lm = LM::from_checkpoint("pretraining/pretrainConV4_batch_22000_epoch_1.check");
     //lm.params();
     let elapsed = std::time::Instant::now();
     lm.generate_gpt("".to_string(), tokens, 0.7);
+    // lm.generate_one_distribution("Ja se zovem Jakov. Ja sam novinar iz čukumbaba post-a.".to_string(), 25);
     let time_elapsed = elapsed.elapsed();
     println!(
         "\n\n\nElapsed: {:?} ({} tokens/second)",

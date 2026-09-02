@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use cblas::{Layout, Transpose};
+use crate::backwards::make_conv_positions;
 use crate::neuron::{Activation, BatchLayerCache, ChannelScaleLayer, Conv1DLayer, DepthwiseConv1DLayer, GroupedConv1DLayer, Layer, LowRankPointwiseLayer, WeightTyingLayer, CONV1D_TILE};
 
 pub fn conv1d_forward(
@@ -336,58 +337,65 @@ pub fn grouped_conv1d_forward(
         let rows =
             tile_batch * output_length;
 
+        let positions = make_conv_positions(
+            output_length,
+            layer.kernel_size,
+            layer.stride,
+            layer.padding,
+            layer.causal,
+        );
+
         for group in 0..layer.groups {
+            let src_channel = group * group_in;
+
             for b in 0..tile_batch {
+                let input_batch_base =
+                    (batch_start + b)
+                        * input_length
+                        * layer.in_channels;
+
+                let row_base =
+                    b * output_length;
+
                 for out_pos in 0..output_length {
                     let row =
-                        b * output_length + out_pos;
+                        row_base + out_pos;
 
                     let row_start =
                         row * kernel_width;
 
-                    for k in 0..layer.kernel_size {
-                        let pos =
-                            out_pos * layer.stride + k;
+                    let position_base =
+                        out_pos * layer.kernel_size;
 
+                    for k in 0..layer.kernel_size {
                         let src_pos =
-                            if layer.causal {
-                                pos as isize
-                                    - (layer.kernel_size - 1)
-                                    as isize
-                            } else {
-                                pos as isize
-                                    - layer.padding as isize
-                            };
+                            positions[position_base + k];
 
                         let dst =
-                            row_start
-                                + k * group_in;
+                            row_start + k * group_in;
 
                         if src_pos >= 0
-                            && (src_pos as usize)
-                            < input_length
+                            && (src_pos as usize) < input_length
                         {
-                            let src_channel =
-                                group * group_in;
-
                             let src =
-                                ((batch_start + b)
-                                    * input_length
-                                    + src_pos as usize)
+                                input_batch_base
+                                    + src_pos as usize
                                     * layer.in_channels
                                     + src_channel;
 
                             col[
                                 dst..dst + group_in
-                                ].copy_from_slice(
-                                &input[
-                                    src..src + group_in
-                                    ],
-                            );
+                                ]
+                                .copy_from_slice(
+                                    &input[
+                                        src..src + group_in
+                                        ],
+                                );
                         } else {
                             col[
                                 dst..dst + group_in
-                                ].fill(0.0);
+                                ]
+                                .fill(0.0);
                         }
                     }
                 }
@@ -674,8 +682,7 @@ fn forward_layer_batch(
                 "Residual block changed tensor size"
             );
 
-            let mut output =
-                inner_output.clone();
+            let mut output = inner_output;
 
             for i in 0..output.len() {
                 output[i] += input[i];

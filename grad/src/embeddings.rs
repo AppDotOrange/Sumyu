@@ -13,8 +13,15 @@ pub struct SavedEmbeddings {
 #[derive(Clone)]
 pub struct Embeddings {
     embedding_dim: usize,
-    vectors: Vec<Vec<Tensor>>,
+
+    // Flat: [token0_dim0 ... token0_dimD, token1_dim0 ...]
+    vectors: Vec<Tensor>,
+
+    // Contiguous values used by BLAS / batch encoding.
     flat_values: RefCell<Vec<f32>>,
+
+    // First embedding parameter node in the tape.
+    node_start: usize,
 }
 
 impl Embeddings {
@@ -27,26 +34,34 @@ impl Embeddings {
         )
             .unwrap();
 
-        let mut vectors = (0..vocab_size)
-            .map(|_| {
-                (0..embedding_dim)
-                    .map(|_| Tensor::new(normal.sample(&mut rng)))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        vectors[0] = (0..embedding_dim)
-            .map(|_| Tensor::new(0.0))
-            .collect();
+        let node_start = crate::tape_len();
 
-        let flat_values = vectors
-            .iter()
-            .flat_map(|row| row.iter().map(|t| t.data()))
-            .collect();
+        let mut vectors =
+            Vec::with_capacity(vocab_size * embedding_dim);
+
+        for token in 0..vocab_size {
+            for _ in 0..embedding_dim {
+                let value = if token == 0 {
+                    0.0
+                } else {
+                    normal.sample(&mut rng)
+                };
+
+                vectors.push(Tensor::new(value));
+            }
+        }
+
+        let flat_values =
+            vectors
+                .iter()
+                .map(|t| t.data())
+                .collect::<Vec<f32>>();
 
         Self {
             embedding_dim,
             vectors,
             flat_values: RefCell::new(flat_values),
+            node_start,
         }
     }
 
@@ -65,26 +80,88 @@ impl Embeddings {
 
     #[inline]
     pub fn vocab_size(&self) -> usize {
-        self.vectors.len()
+        self.vectors.len() / self.embedding_dim
     }
 
     #[inline]
     pub fn parameter_count(&self) -> usize {
-        self.embedding_dim * self.vectors.len()
+        self.vectors.len()
     }
 
+    #[inline]
     pub fn encode(&self, ids: &[usize]) -> Vec<Tensor> {
         let mut out =
             Vec::with_capacity(ids.len() * self.embedding_dim);
 
         for &id in ids {
-            out.extend(
-                self.vectors[id]
-                    .iter()
-                    .cloned()
+            let start = id * self.embedding_dim;
+            let end = start + self.embedding_dim;
+
+            out.extend_from_slice(
+                &self.vectors[start..end]
             );
         }
+
         out
+    }
+
+    pub(crate) fn encode_batch_into(
+        &self,
+        ids: &[usize],
+        batch_size: usize,
+        context_len: usize,
+        output: &mut Vec<f32>,
+    ) {
+        let input_size =
+            context_len * self.embedding_dim;
+
+        let required_len =
+            batch_size * input_size;
+
+        if output.len() != required_len {
+            output.resize(required_len, 0.0);
+        }
+
+        let flat_values =
+            self.flat_values.borrow();
+
+        for b in 0..batch_size {
+            let sample_start =
+                b * context_len;
+
+            let dst_batch_start =
+                b * input_size;
+
+            let dst_batch =
+                &mut output[
+                    dst_batch_start
+                        ..dst_batch_start + input_size
+                    ];
+
+            for position in 0..context_len {
+                let token =
+                    ids[sample_start + position];
+
+                let src_start =
+                    token * self.embedding_dim;
+
+                let src =
+                    &flat_values[
+                        src_start..src_start + self.embedding_dim
+                        ];
+
+                let dst_start =
+                    position * self.embedding_dim;
+
+                let dst =
+                    &mut dst_batch[
+                        dst_start
+                            ..dst_start + self.embedding_dim
+                        ];
+
+                dst.copy_from_slice(src);
+            }
+        }
     }
 
     pub(crate) fn encode_batch(
@@ -93,25 +170,14 @@ impl Embeddings {
         batch_size: usize,
         context_len: usize,
     ) -> Vec<f32> {
-        let input_size = context_len * self.embedding_dim;
-        let mut output = vec![0.0f32; batch_size * input_size];
+        let mut output = Vec::new();
 
-        for b in 0..batch_size {
-            let sample_start = b * context_len;
-            let dst = &mut output[b * input_size..(b + 1) * input_size];
-
-            for position in 0..context_len {
-                let src = &self.vectors[ids[sample_start + position]];
-                let dst = &mut dst[
-                    position * self.embedding_dim
-                        ..(position + 1) * self.embedding_dim
-                    ];
-
-                for (dst, src) in dst.iter_mut().zip(src.iter()) {
-                    *dst = src.data();
-                }
-            }
-        }
+        self.encode_batch_into(
+            ids,
+            batch_size,
+            context_len,
+            &mut output,
+        );
 
         output
     }
@@ -123,39 +189,57 @@ impl Embeddings {
         batch_size: usize,
         context_len: usize,
     ) {
-        let input_size = context_len * self.embedding_dim;
+        let input_size =
+            context_len * self.embedding_dim;
+
+        debug_assert_eq!(
+            ids.len(),
+            batch_size * context_len
+        );
+
+        debug_assert_eq!(
+            input_grads.len(),
+            batch_size * input_size
+        );
 
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
 
             for b in 0..batch_size {
-                let sample = &ids[
-                    b * context_len..(b + 1) * context_len
-                    ];
+                let sample_start =
+                    b * context_len;
 
-                let batch_grads = &input_grads[
-                    b * input_size..(b + 1) * input_size
-                    ];
+                let grad_start =
+                    b * input_size;
 
-                for (position, &token) in sample.iter().enumerate() {
-                    let embedding = &self.vectors[token];
+                for position in 0..context_len {
+                    let token =
+                        ids[sample_start + position];
 
-                    let start = position * self.embedding_dim;
-                    let input = &batch_grads[
-                        start..start + self.embedding_dim
-                        ];
+                    let embedding_start =
+                        token * self.embedding_dim;
 
-                    for (embedding, &grad) in
-                        embedding.iter().zip(input.iter())
-                    {
-                        match &mut tape.nodes[embedding.handle.node] {
-                            Node::Scalar(node) => {
-                                node.grad += grad;
-                            }
+                    let grad_start =
+                        grad_start
+                            + position * self.embedding_dim;
 
-                            Node::FusedLayer(node) => {
-                                node.grads[embedding.handle.index] += grad;
-                            }
+                    for i in 0..self.embedding_dim {
+                        let node_id =
+                            self.node_start
+                                + embedding_start
+                                + i;
+
+                        let grad =
+                            input_grads[grad_start + i];
+
+                        if let Node::Scalar(node) =
+                            &mut tape.nodes[node_id]
+                        {
+                            node.grad += grad;
+                        } else {
+                            unreachable!(
+                                "Embedding node is not Scalar"
+                            );
                         }
                     }
                 }
@@ -163,76 +247,90 @@ impl Embeddings {
         });
     }
 
+    #[inline]
     pub fn parameters(&self) -> Vec<Tensor> {
-        self.vectors
-            .iter()
-            .flat_map(|row| row.iter().cloned())
-            .collect()
+        self.vectors.clone()
     }
 
+    #[inline]
     pub fn parameter_handles(&self) -> Vec<TensorHandle> {
-        self.vectors
-            .iter()
-            .flat_map(|row| row.iter().map(|t| t.handle))
+        (0..self.vectors.len())
+            .map(|i| TensorHandle {
+                node: self.node_start + i,
+                index: 0,
+            })
             .collect()
     }
 
     pub fn save(&self) -> SavedEmbeddings {
-        SavedEmbeddings {
-            embedding_dim: self.embedding_dim,
-            vectors: self.vectors
-                .iter()
+        let vectors =
+            self.vectors
+                .chunks_exact(self.embedding_dim)
                 .map(|row| {
                     row.iter()
                         .map(|t| t.data())
-                        .collect()
+                        .collect::<Vec<f32>>()
                 })
-                .collect(),
+                .collect::<Vec<Vec<f32>>>();
+
+        SavedEmbeddings {
+            embedding_dim: self.embedding_dim,
+            vectors,
         }
     }
 
     pub fn load(saved: SavedEmbeddings) -> Self {
-        let embedding_dim = saved.embedding_dim;
+        let embedding_dim =
+            saved.embedding_dim;
 
-        let vectors = saved.vectors
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(Tensor::new)
-                    .collect()
-            })
-            .collect::<Vec<Vec<Tensor>>>();
+        let node_start =
+            crate::tape_len();
 
-        let flat_values = vectors
-            .iter()
-            .flat_map(|row| row.iter().map(|t| t.data()))
-            .collect();
+        let total =
+            saved.vectors.len()
+                * embedding_dim;
 
-        Embeddings {
+        let mut vectors =
+            Vec::with_capacity(total);
+
+        for row in saved.vectors {
+            debug_assert_eq!(
+                row.len(),
+                embedding_dim
+            );
+
+            for value in row {
+                vectors.push(Tensor::new(value));
+            }
+        }
+
+        let flat_values =
+            vectors
+                .iter()
+                .map(|t| t.data())
+                .collect::<Vec<f32>>();
+
+        Self {
             embedding_dim,
             vectors,
             flat_values: RefCell::new(flat_values),
+            node_start,
         }
     }
 
-    pub(crate) fn sync_flat_values(&self) {
-        let mut flat_values = self.flat_values.borrow_mut();
-
-        debug_assert_eq!(
-            flat_values.len(),
-            self.parameter_count()
-        );
-
-        let mut offset = 0;
-
-        for row in &self.vectors {
-            for tensor in row {
-                flat_values[offset] = tensor.data();
-                offset += 1;
-            }
-        }
+    #[inline]
+    pub(crate) fn node_start(&self) -> usize {
+        self.node_start
     }
 
+    #[inline]
+    pub(crate) fn flat_values_mut(
+        &self,
+    ) -> std::cell::RefMut<'_, Vec<f32>> {
+        self.flat_values.borrow_mut()
+    }
+
+    #[inline]
     pub(crate) fn accumulate_flat_grads(&self, grads: &[f32]) {
         assert_eq!(
             grads.len(),
@@ -240,53 +338,71 @@ impl Embeddings {
             "Invalid embedding gradient length"
         );
 
+        let start = self.node_start;
+
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
 
-            let mut offset = 0;
+            for (i, &grad) in grads.iter().enumerate() {
+                let node_id = start + i;
 
-            for row in &self.vectors {
-                for embedding in row {
-                    let grad = grads[offset];
-
-                    match &mut tape.nodes[embedding.handle.node] {
-                        Node::Scalar(node) => {
-                            node.grad += grad;
-                        }
-
-                        Node::FusedLayer(node) => {
-                            node.grads[embedding.handle.index] += grad;
-                        }
+                match &mut tape.nodes[node_id] {
+                    Node::Scalar(node) => {
+                        node.grad += grad;
                     }
 
-                    offset += 1;
+                    Node::FusedLayer(_) => {
+                        unreachable!(
+                            "Embedding parameter is a fused-layer output"
+                        );
+                    }
                 }
             }
         });
     }
 
     pub fn find_clusters(&self, threshold: f32, vocab: Vec<String>) {
-        let n = self.vectors.len();
+        let n =
+            self.vectors.len()
+                / self.embedding_dim;
+
         if n < 2 {
             println!("Highest similarity: N/A");
             println!("\nTotal clusters: 0");
             return;
         }
-        let dim = self.embedding_dim;
-        // Flatten and normalize embeddings once.
-        // After this, cosine similarity is just a dot product.
-        let mut normalized = vec![0.0f32; n * dim];
+
+        let dim =
+            self.embedding_dim;
+
+        let mut normalized =
+            vec![0.0f32; n * dim];
+
         for id in 0..n {
-            let src = &self.vectors[id];
-            let dst = &mut normalized[id * dim..(id + 1) * dim];
-            let mut norm_sq = 0.0f32;
+            let start =
+                id * dim;
+
+            let src =
+                &self.vectors[start..start + dim];
+
+            let dst =
+                &mut normalized[start..start + dim];
+
+            let mut norm_sq =
+                0.0f32;
+
             for i in 0..dim {
-                let x = src[i].data();
+                let x =
+                    src[i].data();
+
                 dst[i] = x;
                 norm_sq += x * x;
             }
+
             if norm_sq > 0.0 {
-                let inv_norm = norm_sq.sqrt().recip();
+                let inv_norm =
+                    norm_sq.sqrt().recip();
+
                 for x in dst {
                     *x *= inv_norm;
                 }

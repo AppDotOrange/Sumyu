@@ -463,11 +463,11 @@ fn main() {
         lm.load_corpus(&fineweb3);
         lm.train(
             Some(10),
-            None,
+            Some("pretraining/pretrainConV4_batch_25955_epoch_1.check".to_string()),
             Some("pretraining/pretrainConV4".to_string()),
             CheckpointFrequency::EveryBatch(1000),
-            Some(0.4),
-            None
+            Some(0.38),
+            None,
         );
         lm.save(
             "pretrainV4.sumyu",

@@ -10,7 +10,7 @@ pub mod model_configs;
 pub mod datasets;
 pub mod forwards;
 pub mod backwards;
-pub mod miscelaneous;
+pub mod miscellaneous;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -204,6 +204,112 @@ pub fn zero_grad_and_update(params: &[Tensor], lr: f32) -> f32 {
                 }
                 Node::FusedLayer(_) => {
                     panic!("Parameter cannot be a fused-layer output.");
+                }
+            }
+        }
+
+        grad_sum
+    })
+}
+
+pub fn zero_grad_and_update_embeddings(
+    params: &[Tensor],
+    lr: f32,
+    embeddings: &embeddings::Embeddings,
+) -> f32 {
+    const MAX_GRAD_NORM: f64 = 1.0;
+
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        let mut grad_sq_sum = 0.0f64;
+
+        // ---------------------------------------------------------
+        // Gradient norm
+        // ---------------------------------------------------------
+
+        for p in params {
+            match &tape.nodes[p.handle.node] {
+                Node::Scalar(node) => {
+                    let g = node.grad as f64;
+                    grad_sq_sum += g * g;
+                }
+
+                Node::FusedLayer(_) => {
+                    panic!(
+                        "Parameter cannot be a fused-layer output."
+                    );
+                }
+            }
+        }
+
+        let scale =
+            if grad_sq_sum
+                > MAX_GRAD_NORM * MAX_GRAD_NORM
+            {
+                (
+                    MAX_GRAD_NORM
+                        / grad_sq_sum.sqrt()
+                ) as f32
+            } else {
+                1.0f32
+            };
+
+        let embedding_start =
+            embeddings.node_start();
+
+        let embedding_count =
+            embeddings.parameter_count();
+
+        let embedding_end =
+            embedding_start
+                + embedding_count;
+
+        let mut flat_values =
+            embeddings.flat_values_mut();
+
+        let mut grad_sum = 0.0f32;
+
+        // ---------------------------------------------------------
+        // Update
+        // ---------------------------------------------------------
+
+        for p in params {
+            let node_id =
+                p.handle.node;
+
+            match &mut tape.nodes[node_id] {
+                Node::Scalar(node) => {
+                    let grad =
+                        node.grad * scale;
+
+                    node.data -= lr * grad;
+
+                    grad_sum += grad.abs();
+
+                    node.grad = 0.0;
+
+                    // Embedding parameter:
+                    //
+                    // Because Embeddings::new/load creates all
+                    // embedding Tensor nodes consecutively,
+                    // node_id - embedding_start is the exact
+                    // flat_values index.
+                    if node_id >= embedding_start
+                        && node_id < embedding_end
+                    {
+                        let flat_index =
+                            node_id - embedding_start;
+
+                        flat_values[flat_index] =
+                            node.data;
+                    }
+                }
+
+                Node::FusedLayer(_) => {
+                    panic!(
+                        "Parameter cannot be a fused-layer output."
+                    );
                 }
             }
         }

@@ -3,7 +3,7 @@ use crate::Tensor;
 use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState, PermutationSampler};
 use crate::embeddings::{Embeddings, SavedEmbeddings};
 use crate::helper::{Config, HybridConfig};
-pub use crate::miscelaneous::{decode_token_stream, print_layer_specs, stream_token};
+pub use crate::miscellaneous::{decode_token_stream, print_layer_specs, stream_token};
 use std::fs;
 use std::io::Write;
 use std::sync::{Arc, mpsc::Sender};
@@ -393,7 +393,7 @@ impl LM {
                     ids.len();
 
             let mut new_ids =
-                vec![1usize; num_to_add];
+                vec![0usize; num_to_add];
 
             new_ids.extend(ids);
             ids = new_ids;
@@ -414,7 +414,7 @@ impl LM {
             ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
         } else if ids.len() < self.context_len as usize {
             let num_to_add = self.context_len as usize-ids.len();
-            let mut new_ids = vec![1usize; num_to_add];
+            let mut new_ids = vec![0usize; num_to_add];
             new_ids.extend(ids);
             ids = new_ids
         }
