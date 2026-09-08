@@ -162,7 +162,7 @@ pub fn dense_forward(
 /// per-sample gradients and then updates directly.
 pub fn softmax_cross_entropy_batch(
     logits: &[f32],
-    targets: &[usize],
+    targets: &[u16],
     grad_logits: &mut [f32],
     batch: usize,
     classes: usize,
@@ -211,7 +211,7 @@ pub fn softmax_cross_entropy_batch(
         //
         // -log(max(prob[target], 1e-7))
         let target_prob =
-            (grad_logits[base + target] / sum_exp)
+            (grad_logits[base + target as usize] / sum_exp)
                 .max(1e-7);
 
         total_loss -= target_prob.ln();
@@ -222,7 +222,7 @@ pub fn softmax_cross_entropy_batch(
             grad_logits[base + c] /= sum_exp;
         }
 
-        grad_logits[base + target] -= 1.0;
+        grad_logits[base + target as usize] -= 1.0;
     }
 
     total_loss

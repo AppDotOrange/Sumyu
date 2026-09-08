@@ -1,12 +1,12 @@
 use crate::neuron::{LayerSpec, SavedMLP, MLP};
 use crate::Tensor;
-use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, TrainInfo, TrainResult, CheckpointKind, CheckpointState, PermutationSampler};
+use crate::trainer::{CheckpointFrequency, ResumeState, Trainer, CheckpointKind, CheckpointState, PermutationSampler};
 use crate::embeddings::{Embeddings, SavedEmbeddings};
 use crate::helper::{Config, HybridConfig};
 pub use crate::miscellaneous::{decode_token_stream, print_layer_specs, stream_token};
 use std::fs;
 use std::io::Write;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::Arc;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rng;
@@ -49,6 +49,16 @@ pub struct SavedCheckpoint {
     pub lr: f32,
     pub best_loss: f32,
     pub plateau_count: usize,
+
+    // Layerwise adaptive LR optimizer state.
+    //
+    // serde(default) keeps older checkpoints loadable:
+    // old checkpoints simply start the adaptive optimizer from zero.
+    #[serde(default)]
+    pub layer_second_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_adaptive_step: u64,
 }
 
 pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
@@ -58,6 +68,15 @@ pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
         .into_iter()
         .map(|x| x as usize)
         .collect()
+}
+
+pub fn tokenize_u16(text: &str, vocab: &[String]) -> Vec<u16> {
+    let trie = crate::helper::Trie::from_vocab(
+        vocab,
+        byte_fallback_base(vocab.to_vec()),
+    );
+
+    trie.tokenize_bytes_u16(text.as_bytes())
 }
 
 #[inline]
@@ -78,7 +97,7 @@ fn byte_fallback_base(vocab: Vec<String>) -> u32 {
 pub struct LM {
     trainer: Trainer,
     mlp: MLP,
-    dataset: Vec<usize>,
+    dataset: Vec<u16>,
     vocab: Vec<String>,
     context_len: u32,
     hidden_layers: Vec<usize>,
@@ -271,7 +290,7 @@ impl LM {
         self.dataset.len()
     }
 
-    pub fn encode_embeddings(&self, ids: &[usize]) -> Vec<Tensor> {
+    pub fn encode_embeddings(&self, ids: &[u16]) -> Vec<Tensor> {
         self.embeddings.encode(ids)
     }
 
@@ -288,8 +307,8 @@ impl LM {
         self.trainer.reinit_batch_per_epoch(max_batches_per_epoch);
     }
 
-    pub fn encode_nums(&self, string: String) -> Vec<usize> {
-        tokenize(&string, &self.vocab)
+    pub fn encode_nums(&self, string: String) -> Vec<u16> {
+        tokenize_u16(&string, &self.vocab)
     }
 
     pub fn max(&self, vec: Vec<Tensor>) -> usize {
@@ -309,7 +328,7 @@ impl LM {
 
     pub fn generate_one_ids(
         &self,
-        ids: &[usize],
+        ids: &[u16],
         temp: f32,
     ) -> usize {
         let input = self.embeddings.encode_batch(
@@ -393,7 +412,7 @@ impl LM {
                     ids.len();
 
             let mut new_ids =
-                vec![0usize; num_to_add];
+                vec![0u16; num_to_add];
 
             new_ids.extend(ids);
             ids = new_ids;
@@ -414,14 +433,14 @@ impl LM {
             ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
         } else if ids.len() < self.context_len as usize {
             let num_to_add = self.context_len as usize-ids.len();
-            let mut new_ids = vec![0usize; num_to_add];
+            let mut new_ids = vec![0u16; num_to_add];
             new_ids.extend(ids);
             ids = new_ids
         }
         println!("IDs: {:?}", ids);
-        println!("Split text: {:?}", ids.iter().map(|x1| {self.vocab[*x1].clone()}).collect::<Vec<_>>());
+        println!("Split text: {:?}", ids.iter().map(|x1| {self.vocab[*x1 as usize].clone()}).collect::<Vec<_>>());
         let input = self.embeddings.encode_batch(
-            &ids,
+            &*ids,
             1,
             self.context_len as usize,
         );
@@ -556,14 +575,14 @@ impl LM {
             // so this exactly matches tokenize_u32() on the current
             // complete context.
             let ids =
-                tokenizer.current_ids(
+                tokenizer.current_ids_u16(
                     context_len,
                     1,
                 );
 
             let idx =
                 self.generate_one_ids(
-                    &ids,
+                    &*ids,
                     temp,
                 );
 
@@ -634,14 +653,14 @@ impl LM {
 
         for _ in 0..gen_length {
             let ids =
-                tokenizer.current_ids(
+                tokenizer.current_ids_u16(
                     context_len,
                     1,
                 );
 
             let idx =
                 self.generate_one_ids(
-                    &ids,
+                    &*ids,
                     temp,
                 );
 
@@ -728,37 +747,42 @@ impl LM {
         count
     }
 
-    pub fn set_dataset(&mut self, dataset: Vec<usize>) {
+    pub fn set_dataset(&mut self, dataset: Vec<u16>) {
         self.dataset = dataset;
     }
 
     pub fn load_corpus(&mut self, corpus: &str) {
         println!("Tokenizing corpus...");
 
-        self.dataset = tokenize(corpus, &self.vocab);
+        self.dataset = tokenize_u16(corpus, &self.vocab);
 
         println!(
             "Done! Loaded {} tokens ({} training samples).",
             self.dataset.len(),
-            self.dataset.len().saturating_sub(self.context_len as usize)
+            self.dataset
+                .len()
+                .saturating_sub(self.context_len as usize)
         );
     }
 
     pub fn load_corpus_silent(&mut self, corpus: &str) {
-        self.dataset = tokenize(corpus, &self.vocab);
+        self.dataset = tokenize_u16(corpus, &self.vocab);
     }
 
     pub fn param(&self) -> Vec<f32> {
-        let mut params = self.mlp.parameters();
-        params.extend(self.embeddings.parameters());
-        params.iter().map(|x| {x.data()}).collect()
+        let mut params = self.embeddings.parameters();
+        params.extend(self.mlp.parameters());
+
+        params.iter()
+            .map(|x| x.data())
+            .collect()
     }
 
     pub fn train(
         &mut self,
         batch_update_frequency: Option<usize>,
-        checkpoint: Option<String>,
-        checkpoint_path: Option<String>,
+        checkpoint: Option<&str>,
+        checkpoint_path: Option<&str>,
         checkpoint_frequency: CheckpointFrequency,
         lr: Option<f32>,
         seed: Option<u64>,
@@ -779,8 +803,8 @@ impl LM {
         // Parameters
         // ---------------------------------------------------------
 
-        let mut params = self.mlp.parameters();
-        params.extend(self.embeddings.parameters());
+        let mut params = self.embeddings.parameters();
+        params.extend(self.mlp.parameters());
 
         // ---------------------------------------------------------
         // Metadata for checkpoint saving.
@@ -835,6 +859,7 @@ impl LM {
 
             let saved = SavedCheckpoint {
                 model,
+
                 epoch: state.epoch,
                 batch: state.batch,
                 sample: state.sample,
@@ -846,6 +871,12 @@ impl LM {
                 lr: state.lr,
                 best_loss: state.best_loss,
                 plateau_count: state.plateau_count,
+
+                layer_second_moments:
+                state.layer_second_moments,
+
+                layer_adaptive_step:
+                state.layer_adaptive_step,
             };
 
             let bytes = bincode::serde::encode_to_vec(
@@ -940,24 +971,13 @@ impl LM {
             lr: lr_,
             best_loss: checkpoint.best_loss,
             plateau_count: checkpoint.plateau_count,
+
+            layer_second_moments:
+            checkpoint.layer_second_moments,
+
+            layer_adaptive_step:
+            checkpoint.layer_adaptive_step,
         }
-    }
-
-    pub fn train_sumyu(
-        &mut self,
-        tx: Sender<TrainInfo>,
-    ) -> TrainResult {
-        let mut params = self.mlp.parameters();
-        params.extend(self.embeddings.parameters());
-
-        self.trainer.train_lm_sumyu(
-            &mut self.mlp,
-            &self.dataset,
-            self.context_len as usize,
-            &self.embeddings,
-            params,
-            tx,
-        )
     }
 
     pub fn param_count(&self) -> usize {

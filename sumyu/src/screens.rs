@@ -1,18 +1,9 @@
-use std::{
-    io,
-    sync::mpsc,
-    thread,
-};
-
+use std::{io, sync::mpsc, thread};
 use grad::fnn_lm::LM;
-
-use crate::{
-    input,
-    models::{self, DatasetFile, ModelFile},
-    terminal::Terminal,
-};
+use crate::{input, models::{self, DatasetFile, ModelFile}, terminal::Terminal};
 
 const WIDTH: usize = 50;
+
 fn draw_training(
     terminal: &Terminal,
     dataset: &str,

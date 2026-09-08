@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Tensor, TensorHandle, embeddings::Embeddings};
 pub use crate::{backwards::*, forwards::*};
 
-pub(crate) const CONV1D_TILE: usize = 64;
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Copy)]
 pub enum Activation {
     None,
     LeakyReLU { slope: f32 },
@@ -20,7 +18,7 @@ impl Activation {
         }
     }
     #[inline]
-    pub(crate) fn backward(&self, x: f32, grad: &mut f32) {
+    pub fn backward(&self, x: f32, grad: &mut f32) {
         if let Self::LeakyReLU { slope } = self {
             if x <= 0.0 {
                 *grad *= *slope;
@@ -102,6 +100,22 @@ pub enum SavedLayer {
         embedding_dim: usize,
         vocab_size: usize,
     },
+    LayerNorm {
+        channels: usize,
+        epsilon: f32,
+        gamma: Vec<f32>,
+        beta: Vec<f32>,
+    },
+    GlobalMixer {
+        channels: usize,
+        global_dim: usize,
+
+        write_weights: Vec<f32>,
+        write_biases: Vec<f32>,
+
+        read_weights: Vec<f32>,
+        read_biases: Vec<f32>,
+    },
 }
 #[derive(Clone)]
 pub enum LayerSpec {
@@ -149,6 +163,14 @@ pub enum LayerSpec {
         channels: usize,
     },
     WeightTying,
+    LayerNorm {
+        channels: usize,
+        epsilon: f32,
+    },
+    GlobalMixer {
+        channels: usize,
+        global_dim: usize,
+    },
 }
 
 pub struct BatchForward {
@@ -254,40 +276,37 @@ pub enum BatchLayerCache {
         embedding_dim: usize,
         vocab_size: usize,
     },
-}
-#[derive(Clone)]
-pub struct Neuron {
-    weights: Vec<Tensor>,
-    bias: Tensor,
-    is_output: bool,
-}
-impl Neuron {
-    pub fn new(num_inputs: usize, is_output: bool) -> Self {
-        let mut rng = rand::rng();
-        let std_dev = (2.0 / num_inputs as f32).sqrt();
-        let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
+    LayerNorm {
+        input: Vec<f32>,
+        means: Vec<f32>,
+        inv_stds: Vec<f32>,
+        channels: usize,
+        gamma_handles: Arc<[TensorHandle]>,
+        beta_handles: Arc<[TensorHandle]>,
+    },
+    GlobalMixer {
+        input: Vec<f32>,
 
-        let weights = (0..num_inputs)
-            .map(|_| Tensor::new(normal.sample(&mut rng)))
-            .collect();
+        write_probs: Vec<f32>,
+        global_vectors: Vec<f32>,
+        read_probs: Vec<f32>,
 
-        Self {
-            weights,
-            bias: Tensor::new(0.1),
-            is_output,
-        }
-    }
+        positions: usize,
+        channels: usize,
+        global_dim: usize,
 
-    pub fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.weights.clone();
-        params.push(self.bias);
-        params
-    }
+        write_weight_handles: Arc<[TensorHandle]>,
+        write_bias_handles: Arc<[TensorHandle]>,
+
+        read_weight_handles: Arc<[TensorHandle]>,
+        read_bias_handles: Arc<[TensorHandle]>,
+    },
 }
 
 #[derive(Clone)]
 pub struct DenseLayer {
-    pub(crate) neurons: Vec<Neuron>,
+    pub(crate) weights: Vec<Tensor>,
+    pub(crate) biases: Vec<Tensor>,
     pub(crate) fused_weights: Arc<[TensorHandle]>,
     pub(crate) fused_biases: Arc<[TensorHandle]>,
     pub(crate) activation: Activation,
@@ -295,40 +314,35 @@ pub struct DenseLayer {
 
 impl DenseLayer {
     fn new(num_inputs: usize, num_outputs: usize, activation: Activation) -> Self {
-        let is_output = matches!(activation, Activation::None);
+        let mut rng = rand::rng();
+        let std_dev = (2.0 / num_inputs as f32).sqrt();
+        let normal =
+            NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
 
-        let neurons = (0..num_outputs)
-            .map(|_| Neuron::new(num_inputs, is_output))
+        let weights = (0..num_inputs * num_outputs)
+            .map(|_| Tensor::new(normal.sample(&mut rng)))
             .collect::<Vec<_>>();
 
-        let fused_weights = neurons
-            .iter()
-            .flat_map(|n| n.weights.iter().map(|w| w.handle))
-            .collect();
+        let biases = (0..num_outputs)
+            .map(|_| Tensor::new(0.1))
+            .collect::<Vec<_>>();
 
-        let fused_biases = neurons.iter().map(|n| n.bias.handle).collect();
+        let fused_weights = weights.iter().map(|x| x.handle).collect();
+        let fused_biases = biases.iter().map(|x| x.handle).collect();
 
         Self {
-            neurons,
+            weights,
+            biases,
             fused_weights,
             fused_biases,
             activation,
         }
     }
 
-    fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let input_handles: Vec<TensorHandle> = inputs.iter().map(|x| x.handle).collect();
-
-        Tensor::fused_layer(
-            Arc::clone(&self.fused_weights),
-            &input_handles,
-            Arc::clone(&self.fused_biases),
-            matches!(self.activation, Activation::None),
-        )
-    }
-
     fn parameters(&self) -> Vec<Tensor> {
-        self.neurons.iter().flat_map(|n| n.parameters()).collect()
+        let mut params = self.weights.clone();
+        params.extend_from_slice(&self.biases);
+        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -350,12 +364,12 @@ pub struct Conv1DLayer {
     pub(crate) activation: Activation,
     weights: Vec<Tensor>,
     biases: Vec<Tensor>,
-    pub(crate) weight_handles: Arc<[TensorHandle]>,
+    pub weight_handles: Arc<[TensorHandle]>,
     pub(crate) bias_handles: Arc<[TensorHandle]>,
 }
 
 impl Conv1DLayer {
-    fn new(
+    pub fn new(
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -401,7 +415,7 @@ impl Conv1DLayer {
     }
 
     #[inline]
-    pub(crate) fn output_length(&self, input_length: usize) -> usize {
+    pub fn output_length(&self, input_length: usize) -> usize {
         if self.causal {
             // Causal convolution pads only on the left by kernel_size - 1.
             // Output positions occur at 0, stride, 2*stride, ...
@@ -449,7 +463,7 @@ pub struct DepthwiseConv1DLayer {
 }
 
 impl DepthwiseConv1DLayer {
-    fn new(
+    pub fn new(
         in_channels: usize,
         kernel_size: usize,
         stride: usize,
@@ -493,7 +507,7 @@ impl DepthwiseConv1DLayer {
     }
 
     #[inline]
-    pub(crate) fn output_length(&self, input_length: usize) -> usize {
+    pub fn output_length(&self, input_length: usize) -> usize {
         if self.causal {
             assert!(input_length > 0);
             (input_length - 1) / self.stride + 1
@@ -525,10 +539,10 @@ impl DepthwiseConv1DLayer {
 
 #[derive(Clone)]
 pub struct GroupedConv1DLayer {
-    pub(crate) in_channels: usize,
-    pub(crate) out_channels: usize,
-    pub(crate) groups: usize,
-    pub(crate) kernel_size: usize,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub groups: usize,
+    pub kernel_size: usize,
     pub(crate) stride: usize,
     pub(crate) padding: usize,
     pub(crate) causal: bool,
@@ -537,12 +551,12 @@ pub struct GroupedConv1DLayer {
     weights: Vec<Tensor>,
     biases: Vec<Tensor>,
 
-    pub(crate) weight_handles: Arc<[TensorHandle]>,
-    pub(crate) bias_handles: Arc<[TensorHandle]>,
+    pub weight_handles: Arc<[TensorHandle]>,
+    pub bias_handles: Arc<[TensorHandle]>,
 }
 
 impl GroupedConv1DLayer {
-    fn new(
+    pub fn new(
         in_channels: usize,
         out_channels: usize,
         groups: usize,
@@ -620,7 +634,7 @@ impl GroupedConv1DLayer {
         }
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
+    pub fn parameters(&self) -> Vec<Tensor> {
         let mut params = self.weights.clone();
         params.extend_from_slice(&self.biases);
         params
@@ -869,6 +883,231 @@ impl ResidualLayer {
 }
 
 #[derive(Clone)]
+pub struct LayerNormLayer {
+    pub(crate) channels: usize,
+    pub(crate) epsilon: f32,
+
+    pub(crate) gamma: Vec<Tensor>,
+    pub(crate) beta: Vec<Tensor>,
+
+    pub(crate) gamma_handles: Arc<[TensorHandle]>,
+    pub(crate) beta_handles: Arc<[TensorHandle]>,
+}
+
+impl LayerNormLayer {
+    pub fn new(
+        channels: usize,
+        epsilon: f32,
+    ) -> Self {
+        assert!(
+            channels > 0,
+            "LayerNorm requires channels > 0",
+        );
+
+        assert!(
+            epsilon > 0.0,
+            "LayerNorm epsilon must be > 0",
+        );
+
+        let gamma = (0..channels)
+            .map(|_| Tensor::new(1.0))
+            .collect::<Vec<_>>();
+
+        let beta = (0..channels)
+            .map(|_| Tensor::new(0.0))
+            .collect::<Vec<_>>();
+
+        let gamma_handles =
+            gamma
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+        let beta_handles =
+            beta
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+        Self {
+            channels,
+            epsilon,
+            gamma,
+            beta,
+            gamma_handles,
+            beta_handles,
+        }
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params =
+            self.gamma.clone();
+
+        params.extend_from_slice(
+            &self.beta
+        );
+
+        params
+    }
+
+    fn spec(&self) -> LayerSpec {
+        LayerSpec::LayerNorm {
+            channels: self.channels,
+            epsilon: self.epsilon,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GlobalMixerLayer {
+    pub(crate) channels: usize,
+    pub(crate) global_dim: usize,
+
+    pub(crate) write_weights: Vec<Tensor>,
+    pub(crate) write_biases: Vec<Tensor>,
+
+    pub(crate) read_weights: Vec<Tensor>,
+    pub(crate) read_biases: Vec<Tensor>,
+
+    pub(crate) write_weight_handles: Arc<[TensorHandle]>,
+    pub(crate) write_bias_handles: Arc<[TensorHandle]>,
+
+    pub(crate) read_weight_handles: Arc<[TensorHandle]>,
+    pub(crate) read_bias_handles: Arc<[TensorHandle]>,
+}
+
+impl GlobalMixerLayer {
+    fn new(channels: usize, global_dim: usize) -> Self {
+        assert!(channels > 0);
+        assert!(global_dim > 0);
+
+        let mut rng = rand::rng();
+
+        // Start substantially closer to an identity mapping.
+        //
+        // Previous:
+        //     1.0 / sqrt(channels)
+        //
+        // New:
+        //     0.1 / sqrt(channels)
+        //
+        // This keeps the write/read logits small, making both softmaxes
+        // close to uniform at initialization and greatly reducing the
+        // magnitude of the initial global message.
+        let scale = 0.1f32 / (channels as f32).sqrt();
+
+        let dist =
+            NormalDist::new(0.0, scale as f64).unwrap();
+
+        let mut write_weights =
+            Vec::with_capacity(channels * global_dim);
+
+        let mut read_weights =
+            Vec::with_capacity(channels * global_dim);
+
+        for _ in 0..channels * global_dim {
+            write_weights.push(
+                Tensor::new(
+                    dist.sample(&mut rng) as f32
+                )
+            );
+
+            read_weights.push(
+                Tensor::new(
+                    dist.sample(&mut rng) as f32
+                )
+            );
+        }
+
+        // Zero biases keep the initial write/read logits centered.
+        let mut write_biases =
+            Vec::with_capacity(global_dim);
+
+        let mut read_biases =
+            Vec::with_capacity(global_dim);
+
+        for _ in 0..global_dim {
+            write_biases.push(
+                Tensor::new(0.0)
+            );
+
+            read_biases.push(
+                Tensor::new(0.0)
+            );
+        }
+
+        let write_weight_handles: Arc<[TensorHandle]> =
+            write_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
+        let write_bias_handles: Arc<[TensorHandle]> =
+            write_biases
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
+        let read_weight_handles: Arc<[TensorHandle]> =
+            read_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
+        let read_bias_handles: Arc<[TensorHandle]> =
+            read_biases
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
+        Self {
+            channels,
+            global_dim,
+
+            write_weights,
+            write_biases,
+
+            read_weights,
+            read_biases,
+
+            write_weight_handles,
+            write_bias_handles,
+
+            read_weight_handles,
+            read_bias_handles,
+        }
+    }
+
+
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = Vec::with_capacity(
+            self.write_weights.len()
+                + self.write_biases.len()
+                + self.read_weights.len()
+                + self.read_biases.len(),
+        );
+
+        params.extend_from_slice(&self.write_weights);
+        params.extend_from_slice(&self.write_biases);
+        params.extend_from_slice(&self.read_weights);
+        params.extend_from_slice(&self.read_biases);
+
+        params
+    }
+
+    fn spec(&self) -> LayerSpec {
+        LayerSpec::GlobalMixer {
+            channels: self.channels,
+            global_dim: self.global_dim,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum Layer {
     Dense(DenseLayer),
     Conv1D(Conv1DLayer),
@@ -877,7 +1116,9 @@ pub enum Layer {
     GroupedConv1D(GroupedConv1DLayer),
     LowRankPointwise(LowRankPointwiseLayer),
     ChannelScale(ChannelScaleLayer),
+    LayerNorm(LayerNormLayer),
     WeightTying(WeightTyingLayer),
+    GlobalMixer(GlobalMixerLayer),
 }
 
 impl Layer {
@@ -890,7 +1131,9 @@ impl Layer {
             Layer::GroupedConv1D(layer) => layer.spec(),
             Layer::LowRankPointwise(layer) => layer.spec(),
             Layer::ChannelScale(layer) => layer.spec(),
+            Layer::LayerNorm(layer) => layer.spec(),
             Layer::WeightTying(layer) => layer.spec(),
+            Layer::GlobalMixer(layer) => layer.spec(),
         }
     }
 
@@ -903,7 +1146,9 @@ impl Layer {
             Layer::GroupedConv1D(layer) => layer.parameters(),
             Layer::LowRankPointwise(layer) => layer.parameters(),
             Layer::ChannelScale(layer) => layer.parameters(),
+            Layer::LayerNorm(layer) => layer.parameters(),
             Layer::WeightTying(layer) => layer.parameters(),
+            Layer::GlobalMixer(layer) => layer.parameters(),
         }
     }
 }
@@ -1069,6 +1314,52 @@ fn build_layers(
                     )
                 )
             }
+            LayerSpec::LayerNorm {
+                channels,
+                epsilon,
+            } => {
+                assert_eq!(current_size % channels,
+                           0,
+                           "LayerNorm channels ({}) must divide layer size ({})",
+                           channels,
+                           current_size);
+
+                Layer::LayerNorm(
+                    LayerNormLayer::new(
+                        *channels,
+                        *epsilon,
+                    )
+                )
+            }
+            LayerSpec::GlobalMixer {
+                channels,
+                global_dim,
+            } => {
+                assert!(
+                    *channels > 0,
+                    "GlobalMixer channels must be > 0"
+                );
+
+                assert!(
+                    *global_dim > 0,
+                    "GlobalMixer global_dim must be > 0"
+                );
+
+                assert_eq!(
+                    current_size % *channels,
+                    0,
+                    "GlobalMixer channels ({}) must divide layer size ({})",
+                    channels,
+                    current_size
+                );
+
+                Layer::GlobalMixer(
+                    GlobalMixerLayer::new(
+                        *channels,
+                        *global_dim,
+                    )
+                )
+            }
         };
 
         current_size = layer_output_size(&layer, current_size);
@@ -1080,7 +1371,7 @@ fn build_layers(
 
 fn layer_output_size(layer: &Layer, current_size: usize) -> usize {
     match layer {
-        Layer::Dense(layer) => layer.neurons.len(),
+        Layer::Dense(layer) => layer.biases.len(),
 
         Layer::Conv1D(layer) => {
             let input_length = current_size / layer.in_channels;
@@ -1106,6 +1397,28 @@ fn layer_output_size(layer: &Layer, current_size: usize) -> usize {
 
         Layer::ChannelScale(layer) => {
             assert_eq!(current_size % layer.channels, 0);
+            current_size
+        }
+
+        Layer::LayerNorm(layer) => {
+            assert_eq!(
+                current_size % layer.channels,
+                0,
+                "LayerNorm channels must divide input size"
+            );
+
+            current_size
+        }
+
+        Layer::GlobalMixer(layer) => {
+            let channels = layer.channels;
+
+            assert_eq!(
+                current_size % channels,
+                0,
+                "GlobalMixer channels must divide input size"
+            );
+
             current_size
         }
 
@@ -1160,30 +1473,6 @@ impl MLP {
             );
 
         Self { layers }
-    }
-
-    pub fn forward(&self, inputs: &[Tensor]) -> Vec<Tensor> {
-        let mut current = inputs.to_vec();
-
-        for layer in &self.layers {
-            match layer {
-                Layer::Dense(layer) => {
-                    current = layer.forward(&current);
-                }
-
-                Layer::Conv1D(_)
-                | Layer::Residual(_)
-                | Layer::DepthwiseConv1D(_)
-                | Layer::GroupedConv1D(_)
-                | Layer::LowRankPointwise(_)
-                | Layer::ChannelScale(_)
-                | Layer::WeightTying(_) => {
-                    panic!("This layer type is only supported by forward_batch");
-                }
-            }
-        }
-
-        current
     }
 
     pub(crate) fn forward_batch(
@@ -1302,31 +1591,27 @@ impl MLP {
 fn save_layer(layer: &Layer) -> SavedLayer {
     match layer {
         Layer::Dense(layer) => {
-            let input_size = layer
-                .neurons
-                .first()
-                .map(|n| n.weights.len())
-                .unwrap_or(0);
-
             SavedLayer::Dense {
-                input_size,
-                output_size: layer.neurons.len(),
+                input_size: if layer.biases.is_empty() {
+                    0
+                } else {
+                    layer.weights.len() / layer.biases.len()
+                },
+
+                output_size: layer.biases.len(),
+
                 activation: layer.activation.clone(),
 
                 weights: layer
-                    .neurons
+                    .weights
                     .iter()
-                    .flat_map(|neuron| {
-                        neuron.weights
-                            .iter()
-                            .map(|weight| weight.data())
-                    })
+                    .map(|x| x.data())
                     .collect(),
 
                 biases: layer
-                    .neurons
+                    .biases
                     .iter()
-                    .map(|neuron| neuron.bias.data())
+                    .map(|x| x.data())
                     .collect(),
             }
         }
@@ -1466,6 +1751,57 @@ fn save_layer(layer: &Layer) -> SavedLayer {
             }
         }
 
+        Layer::LayerNorm(layer) => {
+            SavedLayer::LayerNorm {
+                channels: layer.channels,
+
+                epsilon: layer.epsilon,
+
+                gamma: layer
+                    .gamma
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                beta: layer
+                    .beta
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+            }
+        }
+
+        Layer::GlobalMixer(layer) => {
+            SavedLayer::GlobalMixer {
+                channels: layer.channels,
+                global_dim: layer.global_dim,
+
+                write_weights: layer
+                    .write_weights
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                write_biases: layer
+                    .write_biases
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                read_weights: layer
+                    .read_weights
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                read_biases: layer
+                    .read_biases
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+            }
+        }
+
         Layer::WeightTying(layer) => {
             SavedLayer::WeightTying {
                 embedding_dim:
@@ -1501,43 +1837,29 @@ fn load_layer(
                 "Invalid Dense bias count"
             );
 
-            let neurons = (0..*output_size)
-                .map(|o| {
-                    let weights = (0..*input_size)
-                        .map(|i| {
-                            Tensor::new(
-                                weights[o * *input_size + i]
-                            )
-                        })
-                        .collect();
-
-                    Neuron {
-                        weights,
-                        bias: Tensor::new(biases[o]),
-                        is_output: matches!(
-                            activation,
-                            Activation::None
-                        ),
-                    }
-                })
+            let weights = weights
+                .iter()
+                .map(|&x| Tensor::new(x))
                 .collect::<Vec<_>>();
 
-            let fused_weights = neurons
+            let biases = biases
                 .iter()
-                .flat_map(|neuron| {
-                    neuron.weights
-                        .iter()
-                        .map(|weight| weight.handle)
-                })
+                .map(|&x| Tensor::new(x))
+                .collect::<Vec<_>>();
+
+            let fused_weights = weights
+                .iter()
+                .map(|x| x.handle)
                 .collect();
 
-            let fused_biases = neurons
+            let fused_biases = biases
                 .iter()
-                .map(|neuron| neuron.bias.handle)
+                .map(|x| x.handle)
                 .collect();
 
             Layer::Dense(DenseLayer {
-                neurons,
+                weights,
+                biases,
                 fused_weights,
                 fused_biases,
                 activation: activation.clone(),
@@ -1878,6 +2200,162 @@ fn load_layer(
                     biases,
                     scale_handles,
                     bias_handles,
+                }
+            )
+        }
+
+        SavedLayer::LayerNorm {
+            channels,
+            epsilon,
+            gamma,
+            beta,
+        } => {
+            assert_eq!(
+                gamma.len(),
+                *channels,
+                "Invalid LayerNorm gamma count"
+            );
+
+            assert_eq!(
+                beta.len(),
+                *channels,
+                "Invalid LayerNorm beta count"
+            );
+
+            let gamma =
+                gamma
+                    .iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+            let beta =
+                beta
+                    .iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+            let gamma_handles =
+                gamma
+                    .iter()
+                    .map(|x| x.handle)
+                    .collect();
+
+            let beta_handles =
+                beta
+                    .iter()
+                    .map(|x| x.handle)
+                    .collect();
+
+            Layer::LayerNorm(
+                LayerNormLayer {
+                    channels: *channels,
+                    epsilon: *epsilon,
+                    gamma,
+                    beta,
+                    gamma_handles,
+                    beta_handles,
+                }
+            )
+        }
+
+        SavedLayer::GlobalMixer {
+            channels,
+            global_dim,
+            write_weights,
+            write_biases,
+            read_weights,
+            read_biases,
+        } => {
+            assert!(
+                *channels > 0,
+                "Invalid GlobalMixer channel count"
+            );
+
+            assert!(
+                *global_dim > 0,
+                "Invalid GlobalMixer global dimension"
+            );
+
+            assert_eq!(
+                write_weights.len(),
+                channels * global_dim,
+                "Invalid GlobalMixer write weight count"
+            );
+
+            assert_eq!(
+                write_biases.len(),
+                *global_dim,
+                "Invalid GlobalMixer write bias count"
+            );
+
+            assert_eq!(
+                read_weights.len(),
+                channels * global_dim,
+                "Invalid GlobalMixer read weight count"
+            );
+
+            assert_eq!(
+                read_biases.len(),
+                *global_dim,
+                "Invalid GlobalMixer read bias count"
+            );
+
+            let write_weights = write_weights
+                .iter()
+                .map(|&x| Tensor::new(x))
+                .collect::<Vec<_>>();
+
+            let write_biases = write_biases
+                .iter()
+                .map(|&x| Tensor::new(x))
+                .collect::<Vec<_>>();
+
+            let read_weights = read_weights
+                .iter()
+                .map(|&x| Tensor::new(x))
+                .collect::<Vec<_>>();
+
+            let read_biases = read_biases
+                .iter()
+                .map(|&x| Tensor::new(x))
+                .collect::<Vec<_>>();
+
+            let write_weight_handles = write_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+            let write_bias_handles = write_biases
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+            let read_weight_handles = read_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+            let read_bias_handles = read_biases
+                .iter()
+                .map(|x| x.handle)
+                .collect();
+
+            Layer::GlobalMixer(
+                GlobalMixerLayer {
+                    channels: *channels,
+                    global_dim: *global_dim,
+
+                    write_weights,
+                    write_biases,
+
+                    read_weights,
+                    read_biases,
+
+                    write_weight_handles,
+                    write_bias_handles,
+
+                    read_weight_handles,
+                    read_bias_handles,
                 }
             )
         }

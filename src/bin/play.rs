@@ -4,7 +4,8 @@ use grad::fnn_lm::{LM};
 
 fn main() {
     let tokens = 10_000;
-    let lm = LM::from_checkpoint("pretraining/pretrainConV4_batch_22000_epoch_1.check");
+    let lm = LM::from_checkpoint("pretraining/pretrainConV5_batch_41000_epoch_1.check");
+    lm.params();
     //lm.params();
     let elapsed = std::time::Instant::now();
     lm.generate_gpt("".to_string(), tokens, 0.7);

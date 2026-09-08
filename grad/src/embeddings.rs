@@ -89,12 +89,13 @@ impl Embeddings {
     }
 
     #[inline]
-    pub fn encode(&self, ids: &[usize]) -> Vec<Tensor> {
+    pub fn encode(&self, ids: &[u16]) -> Vec<Tensor> {
         let mut out =
             Vec::with_capacity(ids.len() * self.embedding_dim);
 
         for &id in ids {
-            let start = id * self.embedding_dim;
+            let start = id as usize * self.embedding_dim;
+
             let end = start + self.embedding_dim;
 
             out.extend_from_slice(
@@ -107,7 +108,7 @@ impl Embeddings {
 
     pub(crate) fn encode_batch_into(
         &self,
-        ids: &[usize],
+        ids: &[u16],
         batch_size: usize,
         context_len: usize,
         output: &mut Vec<f32>,
@@ -140,14 +141,16 @@ impl Embeddings {
 
             for position in 0..context_len {
                 let token =
-                    ids[sample_start + position];
+                    ids[sample_start + position]
+                        as usize;
 
                 let src_start =
                     token * self.embedding_dim;
 
                 let src =
                     &flat_values[
-                        src_start..src_start + self.embedding_dim
+                        src_start
+                            ..src_start + self.embedding_dim
                         ];
 
                 let dst_start =
@@ -166,7 +169,7 @@ impl Embeddings {
 
     pub(crate) fn encode_batch(
         &self,
-        ids: &[usize],
+        ids: &[u16],
         batch_size: usize,
         context_len: usize,
     ) -> Vec<f32> {
@@ -184,7 +187,7 @@ impl Embeddings {
 
     pub(crate) fn accumulate_batch_grads(
         &self,
-        ids: &[usize],
+        ids: &[u16],
         input_grads: &[f32],
         batch_size: usize,
         context_len: usize,
@@ -213,8 +216,7 @@ impl Embeddings {
                     b * input_size;
 
                 for position in 0..context_len {
-                    let token =
-                        ids[sample_start + position];
+                    let token = ids[sample_start + position] as usize;
 
                     let embedding_start =
                         token * self.embedding_dim;
@@ -495,27 +497,5 @@ impl Embeddings {
             }
         }
         println!("\nTotal clusters: {}", clusters);
-    }
-}
-
-#[derive(Deserialize)]
-pub struct OldSavedEmbeddings {
-    embedding_dim: usize,
-    vectors: Vec<Vec<f64>>,
-}
-
-impl From<OldSavedEmbeddings> for SavedEmbeddings {
-    fn from(old: OldSavedEmbeddings) -> Self {
-        Self {
-            embedding_dim: old.embedding_dim,
-            vectors: old.vectors
-                .into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|x| x as f32)
-                        .collect()
-                })
-                .collect(),
-        }
     }
 }

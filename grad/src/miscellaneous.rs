@@ -396,7 +396,6 @@ pub fn print_layer_specs(
                     total
                 );
 
-                sequence_length = sequence_length;
                 channels = *out_channels;
             }
 
@@ -433,6 +432,102 @@ pub fn print_layer_specs(
                 );
 
                 channels = *scale_channels;
+            }
+
+            LayerSpec::LayerNorm {
+                channels: norm_channels,
+                epsilon,
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *norm_channels,
+                    "LayerNorm channel mismatch"
+                );
+
+                let gamma =
+                    *norm_channels;
+
+                let beta =
+                    *norm_channels;
+
+                let total =
+                    gamma + beta;
+
+                println!(
+                    "{}████████████████████████████████   LayerNorm {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    norm_channels,
+                    sequence_length,
+                    norm_channels,
+                );
+
+                println!(
+                    "{}                                  epsilon {} | {} gamma + {} beta = {} params",
+                    prefix,
+                    epsilon,
+                    gamma,
+                    beta,
+                    total
+                );
+
+                channels = *norm_channels;
+            }
+
+            LayerSpec::GlobalMixer {
+                channels: mixer_channels,
+                global_dim,
+            } => {
+                debug_assert_eq!(
+                    channels,
+                    *mixer_channels,
+                    "GlobalMixer channel mismatch"
+                );
+
+                let write_weights =
+                    mixer_channels * global_dim;
+
+                let write_biases =
+                    *global_dim;
+
+                let read_weights =
+                    mixer_channels * global_dim;
+
+                let read_biases =
+                    *global_dim;
+
+                let total =
+                    write_weights
+                        + write_biases
+                        + read_weights
+                        + read_biases;
+
+                println!(
+                    "{}████████████████████████████████   GlobalMixer {}: [{} × {}] → [{} × {}]",
+                    prefix,
+                    idx + 1,
+                    sequence_length,
+                    mixer_channels,
+                    sequence_length,
+                    mixer_channels,
+                );
+
+                println!(
+                    "{}                                  global dim {} | {} write weights + {} write biases + {} read weights + {} read biases = {} params",
+                    prefix,
+                    global_dim,
+                    write_weights,
+                    write_biases,
+                    read_weights,
+                    read_biases,
+                    total
+                );
+
+                // GlobalMixer preserves both sequence length
+                // and channel count.
+                channels =
+                    *mixer_channels;
             }
 
             LayerSpec::Residual {

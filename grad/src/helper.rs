@@ -1034,6 +1034,62 @@ impl<'a> IncrementalTokenizer<'a> {
         ids
     }
 
+    pub(crate) fn current_ids_u16(
+        &self,
+        context_len: usize,
+        pad_id: usize,
+    ) -> Vec<u16> {
+        let pending_ids =
+            self.trie
+                .tokenize_bytes(
+                    &self.pending,
+                );
+
+        let mut ids: Vec<u16> =
+            Vec::with_capacity(
+                self.stable_tokens.len()
+                    + pending_ids.len(),
+            );
+
+        ids.extend(
+            self.stable_tokens
+                .iter()
+                .map(|&x| x as u16),
+        );
+
+        ids.extend(
+            pending_ids
+                .into_iter()
+                .map(|x| x as u16),
+        );
+
+        if ids.len()
+            > context_len
+        {
+            ids =
+                ids[
+                    ids.len()
+                        - context_len..
+                    ]
+                    .to_vec();
+        } else if ids.len()
+            < context_len
+        {
+            let mut padded: Vec<u16> =
+                vec![
+                    pad_id as u16;
+                    context_len
+                        - ids.len()
+                ];
+
+            padded.extend(ids);
+
+            ids = padded;
+        }
+
+        ids
+    }
+
     pub(crate) fn push_raw_bytes(
         &mut self,
         bytes: &[u8],

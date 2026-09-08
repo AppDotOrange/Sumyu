@@ -1,11 +1,14 @@
 use grad::fnn_lm::{SavedLM, LM};
 use grad::helper;
-use std::fs;
+use std::{fs, io};
+use std::io::Write;
 use grad::helper::{poke_v2, recipe_v3};
 use grad::neuron::{Activation, LayerSpec};
 use grad::trainer::CheckpointFrequency;
 
 fn main() {
+    print!("\x1B[2J\x1B[3J\x1B[1;1H");
+    let _ = io::stdout().flush();
     // to save ram:
     let _rust = "";
     let text = "";
@@ -26,8 +29,15 @@ fn main() {
     //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
     //let fineweb2 = fs::read_to_string("Datasets/fineweb_v2.txt").expect("Can't read fineweb_v2.txt!");
     let fineweb3 = fs::read_to_string("Datasets/fineweb_v3.txt").expect("Can't read fineweb_v3.txt!");
-    let test = 13;
-    if test == -2 {
+    let test = 16;
+    if test == -3 {
+        #[cfg(target_arch = "x86_64")]
+        println!(
+            "AVX2: {}, FMA: {}",
+            is_x86_feature_detected!("avx2"),
+            is_x86_feature_detected!("fma"),
+        );
+    } else if test == -2 {
         println!("{}", poke_v2().len())
     } else if test == -1 {
         //------------------------------------------------------------------------------------------
@@ -236,7 +246,14 @@ fn main() {
         //*/
         lm.params();
         lm.load_corpus(&oasst1);
-        lm.train(Some(10), Some("chatterP1_checks/ChatterV1_batch_47443_epoch_2.check".to_string()), Some("chatterP1_checks/ChatterV1".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.01), None);
+        lm.train(
+            Some(10),
+            Some("chatterP1_checks/ChatterV1_batch_47443_epoch_2.check"),
+            Some("chatterP1_checks/ChatterV1"),
+            CheckpointFrequency::EveryBatch(1000),
+            Some(0.01),
+            None,
+        );
         lm.save(
             "ChatterP2.sumyu",
             &description,
@@ -276,7 +293,14 @@ fn main() {
         */
         lm.params();
         lm.load_corpus(&fineweb);
-        lm.train(Some(10), Some("pretraining/pretrainV2_batch_88714_epoch_1.check".to_string()), Some("pretraining/pretrainV2".to_string()), CheckpointFrequency::EveryBatch(1000), Some(0.08), None);
+        lm.train(
+            Some(10),
+            Some("pretraining/pretrainV2_batch_88714_epoch_1.check"),
+            Some("pretraining/pretrainV2"),
+            CheckpointFrequency::EveryBatch(1000),
+            Some(0.08),
+            None,
+        );
         lm.save(
             "pretrainV2.sumyu",
             description,
@@ -463,14 +487,128 @@ fn main() {
         lm.load_corpus(&fineweb3);
         lm.train(
             Some(10),
-            Some("pretraining/pretrainConV4_batch_25955_epoch_1.check".to_string()),
-            Some("pretraining/pretrainConV4".to_string()),
+            Some("pretraining/pretrainConV4_batch_47243_epoch_1.check"),
+            Some("pretraining/pretrainConV4"),
             CheckpointFrequency::EveryBatch(1000),
-            Some(0.38),
+            Some(0.3),
             None,
         );
         lm.save(
             "pretrainV4.sumyu",
+            &description,
+        );
+    } else if test == 14 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::fineweb_hybrid_v5_to(0.3, 256, 1);
+        let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_hybrid_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let (description, mut lm) = LM::load("pretrainV2.sumyu");
+        lm.train_options(0.55, 1, 256, 0);
+        */
+        lm.params();
+        lm.load_corpus(&fineweb3);
+        lm.train(
+            Some(10),
+            Some("pretraining/pretrainConV5_batch_46329_epoch_1.check"),
+            Some("pretraining/pretrainConV5"),
+            CheckpointFrequency::EveryBatch(1000),
+            Some(0.2),
+            None,
+        );
+        lm.save(
+            "pretrainV5.sumyu",
+            &description,
+        );
+    } else if test == 15 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::fineweb_hybrid_v6_to(0.3, 256, 1);
+        let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_hybrid_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let (description, mut lm) = LM::load("pretrainV2.sumyu");
+        lm.train_options(0.55, 1, 256, 0);
+        */
+        lm.params();
+        lm.load_corpus(&fineweb3);
+        lm.train(
+            Some(10),
+            Some("pretraining_v6/pretrainConV6_batch_1130_epoch_1.check"),
+            Some("pretraining_v6/pretrainConV6"),
+            CheckpointFrequency::EveryBatch(1000),
+            Some(0.3),
+            None,
+        );
+        lm.save(
+            "pretrainV6.sumyu",
+            &description,
+        );
+    } else if test == 16 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::fineweb_hybrid_v7_to(0.4, 256, 1);
+        let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_hybrid_config(config);
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(4);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
+        /*
+        let (description, mut lm) = LM::load("pretrainV2.sumyu");
+        lm.train_options(0.55, 1, 256, 0);
+        */
+        lm.params();
+        lm.load_corpus(&fineweb3);
+        lm.train(
+            Some(10),
+            Some("pretraining_v7/pretrainConV7_batch_70_epoch_1.check"),
+            Some("pretraining_v7/pretrainConV7"),
+            CheckpointFrequency::EveryBatch(500),
+            None,
+            None,
+        );
+        lm.save(
+            "pretrainV7.sumyu",
             &description,
         );
     }
