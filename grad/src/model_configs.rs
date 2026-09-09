@@ -2094,3 +2094,246 @@ pub fn fineweb_hybrid_v7_to(
         epochs,
     )
 }
+
+pub fn fineweb_hybrid_v8_to(
+    lr: f32,
+    batch_size: usize,
+    epochs: usize,
+) -> HybridConfig {
+    HybridConfig::new(
+        lr,
+        batch_size,
+        0,
+        fineweb_v3(),
+        128,
+        96,
+        vec![
+            // ============================================================
+            // 128 × 96
+            // ============================================================
+
+            LayerSpec::LayerNorm {
+                channels: 96,
+                epsilon: 1e-5,
+            },
+
+            LayerSpec::Conv1D {
+                in_channels: 96,
+                out_channels: 96,
+                kernel_size: 3,
+                stride: 1,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 96,
+            },
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 96,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 96,
+                        kernel_size: 5,
+                        stride: 1,
+                        padding: 2,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 96,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 96,
+                        rank: 32,
+                        out_channels: 96,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // 128 → 64 positions
+            // 96 → 128 channels
+            // ============================================================
+
+            LayerSpec::GroupedConv1D {
+                in_channels: 96,
+                out_channels: 128,
+                groups: 4,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::LayerNorm {
+                channels: 128,
+                epsilon: 1e-5,
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 128,
+            },
+
+            LayerSpec::GlobalMixer {
+                channels: 128,
+                global_dim: 40,
+            },
+
+            // ============================================================
+            // 64 × 128
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 128,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 128,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 128,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 128,
+                        rank: 40,
+                        out_channels: 128,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // 64 → 32 positions
+            // 128 → 160 channels
+            // ============================================================
+
+            LayerSpec::GroupedConv1D {
+                in_channels: 128,
+                out_channels: 160,
+                groups: 4,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::LayerNorm {
+                channels: 160,
+                epsilon: 1e-5,
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 160,
+            },
+
+            LayerSpec::GlobalMixer {
+                channels: 160,
+                global_dim: 48,
+            },
+
+            // ============================================================
+            // 32 × 160
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 9,
+                        stride: 1,
+                        padding: 4,
+                        causal: true,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+
+                    LayerSpec::ChannelScale {
+                        channels: 160,
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 48,
+                        out_channels: 160,
+                        activation: Activation::LeakyReLU { slope: 0.01 },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // 32 → 16 positions
+            // 160 → 192 channels
+            // ============================================================
+
+            LayerSpec::GroupedConv1D {
+                in_channels: 160,
+                out_channels: 192,
+                groups: 4,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                causal: true,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::LayerNorm {
+                channels: 192,
+                epsilon: 1e-5,
+            },
+
+            LayerSpec::ChannelScale {
+                channels: 192,
+            },
+
+            // ============================================================
+            // Final global communication
+            // 16 × 192
+            // ============================================================
+
+            LayerSpec::GlobalMixer {
+                channels: 192,
+                global_dim: 64,
+            },
+
+            // ============================================================
+            // Global representation
+            // 16 × 192 = 3072
+            // → 96
+            // ============================================================
+
+            LayerSpec::Dense {
+                output_size: 96,
+                activation: Activation::LeakyReLU { slope: 0.01 },
+            },
+
+            LayerSpec::WeightTying,
+        ],
+        epochs,
+    )
+}

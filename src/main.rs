@@ -578,7 +578,7 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::fineweb_hybrid_v7_to(0.4, 256, 1);
+        let config = helper::fineweb_hybrid_v8_to(0.4, 256, 1);
         let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
 
         //------------------------------------------------------------------------------------------
@@ -601,14 +601,14 @@ fn main() {
         lm.load_corpus(&fineweb3);
         lm.train(
             Some(10),
-            Some("pretraining_v7/pretrainConV7_batch_70_epoch_1.check"),
-            Some("pretraining_v7/pretrainConV7"),
+            None,
+            Some("pretraining_v8/pretrainConV8"),
             CheckpointFrequency::EveryBatch(500),
             None,
             None,
         );
         lm.save(
-            "pretrainV7.sumyu",
+            "pretrainV8.sumyu",
             &description,
         );
     }

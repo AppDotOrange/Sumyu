@@ -19,6 +19,7 @@ pub mod grouped_kernel;
 pub mod grouped_backward;
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use cblas::{Layout, Transpose};
@@ -411,109 +412,52 @@ pub fn zero_grad_and_update_embeddings_layerwise(
     lr: f32,
     embeddings: &embeddings::Embeddings,
     lr_scales: &[f32],
+    first_moments: &[f32],
+    beta1_correction: f32,
+    mlp_parameter_start: usize,
+    layer_parameter_ranges: &[Range<usize>],
 ) -> f32 {
     const MAX_GRAD_NORM: f64 = 1.0;
 
-    assert_eq!(
-        params.len(),
-        lr_scales.len(),
-        "Layerwise LR scale count must match parameter count"
-    );
+    // Maximum RMS parameter movement per layer, relative to
+    // that layer's current parameter RMS.
+    const MAX_RELATIVE_LAYER_UPDATE_RMS: f64 = 0.05;
+
+    // Emergency protection against a single pathological update.
+    const MAX_ABS_PARAMETER_UPDATE: f64 = 0.05;
+
+    // Prevent effectively-zero layers from having no usable
+    // trust region at all.
+    const MIN_PARAMETER_RMS: f64 = 1e-3;
 
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
 
         // ---------------------------------------------------------
-        // Global gradient norm
-        //
-        // IMPORTANT:
-        // This is deliberately still global. Adaptive layer LR
-        // changes the update magnitude after the common clipping
-        // factor has been computed.
+        // Embedding backing storage
         // ---------------------------------------------------------
 
-        let mut grad_sq_sum = 0.0f64;
-
-        for p in params {
-            match &tape.nodes[p.handle.node] {
-                Node::Scalar(node) => {
-                    let g =
-                        node.grad as f64;
-
-                    grad_sq_sum +=
-                        g * g;
-                }
-
-                Node::FusedLayer(_) => {
-                    panic!(
-                        "Parameter cannot be a fused-layer output."
-                    );
-                }
-            }
-        }
-
-        let scale =
-            if grad_sq_sum
-                > MAX_GRAD_NORM * MAX_GRAD_NORM
-            {
-                (
-                    MAX_GRAD_NORM
-                        / grad_sq_sum.sqrt()
-                ) as f32
-            } else {
-                1.0
-            };
-
-        let embedding_start =
-            embeddings.node_start();
-
-        let embedding_count =
-            embeddings.parameter_count();
-
+        let embedding_start = embeddings.node_start();
         let embedding_end =
-            embedding_start
-                + embedding_count;
+            embedding_start + embeddings.parameter_count();
 
         let mut flat_values =
             embeddings.flat_values_mut();
 
-        let mut grad_sum =
-            0.0f32;
-
         // ---------------------------------------------------------
-        // Update
+        // Embedding gradient clipping
         // ---------------------------------------------------------
 
-        for (param_index, p) in params.iter().enumerate() {
+        let mut embedding_grad_sq_sum = 0.0f64;
+
+        for param_index in 0..mlp_parameter_start {
             let node_id =
-                p.handle.node;
+                params[param_index].handle.node;
 
-            match &mut tape.nodes[node_id] {
+            match &tape.nodes[node_id] {
                 Node::Scalar(node) => {
-                    let grad =
-                        node.grad * scale;
-
-                    let effective_lr =
-                        lr * lr_scales[param_index];
-
-                    node.data -=
-                        effective_lr * grad;
-
-                    grad_sum +=
-                        grad.abs();
-
-                    node.grad = 0.0;
-
-                    // Keep the contiguous embedding matrix synchronized.
-                    if node_id >= embedding_start
-                        && node_id < embedding_end
-                    {
-                        let flat_index =
-                            node_id - embedding_start;
-
-                        flat_values[flat_index] =
-                            node.data;
-                    }
+                    let g = node.grad as f64;
+                    embedding_grad_sq_sum += g * g;
                 }
 
                 Node::FusedLayer(_) => {
@@ -524,8 +468,274 @@ pub fn zero_grad_and_update_embeddings_layerwise(
             }
         }
 
-        grad_sum
+        let embedding_grad_norm =
+            embedding_grad_sq_sum.sqrt();
+
+        let embedding_clip_scale =
+            if embedding_grad_norm > MAX_GRAD_NORM {
+                (MAX_GRAD_NORM / embedding_grad_norm) as f32
+            } else {
+                1.0
+            };
+
+        // ---------------------------------------------------------
+        // Compute one safety multiplier per MLP layer
+        // ---------------------------------------------------------
+
+        let mut layer_update_clips =
+            vec![1.0f64; layer_parameter_ranges.len()];
+
+        for (layer_index, range) in
+            layer_parameter_ranges.iter().enumerate()
+        {
+            let count =
+                (range.end - range.start) as f64;
+
+            if count <= 0.0 {
+                continue;
+            }
+
+            let mut parameter_sq_sum = 0.0f64;
+            let mut direction_sq_sum = 0.0f64;
+
+            for param_index in range.clone() {
+                let node_id =
+                    params[param_index].handle.node;
+
+                let node =
+                    match &tape.nodes[node_id] {
+                        Node::Scalar(node) => node,
+                        Node::FusedLayer(_) => {
+                            panic!(
+                                "Parameter cannot be a fused-layer output."
+                            );
+                        }
+                    };
+
+                let weight = node.data as f64;
+                let m_hat =
+                    (first_moments[param_index] as f64)
+                        / beta1_correction as f64;
+
+                parameter_sq_sum += weight * weight;
+                direction_sq_sum += m_hat * m_hat;
+            }
+
+            let parameter_rms =
+                (parameter_sq_sum / count).sqrt();
+
+            let direction_rms =
+                (direction_sq_sum / count).sqrt();
+
+            let proposed_update_rms =
+                (lr as f64).abs()
+                    * (lr_scales[range.start] as f64).abs()
+                    * direction_rms;
+
+            let allowed_update_rms =
+                MAX_RELATIVE_LAYER_UPDATE_RMS
+                    * parameter_rms.max(MIN_PARAMETER_RMS);
+
+            if proposed_update_rms > allowed_update_rms
+                && proposed_update_rms > 0.0
+            {
+                layer_update_clips[layer_index] =
+                    allowed_update_rms
+                        / proposed_update_rms;
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Apply updates
+        // ---------------------------------------------------------
+
+        let mut update_sq_sum = 0.0f64;
+
+        // Embeddings
+        for param_index in 0..mlp_parameter_start {
+            let p = &params[param_index];
+            let node_id = p.handle.node;
+
+            match &mut tape.nodes[node_id] {
+                Node::Scalar(node) => {
+                    let grad =
+                        node.grad * embedding_clip_scale;
+
+                    let actual_update =
+                        (lr as f64)
+                            * (lr_scales[param_index] as f64)
+                            * (grad as f64);
+
+                    if actual_update.is_finite() {
+                        node.data -= actual_update as f32;
+
+                        update_sq_sum +=
+                            actual_update * actual_update;
+
+                        if node_id >= embedding_start
+                            && node_id < embedding_end
+                        {
+                            flat_values[node_id - embedding_start] =
+                                node.data;
+                        }
+                    }
+
+                    node.grad = 0.0;
+                }
+
+                Node::FusedLayer(_) => {
+                    panic!(
+                        "Parameter cannot be a fused-layer output."
+                    );
+                }
+            }
+        }
+
+        // MLP, processed layer-by-layer so we already know the
+        // correct clip factor and never need to search for it.
+        for (layer_index, range) in
+            layer_parameter_ranges.iter().enumerate()
+        {
+            let clip =
+                layer_update_clips[layer_index];
+
+            for param_index in range.clone() {
+                let p = &params[param_index];
+                let node_id = p.handle.node;
+
+                match &mut tape.nodes[node_id] {
+                    Node::Scalar(node) => {
+                        let m_hat =
+                            (
+                                first_moments[param_index]
+                                    as f64
+                            ) / beta1_correction as f64;
+
+                        let mut actual_update =
+                            (lr as f64)
+                                * (lr_scales[param_index] as f64)
+                                * clip
+                                * m_hat;
+
+                        actual_update =
+                            actual_update.clamp(
+                                -MAX_ABS_PARAMETER_UPDATE,
+                                MAX_ABS_PARAMETER_UPDATE,
+                            );
+
+                        if actual_update.is_finite() {
+                            node.data -=
+                                actual_update as f32;
+
+                            update_sq_sum +=
+                                actual_update * actual_update;
+                        }
+
+                        node.grad = 0.0;
+                    }
+
+                    Node::FusedLayer(_) => {
+                        panic!(
+                            "Parameter cannot be a fused-layer output."
+                        );
+                    }
+                }
+            }
+        }
+
+        update_sq_sum.sqrt() as f32
     })
+}
+
+pub fn snapshot_parameter_values(
+    params: &[Tensor],
+    start: usize,
+    end: usize,
+) -> Vec<f32> {
+    assert!(
+        start <= end,
+        "Invalid parameter snapshot range"
+    );
+
+    assert!(
+        end <= params.len(),
+        "Parameter snapshot range out of bounds"
+    );
+
+    TAPE.with(|t| {
+        let tape = t.borrow();
+
+        let mut values =
+            Vec::with_capacity(end - start);
+
+        for param_index in start..end {
+            let node_id =
+                params[param_index].handle.node;
+
+            match &tape.nodes[node_id] {
+                Node::Scalar(node) => {
+                    values.push(node.data);
+                }
+
+                Node::FusedLayer(_) => {
+                    panic!(
+                        "Parameter cannot be a fused-layer output."
+                    );
+                }
+            }
+        }
+
+        values
+    })
+}
+
+pub fn restore_parameter_values(
+    params: &[Tensor],
+    start: usize,
+    end: usize,
+    values: &[f32],
+) {
+    assert!(
+        start <= end,
+        "Invalid parameter restore range"
+    );
+
+    assert!(
+        end <= params.len(),
+        "Parameter restore range out of bounds"
+    );
+
+    assert_eq!(
+        values.len(),
+        end - start,
+        "Snapshot size does not match parameter range"
+    );
+
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+
+        for (
+            offset,
+            param_index,
+        ) in (start..end).enumerate()
+        {
+            let node_id =
+                params[param_index].handle.node;
+
+            match &mut tape.nodes[node_id] {
+                Node::Scalar(node) => {
+                    node.data =
+                        values[offset];
+                }
+
+                Node::FusedLayer(_) => {
+                    panic!(
+                        "Parameter cannot be a fused-layer output."
+                    );
+                }
+            }
+        }
+    });
 }
 
 impl Tensor {

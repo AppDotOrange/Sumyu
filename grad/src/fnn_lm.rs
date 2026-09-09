@@ -50,16 +50,68 @@ pub struct SavedCheckpoint {
     pub best_loss: f32,
     pub plateau_count: usize,
 
-    // Layerwise adaptive LR optimizer state.
+    // Layerwise adaptive LR / optimizer state.
     //
-    // serde(default) keeps older checkpoints loadable:
-    // old checkpoints simply start the adaptive optimizer from zero.
+    // serde(default) keeps checkpoints created before this field
+    // was introduced loadable.
     #[serde(default)]
     pub layer_second_moments: Vec<f32>,
+
+    // Per-parameter first moment (Adam-style momentum).
+    //
+    // Old checkpoints have no such field, so they load as an empty
+    // vector and train_lm() initializes m to zero.
+    #[serde(default)]
+    pub layer_first_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_lr_scales: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_search_direction: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_search_factor: Vec<f32>,
 
     #[serde(default)]
     pub layer_adaptive_step: u64,
 }
+
+#[derive(Deserialize)]
+pub struct SavedCheckpointV1 {
+    pub model: SavedLM,
+
+    pub epoch: usize,
+    pub batch: usize,
+    pub sample: usize,
+
+    pub sampler_seed: u64,
+    pub sampler_version: u32,
+    pub sampler_data_len: usize,
+
+    pub lr: f32,
+    pub best_loss: f32,
+    pub plateau_count: usize,
+
+    // Layerwise adaptive LR optimizer state.
+    //
+    // serde(default) keeps older checkpoints loadable.
+    #[serde(default)]
+    pub layer_second_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_lr_scales: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_search_direction: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_search_factor: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_adaptive_step: u64,
+}
+
 
 pub fn tokenize(text: &str, vocab: &[String]) -> Vec<usize> {
     let trie = crate::helper::Trie::from_vocab(vocab, byte_fallback_base(Vec::from(vocab)));
@@ -875,6 +927,18 @@ impl LM {
                 layer_second_moments:
                 state.layer_second_moments,
 
+                layer_first_moments:
+                state.layer_first_moments,
+
+                layer_lr_scales:
+                state.layer_lr_scales,
+
+                layer_search_direction:
+                state.layer_search_direction,
+
+                layer_search_factor:
+                state.layer_search_factor,
+
                 layer_adaptive_step:
                 state.layer_adaptive_step,
             };
@@ -928,20 +992,73 @@ impl LM {
     pub fn load_checkpoint(&mut self, path: &str, lr: Option<f32>) -> ResumeState {
         let bytes = fs::read(path).unwrap();
 
-        let (checkpoint, _): (SavedCheckpoint, usize) =
-            bincode::serde::decode_from_slice(
+        let checkpoint: SavedCheckpoint =
+            match bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
-            ).unwrap();
+            ) {
+                Ok((checkpoint, _)) => checkpoint,
+
+                Err(_) => {
+                    println!(
+                        "Checkpoint uses legacy format; \
+                     initializing new adaptive LR search state."
+                    );
+
+                    let (old, _): (SavedCheckpointV1, usize) =
+                        bincode::serde::decode_from_slice(
+                            &bytes,
+                            bincode::config::standard(),
+                        )
+                            .expect("Failed to load checkpoint as either current or legacy format.");
+
+                    SavedCheckpoint {
+                        model: old.model,
+
+                        epoch: old.epoch,
+                        batch: old.batch,
+                        sample: old.sample,
+
+                        sampler_seed: old.sampler_seed,
+                        sampler_version: old.sampler_version,
+                        sampler_data_len: old.sampler_data_len,
+
+                        lr: old.lr,
+                        best_loss: old.best_loss,
+                        plateau_count: old.plateau_count,
+
+                        layer_second_moments:
+                        old.layer_second_moments,
+
+                        // Legacy checkpoints did not contain per-parameter m.
+                        // Start the new momentum state from zero.
+                        layer_first_moments:
+                        Vec::new(),
+
+                        // New optimizer state.
+                        layer_lr_scales:
+                        old.layer_lr_scales,
+                        layer_search_direction:
+                        old.layer_search_direction,
+                        layer_search_factor:
+                        old.layer_search_factor,
+
+                        layer_adaptive_step:
+                        old.layer_adaptive_step,
+                    }
+                }
+            };
 
         self.vocab = checkpoint.model.vocab;
         self.context_len = checkpoint.model.context_len;
         self.hidden_layers = checkpoint.model.hidden_layers;
+
         self.embeddings = Arc::new(
             Embeddings::load(
                 checkpoint.model.embeddings
             )
         );
+
         self.mlp = MLP::load_with_embeddings(
             &checkpoint.model.mlp,
             Arc::clone(&self.embeddings),
@@ -956,7 +1073,7 @@ impl LM {
 
         let lr_ = match lr {
             Some(t) => t,
-            None => checkpoint.lr
+            None => checkpoint.lr,
         };
 
         ResumeState {
@@ -974,6 +1091,18 @@ impl LM {
 
             layer_second_moments:
             checkpoint.layer_second_moments,
+
+            layer_first_moments:
+            checkpoint.layer_first_moments,
+
+            layer_lr_scales:
+            checkpoint.layer_lr_scales,
+
+            layer_search_direction:
+            checkpoint.layer_search_direction,
+
+            layer_search_factor:
+            checkpoint.layer_search_factor,
 
             layer_adaptive_step:
             checkpoint.layer_adaptive_step,
