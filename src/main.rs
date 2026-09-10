@@ -602,13 +602,13 @@ fn main() {
         lm.train(
             Some(10),
             None,
-            Some("pretraining_v8/pretrainConV8"),
+            Some("pretraining_v8restart/pretrainConV8"),
             CheckpointFrequency::EveryBatch(500),
-            None,
+            Some(0.03),
             None,
         );
         lm.save(
-            "pretrainV8.sumyu",
+            "pretrainV8restart.sumyu",
             &description,
         );
     }

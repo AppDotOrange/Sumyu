@@ -50,17 +50,9 @@ pub struct SavedCheckpoint {
     pub best_loss: f32,
     pub plateau_count: usize,
 
-    // Layerwise adaptive LR / optimizer state.
-    //
-    // serde(default) keeps checkpoints created before this field
-    // was introduced loadable.
     #[serde(default)]
     pub layer_second_moments: Vec<f32>,
 
-    // Per-parameter first moment (Adam-style momentum).
-    //
-    // Old checkpoints have no such field, so they load as an empty
-    // vector and train_lm() initializes m to zero.
     #[serde(default)]
     pub layer_first_moments: Vec<f32>,
 
@@ -75,7 +67,28 @@ pub struct SavedCheckpoint {
 
     #[serde(default)]
     pub layer_adaptive_step: u64,
+
+    #[serde(default)]
+    pub embedding_first_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub embedding_second_moments: Vec<f32>,
+
+    #[serde(default = "default_embedding_lr_scale")]
+    pub embedding_lr_scale: f32,
+
+    #[serde(default = "default_embedding_search_direction")]
+    pub embedding_search_direction: f32,
+
+    #[serde(default = "default_embedding_search_factor")]
+    pub embedding_search_factor: f32,
 }
+
+fn default_embedding_lr_scale() -> f32 { 1.0 }
+
+fn default_embedding_search_direction() -> f32 { 1.0 }
+
+fn default_embedding_search_factor() -> f32 { 1.25 }
 
 #[derive(Deserialize)]
 pub struct SavedCheckpointV1 {
@@ -93,11 +106,11 @@ pub struct SavedCheckpointV1 {
     pub best_loss: f32,
     pub plateau_count: usize,
 
-    // Layerwise adaptive LR optimizer state.
-    //
-    // serde(default) keeps older checkpoints loadable.
     #[serde(default)]
     pub layer_second_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub layer_first_moments: Vec<f32>,
 
     #[serde(default)]
     pub layer_lr_scales: Vec<f32>,
@@ -941,6 +954,12 @@ impl LM {
 
                 layer_adaptive_step:
                 state.layer_adaptive_step,
+
+                embedding_first_moments: state.embedding_first_moments,
+                embedding_lr_scale: state.embedding_lr_scale,
+                embedding_search_direction: state.embedding_search_direction,
+                embedding_search_factor: state.embedding_search_factor,
+                embedding_second_moments: state.embedding_second_moments
             };
 
             let bytes = bincode::serde::encode_to_vec(
@@ -1030,21 +1049,38 @@ impl LM {
                         layer_second_moments:
                         old.layer_second_moments,
 
-                        // Legacy checkpoints did not contain per-parameter m.
-                        // Start the new momentum state from zero.
+                        // Legacy checkpoints did not contain
+                        // the per-parameter first moment.
                         layer_first_moments:
                         Vec::new(),
 
-                        // New optimizer state.
                         layer_lr_scales:
                         old.layer_lr_scales,
+
                         layer_search_direction:
                         old.layer_search_direction,
+
                         layer_search_factor:
                         old.layer_search_factor,
 
                         layer_adaptive_step:
                         old.layer_adaptive_step,
+
+                        // Legacy checkpoints did not contain
+                        // embedding optimizer state.
+                        embedding_first_moments:
+                        Vec::new(),
+
+                        embedding_second_moments: Vec::new(),
+
+                        embedding_lr_scale:
+                        1.0,
+
+                        embedding_search_direction:
+                        1.0,
+
+                        embedding_search_factor:
+                        1.25,
                     }
                 }
             };
@@ -1106,6 +1142,21 @@ impl LM {
 
             layer_adaptive_step:
             checkpoint.layer_adaptive_step,
+
+            embedding_first_moments:
+            checkpoint.embedding_first_moments,
+
+            embedding_second_moments:
+            checkpoint.embedding_second_moments,
+
+            embedding_lr_scale:
+            checkpoint.embedding_lr_scale,
+
+            embedding_search_direction:
+            checkpoint.embedding_search_direction,
+
+            embedding_search_factor:
+            checkpoint.embedding_search_factor,
         }
     }
 
