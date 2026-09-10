@@ -1,10 +1,14 @@
+use std::io;
+use std::io::Write;
 #[allow(unused_imports)]
 use grad::chatter::ChatFNN;
 use grad::fnn_lm::{LM};
 
 fn main() {
+    print!("\x1B[2J\x1B[3J\x1B[1;1H");
+    let _ = io::stdout().flush();
     let tokens = 10_000;
-    let lm = LM::from_checkpoint("pretraining/pretrainConV5_batch_41000_epoch_1.check");
+    let lm = LM::from_checkpoint("pretraining_v8restart/pretrainConV8_batch_5000_epoch_1.check");
     lm.params();
     //lm.params();
     let elapsed = std::time::Instant::now();

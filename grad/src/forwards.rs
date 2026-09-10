@@ -289,6 +289,15 @@ pub fn low_rank_pointwise_forward(
     let mut output =
         vec![0.0; rows * layer.out_channels];
 
+    // ------------------------------------------------------------
+    // First projection:
+    //
+    // input [rows, in_channels]
+    // W1    [rank, in_channels]
+    //
+    // hidden_pre = input @ W1^T
+    // ------------------------------------------------------------
+
     unsafe {
         cblas::sgemm(
             Layout::RowMajor,
@@ -300,13 +309,37 @@ pub fn low_rank_pointwise_forward(
             1.0,
             input,
             layer.in_channels as i32,
-            &first_weights,
+            first_weights,
             layer.in_channels as i32,
             0.0,
             &mut hidden,
             layer.rank as i32,
         );
+    }
 
+    // ------------------------------------------------------------
+    // First bias + activation:
+    //
+    // hidden = activation(hidden_pre + b1)
+    // ------------------------------------------------------------
+
+    activation_bias_simd(
+        &mut hidden,
+        first_biases,
+        layer.rank,
+        &layer.activation,
+    );
+
+    // ------------------------------------------------------------
+    // Second projection:
+    //
+    // hidden [rows, rank]
+    // W2     [out_channels, rank]
+    //
+    // output_pre = hidden @ W2^T
+    // ------------------------------------------------------------
+
+    unsafe {
         cblas::sgemm(
             Layout::RowMajor,
             Transpose::None,
@@ -317,7 +350,7 @@ pub fn low_rank_pointwise_forward(
             1.0,
             &hidden,
             layer.rank as i32,
-            &second_weights,
+            second_weights,
             layer.rank as i32,
             0.0,
             &mut output,
@@ -325,18 +358,11 @@ pub fn low_rank_pointwise_forward(
         );
     }
 
-    for row in 0..rows {
-        let hidden_start =
-            row * layer.rank;
-
-        add_f32_slice_simd(
-            &mut hidden[
-                hidden_start
-                    ..hidden_start + layer.rank
-                ],
-            first_biases,
-        );
-    }
+    // ------------------------------------------------------------
+    // Second bias + activation:
+    //
+    // output = activation(output_pre + b2)
+    // ------------------------------------------------------------
 
     activation_bias_simd(
         &mut output,

@@ -601,10 +601,10 @@ fn main() {
         lm.load_corpus(&fineweb3);
         lm.train(
             Some(10),
-            None,
+            Some("pretraining_v8restart/pretrainConV8_batch_6476_epoch_1.check"),
             Some("pretraining_v8restart/pretrainConV8"),
             CheckpointFrequency::EveryBatch(500),
-            Some(0.03),
+            None,
             None,
         );
         lm.save(

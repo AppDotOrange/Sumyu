@@ -1,15 +1,19 @@
+use std::{fs, io, io::Write};
 use grad;
 use grad::fnn_lm::LM;
 use grad::helper;
 use grad::trainer::CheckpointFrequency;
 
 fn main() {
+    print!("\x1B[2J\x1B[3J\x1B[1;1H");
+    let _ = io::stdout().flush();
+    let poke = fs::read_to_string("Datasets/pokedex.txt").expect("Can't read pokedex.txt!").replace("\r\n", "\n");
     //------------------------------------------------------------------------------------------
     //     CONFIG
     //------------------------------------------------------------------------------------------
 
-    let config = helper::fineweb_hybrid_v5_to(0.4, 256, 1);
-    let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+    let config = helper::poke_v5_to(0.1, 32, 10000);
+    let description = "A tiny Sumyu Hybrid trained on the Pokedex.";
 
     //------------------------------------------------------------------------------------------
     //     DON'T TOUCH
@@ -20,7 +24,7 @@ fn main() {
         fn openblas_get_num_threads() -> i32;
     }
     unsafe {
-        openblas_set_num_threads(4);
+        openblas_set_num_threads(1);
         println!("OpenBLAS threads: {}", openblas_get_num_threads());
     }
     /*
@@ -28,17 +32,17 @@ fn main() {
     lm.train_options(0.55, 1, 256, 0);
     */
     lm.params();
-    lm.load_corpus(""); //* REPLACE WITH REAL CORPUS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    lm.load_corpus(&*poke); //* REPLACE WITH REAL CORPUS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     lm.train(
         Some(10),
-        Some("pretraining/pretrainConV5_batch_11692_epoch_1.check"),
-        Some("pretraining/pretrainConV5"),
-        CheckpointFrequency::EveryBatch(1000),
-        Some(0.3),
+        None,
+        None,
+        CheckpointFrequency::Disabled,
+        None,
         None,
     );
     lm.save(
-        "pretrainV5.sumyu",
+        "PokeP5.sumyu",
         &description,
     );
 }

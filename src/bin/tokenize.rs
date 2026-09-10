@@ -3,15 +3,16 @@ use grad::helper::{dump_vocab_as_rust, make_vocab_from_file};
 fn main() {
     let vocab =
         make_vocab_from_file(
-            "Datasets/fineweb_v2_sample.txt",
-            20_000,
+            "Datasets/pokedex.txt",
+            200,
             0,
-            Some(&[
-                "<EOT>", "<USER>", "<BOT>", "<TOOL>", "<TOOLEND>"
-            ]),
+            None,
         ).unwrap();
+    println!("{:?}", vocab)
+    /*
     dump_vocab_as_rust(
         &vocab,
         "vocabs/fineweb_vocab3.rs"
     ).unwrap()
+     */
 }

@@ -844,6 +844,17 @@ pub fn low_rank_pointwise_backward(
     activation: &Activation,
     workspace: &mut BackwardWorkspace,
 ) -> Vec<f32> {
+
+    // ============================================================
+    // Backprop through SECOND activation.
+    //
+    // grad:
+    // dL/d(output)
+    //
+    // becomes:
+    // dL/d(output_pre)
+    // ============================================================
+
     for i in 0..grad.len() {
         activation.backward(
             output[i],
@@ -851,23 +862,32 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
+    // ============================================================
+    // Allocate/reset second-layer gradients.
+    // ============================================================
+
     workspace.second_weight_grads.resize(
         out_channels * rank,
         0.0,
     );
+
     workspace.second_weight_grads.fill(0.0);
 
     workspace.second_bias_grads.resize(
         out_channels,
         0.0,
     );
+
     workspace.second_bias_grads.fill(0.0);
 
-    workspace.hidden_grads.resize(
-        rows * rank,
-        0.0,
-    );
-    workspace.hidden_grads.fill(0.0);
+    // ============================================================
+    // dW2 = grad^T @ hidden
+    //
+    // grad   [rows, out_channels]
+    // hidden [rows, rank]
+    //
+    // dW2    [out_channels, rank]
+    // ============================================================
 
     unsafe {
         cblas::sgemm(
@@ -886,7 +906,39 @@ pub fn low_rank_pointwise_backward(
             &mut workspace.second_weight_grads,
             rank as i32,
         );
+    }
 
+    // ============================================================
+    // db2 = sum over rows
+    // ============================================================
+
+    for row in 0..rows {
+        let base =
+            row * out_channels;
+
+        for oc in 0..out_channels {
+            workspace.second_bias_grads[oc] +=
+                grad[base + oc];
+        }
+    }
+
+    // ============================================================
+    // dHidden = grad @ W2
+    //
+    // grad [rows, out_channels]
+    // W2   [out_channels, rank]
+    //
+    // dHidden [rows, rank]
+    // ============================================================
+
+    workspace.hidden_grads.resize(
+        rows * rank,
+        0.0,
+    );
+
+    workspace.hidden_grads.fill(0.0);
+
+    unsafe {
         cblas::sgemm(
             Layout::RowMajor,
             Transpose::None,
@@ -905,27 +957,50 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    for row in 0..rows {
-        let base =
-            row * out_channels;
+    // ============================================================
+    // Backprop through FIRST activation.
+    //
+    // hidden contains:
+    //
+    // activation(first_pre + b1)
+    //
+    // so activation.backward(hidden[i], ...)
+    // gives dL/d(first_pre).
+    // ============================================================
 
-        for oc in 0..out_channels {
-            workspace.second_bias_grads[oc] +=
-                grad[base + oc];
-        }
+    for i in 0..workspace.hidden_grads.len() {
+        activation.backward(
+            hidden[i],
+            &mut workspace.hidden_grads[i],
+        );
     }
+
+    // ============================================================
+    // Allocate/reset first-layer gradients.
+    // ============================================================
 
     workspace.first_weight_grads.resize(
         rank * in_channels,
         0.0,
     );
+
     workspace.first_weight_grads.fill(0.0);
 
     workspace.first_bias_grads.resize(
         rank,
         0.0,
     );
+
     workspace.first_bias_grads.fill(0.0);
+
+    // ============================================================
+    // dW1 = dHidden^T @ input
+    //
+    // dHidden [rows, rank]
+    // input   [rows, in_channels]
+    //
+    // dW1     [rank, in_channels]
+    // ============================================================
 
     unsafe {
         cblas::sgemm(
@@ -946,17 +1021,36 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
+    // ============================================================
+    // db1 = sum over rows
+    // ============================================================
+
     for row in 0..rows {
+        let base =
+            row * rank;
+
         for r in 0..rank {
             workspace.first_bias_grads[r] +=
                 workspace.hidden_grads[
-                    row * rank + r
+                    base + r
                     ];
         }
     }
 
+    // ============================================================
+    // dInput = dHidden @ W1
+    //
+    // dHidden [rows, rank]
+    // W1      [rank, in_channels]
+    //
+    // dInput  [rows, in_channels]
+    // ============================================================
+
     let mut input_grads =
-        vec![0.0; rows * in_channels];
+        vec![
+            0.0;
+            rows * in_channels
+        ];
 
     unsafe {
         cblas::sgemm(
@@ -976,6 +1070,10 @@ pub fn low_rank_pointwise_backward(
             in_channels as i32,
         );
     }
+
+    // ============================================================
+    // Accumulate parameter gradients.
+    // ============================================================
 
     crate::add_handle_grad_slices(
         first_weight_handles,
@@ -1044,22 +1142,31 @@ unsafe fn layer_norm_backward_group_avx2(
     // ------------------------------------------------------------
     // First pass:
     //
-    //   sum(dy)
-    //   sum(dy * xhat)
+    // dxhat = dy * gamma
     //
-    // Use two accumulators to reduce the dependency chain.
+    // We need:
+    //
+    //   mean(dxhat)
+    //   mean(dxhat * xhat)
+    //
+    // because:
+    //
+    //   dx = inv_std *
+    //        (dxhat
+    //         - mean(dxhat)
+    //         - xhat * mean(dxhat * xhat))
     // ------------------------------------------------------------
 
-    let mut grad_sum_0 =
+    let mut grad_gamma_sum_0 =
         _mm256_setzero_ps();
 
-    let mut grad_sum_1 =
+    let mut grad_gamma_sum_1 =
         _mm256_setzero_ps();
 
-    let mut grad_xhat_sum_0 =
+    let mut grad_gamma_xhat_sum_0 =
         _mm256_setzero_ps();
 
-    let mut grad_xhat_sum_1 =
+    let mut grad_gamma_xhat_sum_1 =
         _mm256_setzero_ps();
 
     let mean_vec =
@@ -1070,6 +1177,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     let mut c =
         0usize;
+
+    // ------------------------------------------------------------
+    // 16 channels per iteration.
+    // ------------------------------------------------------------
 
     while c + 16 <= channels {
         let x0 =
@@ -1092,6 +1203,16 @@ unsafe fn layer_norm_backward_group_avx2(
                 grad.as_ptr().add(c + 8)
             );
 
+        let g0 =
+            _mm256_loadu_ps(
+                gamma.as_ptr().add(c)
+            );
+
+        let g1 =
+            _mm256_loadu_ps(
+                gamma.as_ptr().add(c + 8)
+            );
+
         let xhat0 =
             _mm256_mul_ps(
                 _mm256_sub_ps(
@@ -1110,38 +1231,54 @@ unsafe fn layer_norm_backward_group_avx2(
                 inv_std_vec,
             );
 
-        grad_sum_0 =
-            _mm256_add_ps(
-                grad_sum_0,
+        let dxhat0 =
+            _mm256_mul_ps(
                 dy0,
+                g0,
             );
 
-        grad_sum_1 =
-            _mm256_add_ps(
-                grad_sum_1,
+        let dxhat1 =
+            _mm256_mul_ps(
                 dy1,
+                g1,
             );
 
-        grad_xhat_sum_0 =
+        grad_gamma_sum_0 =
             _mm256_add_ps(
-                grad_xhat_sum_0,
+                grad_gamma_sum_0,
+                dxhat0,
+            );
+
+        grad_gamma_sum_1 =
+            _mm256_add_ps(
+                grad_gamma_sum_1,
+                dxhat1,
+            );
+
+        grad_gamma_xhat_sum_0 =
+            _mm256_add_ps(
+                grad_gamma_xhat_sum_0,
                 _mm256_mul_ps(
-                    dy0,
+                    dxhat0,
                     xhat0,
                 ),
             );
 
-        grad_xhat_sum_1 =
+        grad_gamma_xhat_sum_1 =
             _mm256_add_ps(
-                grad_xhat_sum_1,
+                grad_gamma_xhat_sum_1,
                 _mm256_mul_ps(
-                    dy1,
+                    dxhat1,
                     xhat1,
                 ),
             );
 
         c += 16;
     }
+
+    // ------------------------------------------------------------
+    // Remaining complete SIMD vector.
+    // ------------------------------------------------------------
 
     while c + 8 <= channels {
         let x =
@@ -1154,6 +1291,11 @@ unsafe fn layer_norm_backward_group_avx2(
                 grad.as_ptr().add(c)
             );
 
+        let g =
+            _mm256_loadu_ps(
+                gamma.as_ptr().add(c)
+            );
+
         let xhat =
             _mm256_mul_ps(
                 _mm256_sub_ps(
@@ -1163,17 +1305,23 @@ unsafe fn layer_norm_backward_group_avx2(
                 inv_std_vec,
             );
 
-        grad_sum_0 =
-            _mm256_add_ps(
-                grad_sum_0,
+        let dxhat =
+            _mm256_mul_ps(
                 dy,
+                g,
             );
 
-        grad_xhat_sum_0 =
+        grad_gamma_sum_0 =
             _mm256_add_ps(
-                grad_xhat_sum_0,
+                grad_gamma_sum_0,
+                dxhat,
+            );
+
+        grad_gamma_xhat_sum_0 =
+            _mm256_add_ps(
+                grad_gamma_xhat_sum_0,
                 _mm256_mul_ps(
-                    dy,
+                    dxhat,
                     xhat,
                 ),
             );
@@ -1181,15 +1329,19 @@ unsafe fn layer_norm_backward_group_avx2(
         c += 8;
     }
 
+    // ------------------------------------------------------------
+    // Reduce SIMD accumulators.
+    // ------------------------------------------------------------
+
     let mut tmp =
         [0.0f32; 8];
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_sum_0,
+        grad_gamma_sum_0,
     );
 
-    let mut grad_sum =
+    let mut grad_gamma_sum =
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1201,10 +1353,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_sum_1,
+        grad_gamma_sum_1,
     );
 
-    grad_sum +=
+    grad_gamma_sum +=
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1216,10 +1368,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_xhat_sum_0,
+        grad_gamma_xhat_sum_0,
     );
 
-    let mut grad_xhat_sum =
+    let mut grad_gamma_xhat_sum =
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1231,10 +1383,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_xhat_sum_1,
+        grad_gamma_xhat_sum_1,
     );
 
-    grad_xhat_sum +=
+    grad_gamma_xhat_sum +=
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1243,20 +1395,30 @@ unsafe fn layer_norm_backward_group_avx2(
             + tmp[5]
             + tmp[6]
             + tmp[7];
+
+    // ------------------------------------------------------------
+    // Scalar tail.
+    // ------------------------------------------------------------
 
     while c < channels {
         let dy =
             grad[c];
 
+        let g =
+            gamma[c];
+
         let xhat =
             (input[c] - mean)
                 * inv_std;
 
-        grad_sum +=
-            dy;
+        let dxhat =
+            dy * g;
 
-        grad_xhat_sum +=
-            dy * xhat;
+        grad_gamma_sum +=
+            dxhat;
+
+        grad_gamma_xhat_sum +=
+            dxhat * xhat;
 
         c += 1;
     }
@@ -1264,20 +1426,22 @@ unsafe fn layer_norm_backward_group_avx2(
     let channels_f32 =
         channels as f32;
 
-    let mean_grad =
-        grad_sum
+    let mean_dyg =
+        grad_gamma_sum
             / channels_f32;
 
-    let mean_xhat_grad =
-        grad_xhat_sum
+    let mean_dyg_xhat =
+        grad_gamma_xhat_sum
             / channels_f32;
 
-    let mean_grad_vec =
-        _mm256_set1_ps(mean_grad);
-
-    let mean_xhat_grad_vec =
+    let mean_dyg_vec =
         _mm256_set1_ps(
-            mean_xhat_grad
+            mean_dyg
+        );
+
+    let mean_dyg_xhat_vec =
+        _mm256_set1_ps(
+            mean_dyg_xhat
         );
 
     // ------------------------------------------------------------
@@ -1286,7 +1450,6 @@ unsafe fn layer_norm_backward_group_avx2(
     //   dgamma
     //   dbeta
     //   dx
-    //
     // ------------------------------------------------------------
 
     c = 0;
@@ -1358,27 +1521,35 @@ unsafe fn layer_norm_backward_group_avx2(
             ),
         );
 
+        // dxhat = dy * gamma
+        let dxhat =
+            _mm256_mul_ps(
+                dy,
+                g,
+            );
+
         // dx =
-        //   gamma * inv_std *
-        //   (dy - mean_grad - xhat * mean_xhat_grad)
+        //     inv_std *
+        //     (
+        //         dxhat
+        //         - mean(dxhat)
+        //         - xhat * mean(dxhat * xhat)
+        //     )
         let centered_grad =
             _mm256_sub_ps(
                 _mm256_sub_ps(
-                    dy,
-                    mean_grad_vec,
+                    dxhat,
+                    mean_dyg_vec,
                 ),
                 _mm256_mul_ps(
                     xhat,
-                    mean_xhat_grad_vec,
+                    mean_dyg_xhat_vec,
                 ),
             );
 
         let dx =
             _mm256_mul_ps(
-                _mm256_mul_ps(
-                    g,
-                    inv_std_vec,
-                ),
+                inv_std_vec,
                 centered_grad,
             );
 
@@ -1392,7 +1563,10 @@ unsafe fn layer_norm_backward_group_avx2(
         c += 8;
     }
 
+    // ------------------------------------------------------------
     // Scalar tail.
+    // ------------------------------------------------------------
+
     while c < channels {
         let x =
             input[c];
@@ -1400,24 +1574,33 @@ unsafe fn layer_norm_backward_group_avx2(
         let dy =
             grad[c];
 
+        let g =
+            gamma[c];
+
         let xhat =
             (x - mean)
                 * inv_std;
 
+        // dgamma
         weight_grads[c] +=
             dy * xhat;
 
+        // dbeta
         bias_grads[c] +=
             dy;
 
+        // dxhat
+        let dxhat =
+            dy * g;
+
+        // dx
         output_grad[c] =
-            gamma[c]
-                * inv_std
+            inv_std
                 * (
-                dy
-                    - mean_grad
+                dxhat
+                    - mean_dyg
                     - xhat
-                    * mean_xhat_grad
+                    * mean_dyg_xhat
             );
 
         c += 1;
@@ -1568,15 +1751,25 @@ pub fn layer_norm_backward(
 
         // --------------------------------------------------------
         // Scalar fallback.
+        //
+        // dxhat = dy * gamma
+        //
+        // dx =
+        //     inv_std *
+        //     (
+        //         dxhat
+        //         - mean(dxhat)
+        //         - xhat * mean(dxhat * xhat)
+        //     )
         // --------------------------------------------------------
 
         let channels_f32 =
             channels as f32;
 
-        let mut grad_sum =
+        let mut grad_gamma_sum =
             0.0f32;
 
-        let mut grad_xhat_sum =
+        let mut grad_gamma_xhat_sum =
             0.0f32;
 
         for c in 0..channels {
@@ -1590,19 +1783,22 @@ pub fn layer_norm_backward(
                 (x - mean)
                     * inv_std;
 
-            grad_sum +=
-                dy;
+            let dxhat =
+                dy * gamma[c];
 
-            grad_xhat_sum +=
-                dy * xhat;
+            grad_gamma_sum +=
+                dxhat;
+
+            grad_gamma_xhat_sum +=
+                dxhat * xhat;
         }
 
-        let mean_grad =
-            grad_sum
+        let mean_dyg =
+            grad_gamma_sum
                 / channels_f32;
 
-        let mean_xhat_grad =
-            grad_xhat_sum
+        let mean_dyg_xhat =
+            grad_gamma_xhat_sum
                 / channels_f32;
 
         for c in 0..channels {
@@ -1616,20 +1812,26 @@ pub fn layer_norm_backward(
                 (x - mean)
                     * inv_std;
 
+            // dgamma
             workspace.weight_grads[c] +=
                 dy * xhat;
 
+            // dbeta
             workspace.bias_grads[c] +=
                 dy;
 
+            // dxhat
+            let dxhat =
+                dy * gamma[c];
+
+            // dx
             output_grad_group[c] =
-                gamma[c]
-                    * inv_std
+                inv_std
                     * (
-                    dy
-                        - mean_grad
+                    dxhat
+                        - mean_dyg
                         - xhat
-                        * mean_xhat_grad
+                        * mean_dyg_xhat
                 );
         }
     }
