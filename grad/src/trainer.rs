@@ -1,12 +1,11 @@
 use std::time::{Duration, Instant};
 use rand::prelude::SliceRandom;
-use crate::neuron::{LayerSpec, MLP};
+use crate::neuron::{MLP};
 use crate::Tensor;
 use crate::batched::softmax_cross_entropy_batch;
 use crate::embeddings::Embeddings;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::io::{self, Write};
-use std::ops::Range;
 
 const PERMUTATION_SAMPLER_VERSION: u32 = 1;
 const DEFAULT_SAMPLER_SEED: u64 = 1;
@@ -214,20 +213,9 @@ pub struct ResumeState {
     pub(crate) best_loss: f32,
     pub(crate) plateau_count: usize,
 
-    pub(crate) layer_second_moments: Vec<f32>,
-    pub(crate) layer_first_moments: Vec<f32>,
-
-    pub(crate) layer_lr_scales: Vec<f32>,
-    pub(crate) layer_search_direction: Vec<f32>,
-    pub(crate) layer_search_factor: Vec<f32>,
-
-    pub(crate) layer_adaptive_step: u64,
-
-    pub(crate) embedding_first_moments: Vec<f32>,
-    pub(crate) embedding_second_moments: Vec<f32>,
-    pub(crate) embedding_lr_scale: f32,
-    pub(crate) embedding_search_direction: f32,
-    pub(crate) embedding_search_factor: f32,
+    pub(crate) adam_first_moments: Vec<f32>,
+    pub(crate) adam_second_moments: Vec<f32>,
+    pub(crate) adam_step: u64,
 }
 
 pub struct CheckpointState {
@@ -245,356 +233,9 @@ pub struct CheckpointState {
     pub(crate) best_loss: f32,
     pub(crate) plateau_count: usize,
 
-    pub(crate) layer_second_moments: Vec<f32>,
-    pub(crate) layer_first_moments: Vec<f32>,
-
-    pub(crate) layer_lr_scales: Vec<f32>,
-    pub(crate) layer_search_direction: Vec<f32>,
-    pub(crate) layer_search_factor: Vec<f32>,
-
-    pub(crate) layer_adaptive_step: u64,
-
-    pub(crate) embedding_first_moments: Vec<f32>,
-    pub(crate) embedding_second_moments: Vec<f32>,
-    pub(crate) embedding_lr_scale: f32,
-    pub(crate) embedding_search_direction: f32,
-    pub(crate) embedding_search_factor: f32,
-}
-
-/// Returns the number of scalar parameters owned by this layer.
-///
-/// The parameter ordering exactly matches Layer::parameters():
-/// weights first, then biases, recursively for Residual layers.
-fn layer_parameter_count(
-    spec: &LayerSpec,
-    current_size: usize,
-    embeddings_vocab_size: usize,
-) -> (usize, usize) {
-    match spec {
-        LayerSpec::Dense { output_size, .. } => {
-            let count =
-                current_size * output_size
-                    + output_size;
-
-            (count, *output_size)
-        }
-
-        LayerSpec::Conv1D {
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            ..
-        } => {
-            assert_eq!(
-                current_size % in_channels,
-                0
-            );
-
-            let input_length =
-                current_size / in_channels;
-
-            let output_length =
-                if *causal {
-                    (input_length - 1) / stride + 1
-                } else {
-                    assert!(
-                        input_length + 2 * padding
-                            >= *kernel_size
-                    );
-
-                    (
-                        input_length
-                            + 2 * padding
-                            - kernel_size
-                    ) / stride
-                        + 1
-                };
-
-            let count =
-                out_channels
-                    * in_channels
-                    * kernel_size
-                    + out_channels;
-
-            let output_size =
-                output_length * out_channels;
-
-            (count, output_size)
-        }
-
-        LayerSpec::Residual { layers } => {
-            let mut size = current_size;
-            let mut count = 0;
-
-            for inner in layers {
-                let (inner_count, inner_size) =
-                    layer_parameter_count(
-                        inner,
-                        size,
-                        embeddings_vocab_size,
-                    );
-
-                count += inner_count;
-                size = inner_size;
-            }
-
-            assert_eq!(
-                size,
-                current_size,
-                "Residual block changed tensor size"
-            );
-
-            (count, size)
-        }
-
-        LayerSpec::DepthwiseConv1D {
-            in_channels,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            ..
-        } => {
-            assert_eq!(
-                current_size % in_channels,
-                0
-            );
-
-            let input_length =
-                current_size / in_channels;
-
-            let output_length =
-                if *causal {
-                    (input_length - 1) / stride + 1
-                } else {
-                    assert!(
-                        input_length + 2 * padding
-                            >= *kernel_size
-                    );
-
-                    (
-                        input_length
-                            + 2 * padding
-                            - kernel_size
-                    ) / stride
-                        + 1
-                };
-
-            let count =
-                in_channels * kernel_size
-                    + in_channels;
-
-            (
-                count,
-                output_length * in_channels,
-            )
-        }
-
-        LayerSpec::GroupedConv1D {
-            in_channels,
-            out_channels,
-            groups,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            ..
-        } => {
-            assert_eq!(
-                in_channels % groups,
-                0
-            );
-
-            assert_eq!(
-                out_channels % groups,
-                0
-            );
-
-            assert_eq!(
-                current_size % in_channels,
-                0
-            );
-
-            let input_length =
-                current_size / in_channels;
-
-            let output_length =
-                if *causal {
-                    (input_length - 1) / stride + 1
-                } else {
-                    assert!(
-                        input_length + 2 * padding
-                            >= *kernel_size
-                    );
-
-                    (
-                        input_length
-                            + 2 * padding
-                            - kernel_size
-                    ) / stride
-                        + 1
-                };
-
-            let group_in =
-                in_channels / groups;
-
-            let count =
-                out_channels
-                    * group_in
-                    * kernel_size
-                    + out_channels;
-
-            (
-                count,
-                output_length * out_channels,
-            )
-        }
-
-        LayerSpec::LowRankPointwise {
-            in_channels,
-            rank,
-            out_channels,
-            ..
-        } => {
-            assert_eq!(
-                current_size % in_channels,
-                0
-            );
-
-            let positions =
-                current_size / in_channels;
-
-            let count =
-                rank * in_channels
-                    + rank
-                    + out_channels * rank
-                    + out_channels;
-
-            (
-                count,
-                positions * out_channels,
-            )
-        }
-
-        LayerSpec::ChannelScale { channels } => {
-            assert_eq!(
-                current_size % channels,
-                0
-            );
-
-            (
-                channels * 2,
-                current_size,
-            )
-        }
-
-        LayerSpec::WeightTying => {
-            (
-                0,
-                embeddings_vocab_size,
-            )
-        }
-
-        LayerSpec::LayerNorm { channels, .. } => {
-            assert_eq!(
-                current_size % channels,
-                0
-            );
-
-            (
-                channels * 2,
-                current_size,
-            )
-        }
-
-        LayerSpec::GlobalMixer {
-            channels,
-            global_dim,
-        } => {
-            assert_eq!(
-                current_size % channels,
-                0
-            );
-
-            let count =
-                2 * (
-                    channels * global_dim
-                        + global_dim
-                );
-
-            (
-                count,
-                current_size,
-            )
-        }
-    }
-}
-
-/// Builds parameter ranges for actual parameter-bearing layers.
-///
-/// Residual itself is not an optimizer group; its inner layers are.
-/// This gives CNN / mixer / norm / pointwise components independent
-/// adaptive learning rates.
-fn build_layer_parameter_ranges(
-    specs: &[LayerSpec],
-    mut current_size: usize,
-    embeddings_vocab_size: usize,
-) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut offset = 0usize;
-
-    fn recurse(
-        specs: &[LayerSpec],
-        current_size: &mut usize,
-        offset: &mut usize,
-        embeddings_vocab_size: usize,
-        ranges: &mut Vec<Range<usize>>,
-    ) {
-        for spec in specs {
-            match spec {
-                LayerSpec::Residual { layers } => {
-                    recurse(
-                        layers,
-                        current_size,
-                        offset,
-                        embeddings_vocab_size,
-                        ranges,
-                    );
-                }
-
-                _ => {
-                    let (count, output_size) =
-                        layer_parameter_count(
-                            spec,
-                            *current_size,
-                            embeddings_vocab_size,
-                        );
-
-                    if count > 0 {
-                        ranges.push(
-                            *offset..*offset + count
-                        );
-                    }
-
-                    *offset += count;
-                    *current_size = output_size;
-                }
-            }
-        }
-    }
-
-    recurse(
-        specs,
-        &mut current_size,
-        &mut offset,
-        embeddings_vocab_size,
-        &mut ranges,
-    );
-
-    ranges
+    pub(crate) adam_first_moments: Vec<f32>,
+    pub(crate) adam_second_moments: Vec<f32>,
+    pub(crate) adam_step: u64,
 }
 
 pub struct Trainer {
@@ -904,57 +545,20 @@ impl Trainer {
             params.len() as f32;
 
         // =============================================================
-        // Adaptive optimizer configuration
+        // Textbook Adam
         //
-        // `self.lr` is already divided by batch size by Trainer::new().
-        // We undo that below because Adam-style normalization makes the
-        // gradient magnitude approximately batch-size invariant.
+        //     m_t = beta1 * m + (1-beta1) * g
+        //     v_t = beta2 * v + (1-beta2) * g²
         //
-        // The user's supplied LR therefore behaves like:
+        //     m_hat = m / (1-beta1^t)
+        //     v_hat = v / (1-beta2^t)
         //
-        //     Trainer::new(0.01, ...)
+        //     param -= lr * m_hat / (sqrt(v_hat) + eps)
         //
-        // -> base adaptive LR = 0.01
-        //
-        // Each MLP layer then gets its own multiplier.
         // =============================================================
 
-        const LAYER_BETA1: f32 = 0.9;
-        const LAYER_BETA2: f32 = 0.99;
-        const LAYER_EPS: f32 = 1e-6;
-        const LAYER_LR_MIN_SCALE: f32 = 0.01;
-        const LAYER_LR_MAX_SCALE: f32 = 8.0;
-
-        // Multiplicative LR search step.
-        //
-        // Example:
-        //
-        //     1.00 -> 1.25 -> 1.5625 -> ...
-        //
-        // If the search overshoots, the factor is reduced and the
-        // direction is reversed.
-        const LAYER_SEARCH_INITIAL_FACTOR: f32 = 1.25;
-        const LAYER_SEARCH_MIN_FACTOR: f32 = 1.02;
-
-        // Only one layer is probed every N batches.
-        //
-        // A probe does one extra forward pass, and freezes all other
-        // parameter groups for that particular update.
-        const LAYER_PROBE_INTERVAL: usize = 16;
-
-        // Require a tiny relative improvement before calling a probe
-        // successful.
-        const LAYER_LOSS_TOLERANCE: f32 = 1e-5;
-
-        const EMBED_BETA1: f32 = 0.9;
-        const EMBED_BETA2: f32 = 0.99;
-        const EMBED_EPS: f32 = 1e-6;
-
-        const EMBED_LR_MIN_SCALE: f32 = 0.01;
-        const EMBED_LR_MAX_SCALE: f32 = 8.0;
-
-        const EMBED_SEARCH_INITIAL_FACTOR: f32 = 1.25;
-        const EMBED_SEARCH_MIN_FACTOR: f32 = 1.02;
+        const ADAM_BETA1: f32 = 0.9;
+        const ADAM_BETA2: f32 = 0.999;
 
         // =============================================================
         // Ctrl+C handling
@@ -1015,22 +619,18 @@ impl Trainer {
         let parameter_boundary =
             crate::tape_len();
 
-        // self.lr is lr / batch_size.
+        // IMPORTANT:
         //
-        // Recover the user-facing LR so that:
+        // Adam uses the real user-supplied LR directly.
         //
-        //     Trainer::new(0.01, ...)
-        //
-        // really means 0.01 for the adaptive optimizer.
+        // Trainer::new() should therefore store `lr` directly rather
+        // than dividing it by batch size.
         let mut lr =
-            self.lr;
+            self.lr * self.batch_size as f32;
 
         let mut best_loss =
             f32::MAX;
 
-        // Kept for checkpoint compatibility, but the old global LR
-        // plateau scheduler is deliberately disabled. Per-layer search
-        // now owns LR adaptation.
         let mut plateau_count =
             0usize;
 
@@ -1043,7 +643,7 @@ impl Trainer {
                 * embeddings.embedding_dim();
 
         // =============================================================
-        // Layer parameter ranges
+        // Parameter boundary
         // =============================================================
 
         let mlp_parameter_count =
@@ -1058,105 +658,37 @@ impl Trainer {
             params.len()
                 - mlp_parameter_count;
 
-        let relative_layer_ranges =
-            build_layer_parameter_ranges(
-                &mlp.layer_specs(),
-                input_size,
-                embeddings.vocab_size(),
-            );
-
-        let expected_mlp_parameter_count =
-            relative_layer_ranges
-                .iter()
-                .map(|range| range.end - range.start)
-                .sum::<usize>();
-
-        assert_eq!(
-            expected_mlp_parameter_count,
-            mlp_parameter_count,
-            "Layer parameter accounting does not match MLP::parameters()"
-        );
-
-        // Convert the MLP-relative ranges into absolute ranges into `params`.
-        let layer_ranges: Vec<Range<usize>> =
-            relative_layer_ranges
-                .into_iter()
-                .map(|range| {
-                    (mlp_parameter_start + range.start)
-                        ..
-                        (mlp_parameter_start + range.end)
-                })
-                .collect();
+        // `mlp_parameter_start` is retained because it identifies the
+        // embedding/MLP boundary for diagnostics and gradient handling.
+        //
+        // Adam itself does NOT use separate optimizer logic for them.
 
         // =============================================================
-        // Per-layer Adam-style state
-        //
-        // IMPORTANT:
-        //
-        // This is deliberately ONE scalar per layer.
-        //
-        // It is NOT per-parameter Adam.
-        //
-        // Each layer gets:
-        //
-        //     v_l = EMA(mean(g_l^2))
-        //
-        // and the actual parameter gradient remains individual.
+        // Adam state
         // =============================================================
 
-        let mut layer_second_moments = vec![0.0; layer_ranges.len()];
+        let mut adam_first_moments =
+            vec![0.0f32; params.len()];
 
-        // First moment is per parameter.
-        let mut layer_first_moments = vec![0.0; params.len()];
+        let mut adam_second_moments =
+            vec![0.0f32; params.len()];
 
-        let mut layer_lr_scales = vec![1.0; layer_ranges.len()];
-
-        // +1 = currently searching upward.
-        // -1 = currently searching downward.
-        let mut layer_search_direction =
-            vec![
-                1.0f32;
-                layer_ranges.len()
-            ];
-
-        // Search resolution for every layer.
-        let mut layer_search_factor =
-            vec![
-                LAYER_SEARCH_INITIAL_FACTOR;
-                layer_ranges.len()
-            ];
-
-        // =============================================================
-        // Embedding optimizer state
-        //
-        // One first moment per embedding parameter.
-        // One second moment per embedding parameter.
-        //
-        // This gives the tied embedding/output matrix a fully
-        // coordinate-wise adaptive optimizer.
-        // =============================================================
-
-        let embedding_parameter_count =
-            embeddings.parameter_count();
-
-        let mut embedding_first_moments =
-            vec![0.0f32; embedding_parameter_count];
-
-        let mut embedding_second_moments =
-            vec![0.0f32; embedding_parameter_count];
-
-        let mut embedding_lr_scale =
-            1.0f32;
-
-        let mut embedding_search_direction =
-            1.0f32;
-
-        let mut embedding_search_factor =
-            EMBED_SEARCH_INITIAL_FACTOR;
-
-        // Counts adaptive training batches and is checkpointed.
-        let mut layer_adaptive_step =
+        let mut adam_step =
             0u64;
+
+        // Keep beta powers incrementally so we do NOT calculate powi()
+        // every training batch.
+        //
+        // At step t:
+        //
+        //     beta1_power = beta1^t
+        //     beta2_power = beta2^t
+        //
+        let mut beta1_power =
+            1.0f32;
+
+        let mut beta2_power =
+            1.0f32;
 
         // =============================================================
         // Resume state
@@ -1186,145 +718,61 @@ impl Trainer {
                         state.plateau_count;
 
                     // -------------------------------------------------
-                    // Restore optimizer state.
+                    // Restore Adam state
                     // -------------------------------------------------
 
-                    if state.layer_second_moments.is_empty() {
+                    if state.adam_first_moments.len()
+                        == params.len()
+                        && state.adam_second_moments.len()
+                        == params.len()
+                    {
+                        adam_first_moments =
+                            state.adam_first_moments.clone();
+
+                        adam_second_moments =
+                            state.adam_second_moments.clone();
+
+                        adam_step =
+                            state.adam_step;
+
                         println!(
-                            "Checkpoint has no layerwise optimizer state; \
-         starting adaptive moments from zero."
+                            "Restored Adam state: {} parameters, step {}.",
+                            adam_first_moments.len(),
+                            adam_step,
                         );
 
-                        layer_second_moments.fill(0.0);
-                        layer_first_moments.fill(0.0);
-
-                        layer_lr_scales.fill(1.0);
-
-                        layer_search_direction.fill(1.0);
-
-                        layer_search_factor.fill(
-                            LAYER_SEARCH_INITIAL_FACTOR
-                        );
-
-                        layer_adaptive_step = 0;
-                    } else {
-                        assert_eq!(
-                            state.layer_second_moments.len(),
-                            layer_ranges.len(),
-                            "Checkpoint layer optimizer state \
-         does not match current MLP architecture"
-                        );
-
-                        layer_second_moments =
-                            state.layer_second_moments.clone();
-
-                        // Old checkpoints did not contain the per-parameter
-                        // first moment. In that case just start m from zero.
-                        if state.layer_first_moments.len() == params.len() {
-                            layer_first_moments =
-                                state.layer_first_moments.clone();
-                        } else {
-                            println!(
-                                "Checkpoint has no compatible per-parameter \
-             first-moment state; starting m from zero."
+                        // Reconstruct beta powers once at resume.
+                        //
+                        // They quickly underflow to zero at large t,
+                        // which is harmless because the bias correction
+                        // approaches 1.
+                        beta1_power =
+                            ADAM_BETA1.powi(
+                                adam_step as i32
                             );
 
-                            layer_first_moments.fill(0.0);
-                        }
-
-                        layer_adaptive_step =
-                            state.layer_adaptive_step;
-
-                        // -------------------------------------------------
-                        // Restore per-layer LR-search state.
-                        // -------------------------------------------------
-
-                        assert_eq!(
-                            state.layer_lr_scales.len(),
-                            layer_ranges.len(),
-                            "Checkpoint LR-scale state does not match current MLP architecture"
-                        );
-
-                        assert_eq!(
-                            state.layer_search_direction.len(),
-                            layer_ranges.len(),
-                            "Checkpoint LR-search-direction state does not match current MLP architecture"
-                        );
-
-                        assert_eq!(
-                            state.layer_search_factor.len(),
-                            layer_ranges.len(),
-                            "Checkpoint LR-search-factor state does not match current MLP architecture"
-                        );
-
-                        layer_lr_scales =
-                            state.layer_lr_scales.clone();
-
-                        layer_search_direction =
-                            state.layer_search_direction.clone();
-
-                        layer_search_factor =
-                            state.layer_search_factor.clone();
-
-                        println!(
-                            "Restored optimizer state: \
- {} layers, {} parameters in m, step {}.",
-                            layer_second_moments.len(),
-                            layer_first_moments.len(),
-                            layer_adaptive_step,
-                        );
-                    }
-
-                    // -------------------------------------------------
-                    // Restore embedding optimizer state.
-                    // -------------------------------------------------
-
-                    if state.embedding_first_moments.len()
-                        == embedding_parameter_count
-                    {
-                        embedding_first_moments =
-                            state.embedding_first_moments.clone();
+                        beta2_power =
+                            ADAM_BETA2.powi(
+                                adam_step as i32
+                            );
                     } else {
                         println!(
-                            "Checkpoint has no compatible embedding \
-         first-moment state; starting embedding m from zero."
+                            "Checkpoint has incompatible Adam state; \
+         starting Adam moments from zero."
                         );
 
-                        embedding_first_moments.fill(0.0);
+                        adam_first_moments.fill(0.0);
+                        adam_second_moments.fill(0.0);
+
+                        adam_step =
+                            0;
+
+                        beta1_power =
+                            1.0;
+
+                        beta2_power =
+                            1.0;
                     }
-
-                    if state.embedding_second_moments.len()
-                        == embedding_parameter_count
-                    {
-                        embedding_second_moments =
-                            state.embedding_second_moments.clone();
-                    } else {
-                        println!(
-                            "Checkpoint has no compatible embedding \
-         per-parameter second-moment state; \
-         starting embedding v from zero."
-                        );
-
-                        embedding_second_moments.fill(0.0);
-                    }
-
-                    embedding_lr_scale =
-                        state.embedding_lr_scale.clamp(
-                            EMBED_LR_MIN_SCALE,
-                            EMBED_LR_MAX_SCALE,
-                        );
-
-                    embedding_search_direction =
-                        if state.embedding_search_direction >= 0.0 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-
-                    embedding_search_factor =
-                        state.embedding_search_factor.max(
-                            EMBED_SEARCH_MIN_FACTOR
-                        );
 
                     if state.sample >= data_len {
                         (
@@ -1347,9 +795,6 @@ impl Trainer {
                 }
             };
 
-        let adaptive_base_lr =
-            lr * self.batch_size as f32;
-
         // =============================================================
         // Sampler state
         // =============================================================
@@ -1367,7 +812,7 @@ impl Trainer {
                         state.sampler_data_len,
                         data_len,
                         "Dataset length differs from checkpoint. \
-                     Exact deterministic resume is impossible."
+                 Exact deterministic resume is impossible."
                     );
 
                     state.sampler_seed
@@ -1390,17 +835,9 @@ impl Trainer {
              lr: f32,
              best_loss: f32,
              plateau_count: usize,
-             layer_second_moments: &[f32],
-             layer_first_moments: &[f32],
-             layer_lr_scales: &[f32],
-             layer_search_direction: &[f32],
-             layer_search_factor: &[f32],
-             layer_adaptive_step: u64,
-             embedding_first_moments: &[f32],
-             embedding_second_moments: &[f32],
-             embedding_lr_scale: f32,
-             embedding_search_direction: f32,
-             embedding_search_factor: f32| {
+             adam_first_moments: &[f32],
+             adam_second_moments: &[f32],
+             adam_step: u64| {
                 if let Some(savefn) =
                     savefn.as_mut()
                 {
@@ -1412,34 +849,21 @@ impl Trainer {
                             sample,
 
                             sampler_seed,
-                            sampler_version: PermutationSampler::VERSION,
+                            sampler_version:
+                            PermutationSampler::VERSION,
                             sampler_data_len,
 
                             lr,
                             best_loss,
                             plateau_count,
 
-                            layer_second_moments: layer_second_moments.to_vec(),
+                            adam_first_moments:
+                            adam_first_moments.to_vec(),
 
-                            layer_first_moments: layer_first_moments.to_vec(),
+                            adam_second_moments:
+                            adam_second_moments.to_vec(),
 
-                            layer_lr_scales: layer_lr_scales.to_vec(),
-
-                            layer_search_direction: layer_search_direction.to_vec(),
-
-                            layer_search_factor: layer_search_factor.to_vec(),
-
-                            layer_adaptive_step,
-
-                            embedding_first_moments: embedding_first_moments.to_vec(),
-
-                            embedding_second_moments: embedding_second_moments.to_vec(),
-
-                            embedding_lr_scale,
-
-                            embedding_search_direction,
-
-                            embedding_search_factor,
+                            adam_step,
                         },
                         mlp,
                         embeddings,
@@ -1667,14 +1091,7 @@ impl Trainer {
                 // -----------------------------------------------------
                 // Softmax cross entropy
                 //
-                // IMPORTANT:
                 // softmax_cross_entropy_batch() returns SUM CE.
-                //
-                // Therefore:
-                //
-                //     total_loss += batch_loss
-                //
-                // is correct.
                 // -----------------------------------------------------
 
                 let output_size =
@@ -1692,7 +1109,9 @@ impl Trainer {
                         0.0,
                     );
                 } else {
-                    output_grads.fill(0.0);
+                    output_grads.fill(
+                        0.0
+                    );
                 }
 
                 #[cfg(feature = "timing")]
@@ -1711,7 +1130,7 @@ impl Trainer {
                 if !batch_loss.is_finite() {
                     println!(
                         "Non-finite batch loss detected. \
-         Stopping training before optimizer update."
+     Stopping training before optimizer update."
                     );
 
                     crate::clear_tape_after(
@@ -1771,448 +1190,154 @@ impl Trainer {
                         timer.elapsed();
                 }
 
-                // =========================================================
-                // SEPARATE GRADIENT NORMS
+                // =====================================================
+                // GLOBAL GRADIENT NORM
                 //
-                // MLP and embeddings intentionally have completely independent
-                // clipping statistics.
+                // Gradients are NOT clipped element-by-element.
                 //
-                //     embedding norm -> embedding clip
-                //     MLP norm       -> MLP clip
+                // If the total norm is <= MAX_GRAD_NORM:
+                //     gradient is completely unchanged.
                 //
-                // Neither can suppress the other.
-                // =========================================================
+                // If the norm exceeds the limit:
+                //     the ENTIRE gradient vector is uniformly scaled.
+                //
+                // This preserves the gradient direction.
+                // =====================================================
 
                 const MAX_GRAD_NORM: f64 = 1.0;
 
-                // ---------------------------------------------------------
+                // The backward pass accumulates SUM gradients over the batch.
+                // Adam should operate on the MEAN batch gradient.
+                let batch_normalization =
+                    1.0f32 / current_batch.max(1) as f32;
+
+                // -----------------------------------------------------
                 // MLP gradient norm
-                // ---------------------------------------------------------
+                // -----------------------------------------------------
 
-                let mut mlp_grad_sq_sum = 0.0f64;
+                let mut mlp_grad_sq_sum =
+                    0.0f64;
 
-                for param_index in mlp_parameter_start..params.len() {
-                    let g = params[param_index].grad();
+                for param_index
+                in mlp_parameter_start..params.len()
+                {
+                    let raw_g =
+                        params[param_index].grad();
 
-                    if !g.is_finite() {
+                    if !raw_g.is_finite() {
                         println!(
                             "Non-finite MLP gradient detected before optimizer update. \
 Stopping training."
                         );
 
-                        crate::clear_tape_after(parameter_boundary);
+                        crate::clear_tape_after(
+                            parameter_boundary
+                        );
+
                         return TrainResult::Finished;
                     }
 
-                    let gf = g as f64;
-                    mlp_grad_sq_sum += gf * gf;
+                    // Measure the norm of the MEAN gradient,
+                    // not the summed batch gradient.
+                    let g =
+                        raw_g * batch_normalization;
+
+                    let gf =
+                        g as f64;
+
+                    mlp_grad_sq_sum +=
+                        gf * gf;
                 }
 
-                let mlp_raw_norm =
+                let mlp_grad_norm =
                     mlp_grad_sq_sum.sqrt();
 
-                let mlp_clip_scale =
-                    if mlp_raw_norm > MAX_GRAD_NORM {
-                        (MAX_GRAD_NORM / mlp_raw_norm) as f32
+                let mlp_grad_scale =
+                    if mlp_grad_norm > MAX_GRAD_NORM {
+                        (
+                            MAX_GRAD_NORM
+                                / mlp_grad_norm
+                        ) as f32
                     } else {
                         1.0
                     };
 
-                // ---------------------------------------------------------
+                // -----------------------------------------------------
                 // Embedding gradient norm
-                // ---------------------------------------------------------
+                // -----------------------------------------------------
 
-                let mut embedding_grad_sq_sum = 0.0f64;
+                let mut embedding_grad_sq_sum =
+                    0.0f64;
 
-                for param_index in 0..mlp_parameter_start {
-                    let g = params[param_index].grad();
+                for param_index
+                in 0..mlp_parameter_start
+                {
+                    let raw_g =
+                        params[param_index].grad();
 
-                    if !g.is_finite() {
+                    if !raw_g.is_finite() {
                         println!(
                             "Non-finite embedding gradient detected before optimizer update. \
 Stopping training."
                         );
 
-                        crate::clear_tape_after(parameter_boundary);
+                        crate::clear_tape_after(
+                            parameter_boundary
+                        );
+
                         return TrainResult::Finished;
                     }
 
-                    let gf = g as f64;
-                    embedding_grad_sq_sum += gf * gf;
+                    // Measure the norm of the MEAN gradient,
+                    // not the summed batch gradient.
+                    let g =
+                        raw_g * batch_normalization;
+
+                    let gf =
+                        g as f64;
+
+                    embedding_grad_sq_sum +=
+                        gf * gf;
                 }
 
-                let embedding_raw_norm =
+                let embedding_grad_norm =
                     embedding_grad_sq_sum.sqrt();
 
-                let embedding_clip_scale =
-                    if embedding_raw_norm > MAX_GRAD_NORM {
-                        (MAX_GRAD_NORM / embedding_raw_norm) as f32
+                let embedding_grad_scale =
+                    if embedding_grad_norm > MAX_GRAD_NORM {
+                        (
+                            MAX_GRAD_NORM
+                                / embedding_grad_norm
+                        ) as f32
                     } else {
                         1.0
                     };
 
-                // =========================================================
-                // ADAPTIVE MOMENT UPDATE
-                // =========================================================
-
-                layer_adaptive_step += 1;
-
-                let beta1_correction =
-                    1.0f32
-                        - LAYER_BETA1.powi(
-                        layer_adaptive_step as i32
-                    );
-
-                let beta2_correction =
-                    1.0f32
-                        - LAYER_BETA2.powi(
-                        layer_adaptive_step as i32
-                    );
-
-                // Embedding correction uses its own beta values, although
-                // the adaptive step counter can remain shared.
-                let embed_beta1_correction =
-                    1.0f32
-                        - EMBED_BETA1.powi(
-                        layer_adaptive_step as i32
-                    );
-
-                let embed_beta2_correction =
-                    1.0f32
-                        - EMBED_BETA2.powi(
-                        layer_adaptive_step as i32
-                    );
-
-                // ---------------------------------------------------------
-                // Embedding moments
-                //
-                // accumulate_batch_grads() produces SUM gradients.
-                //
-                // Normalize by batch size before feeding them to the
-                // adaptive optimizer.
-                //
-                // Only one scalar v is kept for the whole embedding table.
-                // ---------------------------------------------------------
-
-                let batch_normalization =
-                    1.0f32 / current_batch.max(1) as f32;
-
-                for param_index in 0..mlp_parameter_start {
-                    let raw_g =
-                        params[param_index].grad();
-
-                    let g =
-                        raw_g
-                            * embedding_clip_scale
-                            * batch_normalization;
-
-                    embedding_first_moments[param_index] =
-                        EMBED_BETA1
-                            * embedding_first_moments[param_index]
-                            + (1.0 - EMBED_BETA1) * g;
-
-                    embedding_second_moments[param_index] =
-                        EMBED_BETA2
-                            * embedding_second_moments[param_index]
-                            + (1.0 - EMBED_BETA2) * g * g;
-                }
-
-                // ---------------------------------------------------------
-                // MLP moments
-                //
-                // These remain exactly layerwise as before.
-                // ---------------------------------------------------------
-
-                let mut layer_rms =
-                    vec![
-                        0.0f32;
-                        layer_ranges.len()
-                    ];
-
-                for (
-                    layer_index,
-                    range,
-                ) in layer_ranges.iter().enumerate()
-                {
-                    let start =
-                        range.start;
-
-                    let end =
-                        range.end;
-
-                    let count_params =
-                        end - start;
-
-                    if count_params == 0 {
-                        continue;
-                    }
-
-                    let mut sum_sq =
-                        0.0f64;
-
-                    for param_index in start..end {
-                        let raw_g =
-                            params[param_index].grad();
-
-                        let g =
-                            raw_g * mlp_clip_scale;
-
-                        layer_first_moments[param_index] =
-                            LAYER_BETA1
-                                * layer_first_moments[param_index]
-                                + (1.0 - LAYER_BETA1) * g;
-
-                        let gf =
-                            g as f64;
-
-                        sum_sq +=
-                            gf * gf;
-                    }
-
-                    let mean_sq =
-                        (sum_sq / count_params as f64)
-                            as f32;
-
-                    layer_second_moments[layer_index] =
-                        LAYER_BETA2
-                            * layer_second_moments[layer_index]
-                            + (1.0 - LAYER_BETA2) * mean_sq;
-
-                    let v_hat =
-                        if beta2_correction > 1e-12 {
-                            layer_second_moments[layer_index]
-                                / beta2_correction
-                        } else {
-                            layer_second_moments[layer_index]
-                        };
-
-                    layer_rms[layer_index] =
-                        v_hat.max(0.0).sqrt();
-                }
-
                 // =====================================================
-                // PER-LAYER LR SEARCH
-                //
-                // Every LAYER_PROBE_INTERVAL batches, one layer gets
-                // tested.
-                //
-                // On the probe update:
-                //
-                //     all other layers = 0
-                //     tested layer      = candidate LR
-                //
-                // Then we run the same batch forward again.
-                //
-                // This gives us a real measurement of whether that
-                // layer's candidate step decreased the loss.
+                // Adam step
                 // =====================================================
 
-                /// When true, probing is enabled, but when false, it's disabled.
-                const ENABLE_PROBING: bool = false;
+                adam_step +=
+                    1;
 
-                let probing =
-                    !layer_ranges.is_empty()
-                        && layer_adaptive_step
-                        % LAYER_PROBE_INTERVAL as u64
-                        == 0 && ENABLE_PROBING;
+                beta1_power *=
+                    ADAM_BETA1;
 
-                let probe_group_count =
-                    layer_ranges.len() + 1;
+                beta2_power *=
+                    ADAM_BETA2;
 
-                // Group 0 = embeddings.
-                // Groups 1.. = MLP layers.
+                let beta1_correction_inv =
+                    1.0f32
+                        / (1.0f32
+                        - beta1_power);
 
-                let probe_group =
-                    if probing {
-                        (
-                            layer_adaptive_step
-                                / LAYER_PROBE_INTERVAL as u64
-                                - 1
-                        ) as usize
-                            % probe_group_count
-                    } else {
-                        usize::MAX
-                    };
-
-                let probing_embeddings =
-                    probing
-                        && probe_group == 0
-                        && ENABLE_PROBING;
-
-                let probe_layer =
-                    if probing && !probing_embeddings {
-                        probe_group - 1
-                    } else {
-                        0
-                    };
-
-                let mut probe_candidate =
-                    1.0f32;
-
-                let mut probe_old_scale =
-                    1.0f32;
-
-                if probing_embeddings {
-                    probe_old_scale =
-                        embedding_lr_scale;
-
-                    probe_candidate =
-                        if embedding_search_direction > 0.0 {
-                            probe_old_scale
-                                * embedding_search_factor
-                        } else {
-                            probe_old_scale
-                                / embedding_search_factor
-                        };
-
-                    probe_candidate =
-                        probe_candidate.clamp(
-                            EMBED_LR_MIN_SCALE,
-                            EMBED_LR_MAX_SCALE,
-                        );
-                } else if probing {
-                    probe_old_scale =
-                        layer_lr_scales[probe_layer];
-
-                    let factor =
-                        layer_search_factor[probe_layer];
-
-                    probe_candidate =
-                        if layer_search_direction[probe_layer] > 0.0 {
-                            probe_old_scale * factor
-                        } else {
-                            probe_old_scale / factor
-                        };
-
-                    probe_candidate =
-                        probe_candidate.clamp(
-                            LAYER_LR_MIN_SCALE,
-                            LAYER_LR_MAX_SCALE,
-                        );
-                }
+                let beta2_correction_inv =
+                    1.0f32
+                        / (1.0f32
+                        - beta2_power);
 
                 // -----------------------------------------------------
-                // Per-parameter scales.
-                //
-                // Embeddings remain ordinary SGD at the original
-                // user-supplied LR.
-                //
-                // MLP layers use:
-                //
-                //     lr * layer_lr_scale / sqrt(v_hat)
-                //
-                // which is the layerwise equivalent of Adam's
-                // second-moment normalization.
-                // -----------------------------------------------------
-
-                // ---------------------------------------------------------
-                // Build per-parameter optimizer scales.
-                //
-                // Embeddings:
-                //     embedding_lr_scale / sqrt(v_hat)
-                //
-                // MLP layers:
-                //     layer_lr_scale / sqrt(v_hat_layer)
-                //
-                // The actual gradient/momentum used by the updater is still
-                // per parameter.
-                // ---------------------------------------------------------
-
-                let mut lr_scales =
-                    vec![0.0f32; params.len()];
-
-                // Embedding parameters use the embedding-wide adaptive RMS.
-                // Each embedding parameter gets its own adaptive
-                // second-moment normalization.
-                //
-                //     scale_i = embedding_lr_scale / sqrt(v_hat_i)
-                //
-                // This is the only part of Sumyu that uses per-parameter v.
-                for param_index in 0..mlp_parameter_start {
-                    let v_hat =
-                        if embed_beta2_correction > 1e-12 {
-                            embedding_second_moments[param_index]
-                                / embed_beta2_correction
-                        } else {
-                            embedding_second_moments[param_index]
-                        };
-
-                    let rms =
-                        v_hat.max(0.0).sqrt();
-
-                    lr_scales[param_index] =
-                        if rms > EMBED_EPS {
-                            embedding_lr_scale
-                                / (rms + EMBED_EPS)
-                        } else {
-                            0.0
-                        };
-                }
-
-                // MLP layers.
-                for (
-                    layer_index,
-                    range,
-                ) in layer_ranges.iter().enumerate()
-                {
-                    let rms =
-                        layer_rms[layer_index];
-
-                    if rms <= LAYER_EPS {
-                        continue;
-                    }
-
-                    let multiplier =
-                        if probing {
-                            if probing_embeddings {
-                                0.0
-                            } else if layer_index == probe_layer {
-                                probe_candidate
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            layer_lr_scales[layer_index]
-                        };
-
-                    let layer_scale =
-                        multiplier
-                            / (rms + LAYER_EPS);
-
-                    for param_index in
-                        range.start..range.end
-                    {
-                        lr_scales[param_index] =
-                            layer_scale;
-                    }
-                }
-
-                // Embedding probe: only embeddings get a non-zero scale.
-                if probing_embeddings {
-                    for param_index in 0..mlp_parameter_start {
-                        let v_hat =
-                            if embed_beta2_correction > 1e-12 {
-                                embedding_second_moments[param_index]
-                                    / embed_beta2_correction
-                            } else {
-                                embedding_second_moments[param_index]
-                            };
-
-                        let rms =
-                            v_hat.max(0.0).sqrt();
-
-                        lr_scales[param_index] =
-                            if rms > EMBED_EPS {
-                                probe_candidate
-                                    / (rms + EMBED_EPS)
-                            } else {
-                                0.0
-                            };
-                    }
-                }
-
-                // -----------------------------------------------------
-                // Clear backward tape.
+                // Clear backward tape before parameter update.
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -2235,73 +1360,27 @@ Stopping training."
                 batches_done +=
                     1;
 
-                // =====================================================
-                // Save the probed layer before its tentative update.
-                //
-                // A rejected probe MUST restore these weights.
-                // The optimizer moments are intentionally NOT rolled back,
-                // because they represent the gradient observed on this batch,
-                // independent of which LR candidate we tested.
-                // =====================================================
-
-                // =====================================================
-                // Save exactly the parameter group being probed.
-                //
-                // Rejected probes restore only that group.
-                // Optimizer moments are intentionally NOT rolled back.
-                // =====================================================
-
-                let probe_backup =
-                    if probing_embeddings {
-                        None
-                    } else if probing {
-                        let range =
-                            &layer_ranges[probe_layer];
-
-                        Some(
-                            crate::snapshot_parameter_values(
-                                &params,
-                                range.start,
-                                range.end,
-                            )
-                        )
-                    } else {
-                        None
-                    };
-
-                let embedding_probe_backup =
-                    if probing_embeddings {
-                        Some(
-                            crate::snapshot_parameter_values(
-                                &params,
-                                0,
-                                mlp_parameter_start,
-                            )
-                        )
-                    } else {
-                        None
-                    };
-
-                // =====================================================
-                // PARAMETER UPDATE
-                // =====================================================
+                // -----------------------------------------------------
+                // Parameter update
+                // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
                 let timer =
                     Instant::now();
 
                 grad_sum +=
-                    crate::zero_grad_and_update_embeddings_layerwise(
+                    crate::zero_grad_and_update_adam(
                         &params,
-                        adaptive_base_lr,
+                        lr,
                         embeddings,
-                        &lr_scales,
-                        &layer_first_moments,
-                        &embedding_first_moments,
-                        beta1_correction,
-                        embed_beta1_correction,
+                        &mut adam_first_moments,
+                        &mut adam_second_moments,
+                        beta1_correction_inv,
+                        beta2_correction_inv,
                         mlp_parameter_start,
-                        &layer_ranges,
+                        mlp_grad_scale,
+                        embedding_grad_scale,
+                        batch_normalization,
                     );
 
                 #[cfg(feature = "timing")]
@@ -2311,182 +1390,12 @@ Stopping training."
                 }
 
                 // =====================================================
-                // SAME-BATCH PROBE
-                // =====================================================
-                //
-                // This is the part that actually makes the LR search
-                // loss-aware.
-                //
-                // Since a probe batch only updates ONE MLP layer, the
-                // change in loss is attributable to that candidate
-                // layer step much more directly than comparing gradient
-                // RMS values.
-                // =====================================================
-
-                if probing {
-                    let post_forward =
-                        mlp.forward_batch(
-                            &batch_input,
-                            current_batch,
-                            input_size,
-                        );
-
-                    let post_output_size =
-                        post_forward.output_size;
-
-                    let post_grad_len =
-                        current_batch
-                            * post_output_size;
-
-                    if output_grads.len()
-                        != post_grad_len
-                    {
-                        output_grads.resize(
-                            post_grad_len,
-                            0.0,
-                        );
-                    } else {
-                        output_grads.fill(0.0);
-                    }
-
-                    let post_loss =
-                        softmax_cross_entropy_batch(
-                            &post_forward.output,
-                            &*targets,
-                            &mut output_grads,
-                            current_batch,
-                            post_output_size,
-                        );
-
-                    crate::clear_tape_after(
-                        parameter_boundary
-                    );
-
-                    let relative_improvement =
-                        if batch_loss.is_finite()
-                            && post_loss.is_finite()
-                            && batch_loss.abs() > 1e-12
-                        {
-                            (
-                                batch_loss
-                                    - post_loss
-                            )
-                                / batch_loss.abs()
-                        } else {
-                            f32::NEG_INFINITY
-                        };
-
-                    let successful =
-                        post_loss.is_finite()
-                            && batch_loss.is_finite()
-                            && relative_improvement
-                            > LAYER_LOSS_TOLERANCE;
-
-                    if successful {
-                        if probing_embeddings {
-                            embedding_lr_scale =
-                                probe_candidate;
-
-                            println!(
-                                "  Embedding LR probe: {:.5}x -> {:.5}x \
-                 | loss improvement = {:.6}%",
-                                probe_old_scale,
-                                probe_candidate,
-                                relative_improvement * 100.0,
-                            );
-                        } else {
-                            layer_lr_scales[probe_layer] =
-                                probe_candidate;
-
-                            println!(
-                                "  Layer {} LR probe: {:.5}x -> {:.5}x \
-                 | loss improvement = {:.6}%",
-                                probe_layer,
-                                probe_old_scale,
-                                probe_candidate,
-                                relative_improvement * 100.0,
-                            );
-                        }
-                    } else {
-                        if probing_embeddings {
-                            if let Some(ref backup) =
-                                embedding_probe_backup
-                            {
-                                crate::restore_parameter_values(
-                                    &params,
-                                    0,
-                                    mlp_parameter_start,
-                                    backup,
-                                );
-                            }
-                        } else if let Some(ref backup) =
-                            probe_backup
-                        {
-                            let range =
-                                &layer_ranges[probe_layer];
-
-                            crate::restore_parameter_values(
-                                &params,
-                                range.start,
-                                range.end,
-                                backup,
-                            );
-                        }
-
-                        if probing_embeddings {
-                            embedding_search_direction *= -1.0;
-
-                            let old_factor =
-                                embedding_search_factor;
-
-                            embedding_search_factor =
-                                old_factor
-                                    .sqrt()
-                                    .max(EMBED_SEARCH_MIN_FACTOR);
-
-                            println!(
-                                "  Embedding LR probe rejected: {:.5}x \
-                 (loss change = {:.6}%) \
-                 | reversing search | factor {:.4} -> {:.4}",
-                                probe_candidate,
-                                relative_improvement * 100.0,
-                                old_factor,
-                                embedding_search_factor,
-                            );
-                        } else {
-                            layer_search_direction[probe_layer] *= -1.0;
-
-                            let old_factor =
-                                layer_search_factor[probe_layer];
-
-                            layer_search_factor[probe_layer] =
-                                old_factor
-                                    .sqrt()
-                                    .max(LAYER_SEARCH_MIN_FACTOR);
-
-                            println!(
-                                "  Layer {} LR probe rejected: {:.5}x \
-                 (loss change = {:.6}%) \
-                 | reversing search | factor {:.4} -> {:.4}",
-                                probe_layer,
-                                probe_candidate,
-                                relative_improvement * 100.0,
-                                old_factor,
-                                layer_search_factor[probe_layer],
-                            );
-                        }
-                    }
-                }
-
-                // =====================================================
                 // Batch checkpoint
                 // =====================================================
 
                 let should_checkpoint =
                     match checkpoint_frequency {
-                        CheckpointFrequency::EveryBatch(
-                            n
-                        ) => {
+                        CheckpointFrequency::EveryBatch(n) => {
                             n > 0
                                 && batches_done
                                 % n
@@ -2507,17 +1416,9 @@ Stopping training."
                         lr,
                         best_loss,
                         plateau_count,
-                        &layer_second_moments,
-                        &layer_first_moments,
-                        &layer_lr_scales,
-                        &layer_search_direction,
-                        &layer_search_factor,
-                        layer_adaptive_step,
-                        &embedding_first_moments,
-                        &embedding_second_moments,
-                        embedding_lr_scale,
-                        embedding_search_direction,
-                        embedding_search_factor,
+                        &adam_first_moments,
+                        &adam_second_moments,
+                        adam_step,
                     );
                 }
 
@@ -2618,11 +1519,11 @@ Stopping training."
 
                         println!(
                             "Epoch {} | Batch {}/{} | {:>6.2}% | \
-                         Samples {}/{} | AvgLoss = {:.6} | \
-                         AvgPPL = {:.6}\n\
-                         Loss={:.6} | PPL= {:.6} | \
-                         {:.1} samples/s | Elapsed: {:.2?} | \
-                         ETA: {:.2?}",
+                     Samples {}/{} | AvgLoss = {:.6} | \
+                     AvgPPL = {:.6}\n\
+                     Loss={:.6} | PPL= {:.6} | \
+                     {:.1} samples/s | Elapsed: {:.2?} | \
+                     ETA: {:.2?}",
                             epoch,
                             batches_done,
                             total_batches,
@@ -2648,7 +1549,9 @@ Stopping training."
                     .load(Ordering::SeqCst)
                 {
                     println!();
-                    println!("Ctrl+C received. Current batch has finished.");
+                    println!(
+                        "Ctrl+C received. Current batch has finished."
+                    );
 
                     make_checkpoint(
                         CheckpointKind::Batch,
@@ -2660,21 +1563,15 @@ Stopping training."
                         lr,
                         best_loss,
                         plateau_count,
-                        &layer_second_moments,
-                        &layer_first_moments,
-                        &layer_lr_scales,
-                        &layer_search_direction,
-                        &layer_search_factor,
-                        layer_adaptive_step,
-                        &embedding_first_moments,
-                        &embedding_second_moments,
-                        embedding_lr_scale,
-                        embedding_search_direction,
-                        embedding_search_factor,
+                        &adam_first_moments,
+                        &adam_second_moments,
+                        adam_step,
                     );
 
                     loop {
-                        print!("Exit training? [y/N]: ");
+                        print!(
+                            "Exit training? [y/N]: "
+                        );
 
                         io::stdout()
                             .flush()
@@ -2727,7 +1624,7 @@ Stopping training."
                             Err(_) => {
                                 println!(
                                     "Could not read input. \
-                                 Exiting training."
+                             Exiting training."
                                 );
 
                                 return TrainResult::Interrupted;
@@ -2762,10 +1659,10 @@ Stopping training."
             // =========================================================
             // Track best loss
             //
-            // No global LR reduction here.
+            // Kept for checkpoint/output compatibility.
             //
-            // The per-layer LR search is now responsible for finding
-            // useful step sizes.
+            // Adam itself does not perform the old custom layerwise
+            // LR adaptation.
             // =========================================================
 
             if avg_loss
@@ -2787,9 +1684,7 @@ Stopping training."
 
             let should_checkpoint =
                 match checkpoint_frequency {
-                    CheckpointFrequency::EveryEpoch(
-                        n
-                    ) => {
+                    CheckpointFrequency::EveryEpoch(n) => {
                         n > 0
                             && epoch % n
                             == 0
@@ -2809,17 +1704,9 @@ Stopping training."
                     lr,
                     best_loss,
                     plateau_count,
-                    &layer_second_moments,
-                    &layer_first_moments,
-                    &layer_lr_scales,
-                    &layer_search_direction,
-                    &layer_search_factor,
-                    layer_adaptive_step,
-                    &embedding_first_moments,
-                    &embedding_second_moments,
-                    embedding_lr_scale,
-                    embedding_search_direction,
-                    embedding_search_factor,
+                    &adam_first_moments,
+                    &adam_second_moments,
+                    adam_step,
                 );
             }
 
@@ -2840,8 +1727,8 @@ Stopping training."
             {
                 println!(
                     "Epoch {} | Loss (CE) = {:.6} | \
-                 Grad sum (avg per param) = {:.8} | \
-                 PPL = {:.6} | Time elapsed: {:.2?}.",
+             Grad sum (avg per param) = {:.8} | \
+             PPL = {:.6} | Time elapsed: {:.2?}.",
                     epoch,
                     avg_loss,
                     grad_avg
@@ -2915,7 +1802,6 @@ Stopping training."
 
             if grad_avg <= 1e-9 {
                 println!("Early stopping, network will not learn anymore!");
-
                 return TrainResult::Finished;
             }
         }

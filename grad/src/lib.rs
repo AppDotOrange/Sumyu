@@ -19,7 +19,6 @@ pub mod grouped_kernel;
 pub mod grouped_backward;
 
 use std::cell::RefCell;
-use std::ops::Range;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use cblas::{Layout, Transpose};
@@ -407,287 +406,120 @@ pub(crate) fn add_handle_grad_slices_2(
     });
 }
 
-pub fn zero_grad_and_update_embeddings_layerwise(
+pub fn zero_grad_and_update_adam(
     params: &[Tensor],
     lr: f32,
     embeddings: &embeddings::Embeddings,
-    lr_scales: &[f32],
-    first_moments: &[f32],
-    embedding_first_moments: &[f32],
-    beta1_correction: f32,
-    embedding_beta1_correction: f32,
+    first_moments: &mut [f32],
+    second_moments: &mut [f32],
+    beta1_correction_inv: f32,
+    beta2_correction_inv: f32,
     mlp_parameter_start: usize,
-    layer_parameter_ranges: &[Range<usize>],
+    mlp_grad_scale: f32,
+    embedding_grad_scale: f32,
+    batch_normalization: f32,
 ) -> f32 {
-    // ---------------------------------------------------------
-    // These protections remain ONLY for the MLP.
-    //
-    // The embedding path is now Adam-style:
-    //
-    //     update = lr * m_hat * lr_scale
-    //
-    // where lr_scale already contains:
-    //
-    //     embedding_lr_scale / (sqrt(v_hat) + eps)
-    //
-    // from train_lm().
-    // ---------------------------------------------------------
+    const BETA1: f32 = 0.9;
+    const BETA2: f32 = 0.999;
+    const EPS: f32 = 1e-8;
 
-    const MAX_RELATIVE_LAYER_UPDATE_RMS: f64 = 0.01;
-    const MAX_ABS_PARAMETER_UPDATE: f64 = 0.05;
-    const MIN_PARAMETER_RMS: f64 = 1e-3;
+    debug_assert_eq!(
+        first_moments.len(),
+        params.len()
+    );
+
+    debug_assert_eq!(
+        second_moments.len(),
+        params.len()
+    );
+
+    let embedding_start =
+        embeddings.node_start();
+
+    let embedding_end =
+        embedding_start
+            + embeddings.parameter_count();
 
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
 
-        // ---------------------------------------------------------
-        // Embedding backing storage
-        // ---------------------------------------------------------
-
-        let embedding_start =
-            embeddings.node_start();
-
-        let embedding_end =
-            embedding_start
-                + embeddings.parameter_count();
-
         let mut flat_values =
             embeddings.flat_values_mut();
-
-        // ---------------------------------------------------------
-        // Compute one safety multiplier per MLP layer
-        // ---------------------------------------------------------
-
-        let mut layer_update_clips =
-            vec![1.0f64; layer_parameter_ranges.len()];
-
-        for (
-            layer_index,
-            range,
-        ) in layer_parameter_ranges.iter().enumerate()
-        {
-            let count =
-                (range.end - range.start) as f64;
-
-            if count <= 0.0 {
-                continue;
-            }
-
-            let mut parameter_sq_sum =
-                0.0f64;
-
-            let mut direction_sq_sum =
-                0.0f64;
-
-            for param_index in range.clone() {
-                let node_id =
-                    params[param_index].handle.node;
-
-                let node =
-                    match &tape.nodes[node_id] {
-                        Node::Scalar(node) => node,
-
-                        Node::FusedLayer(_) => {
-                            panic!(
-                                "Parameter cannot be a fused-layer output."
-                            );
-                        }
-                    };
-
-                let weight =
-                    node.data as f64;
-
-                let m_hat =
-                    if beta1_correction > 1e-12 {
-                        (first_moments[param_index] as f64)
-                            / beta1_correction as f64
-                    } else {
-                        first_moments[param_index] as f64
-                    };
-
-                parameter_sq_sum +=
-                    weight * weight;
-
-                direction_sq_sum +=
-                    m_hat * m_hat;
-            }
-
-            let parameter_rms =
-                (parameter_sq_sum / count).sqrt();
-
-            let direction_rms =
-                (direction_sq_sum / count).sqrt();
-
-            let proposed_update_rms =
-                (lr as f64).abs()
-                    * (lr_scales[range.start] as f64).abs()
-                    * direction_rms;
-
-            let allowed_update_rms =
-                MAX_RELATIVE_LAYER_UPDATE_RMS
-                    * parameter_rms.max(
-                    MIN_PARAMETER_RMS
-                );
-
-            if proposed_update_rms
-                > allowed_update_rms
-                && proposed_update_rms > 0.0
-            {
-                layer_update_clips[layer_index] =
-                    allowed_update_rms
-                        / proposed_update_rms;
-            }
-        }
-
-        // ---------------------------------------------------------
-        // Apply updates
-        // ---------------------------------------------------------
 
         let mut update_sq_sum =
             0.0f64;
 
-        // =========================================================
-        // Embeddings
-        //
-        // Adam-style update:
-        //
-        //     m_hat = m / bias_correction
-        //
-        //     lr_scale =
-        //         embedding_lr_scale
-        //         / (sqrt(v_hat) + eps)
-        //
-        // therefore:
-        //
-        //     update =
-        //         lr * lr_scale * m_hat
-        //
-        // No embedding trust-region clipping.
-        // No per-coordinate emergency clamp.
-        //
-        // The embedding optimizer is intentionally allowed to
-        // follow its adaptive step directly.
-        // =========================================================
-
-        for param_index in 0..mlp_parameter_start {
-            let p =
-                &params[param_index];
-
+        for param_index in 0..params.len() {
             let node_id =
-                p.handle.node;
+                params[param_index]
+                    .handle
+                    .node;
 
-            match &mut tape.nodes[node_id] {
-                Node::Scalar(node) => {
-                    let m_hat =
-                        if embedding_beta1_correction > 1e-12 {
-                            (
-                                embedding_first_moments[
-                                    param_index
-                                    ] as f64
-                            ) / embedding_beta1_correction as f64
-                        } else {
-                            embedding_first_moments[
-                                param_index
-                                ] as f64
-                        };
-
-                    let actual_update =
-                        (lr as f64)
-                            * (lr_scales[param_index] as f64)
-                            * m_hat;
-
-                    if actual_update.is_finite() {
-                        node.data -=
-                            actual_update as f32;
-
-                        update_sq_sum +=
-                            actual_update
-                                * actual_update;
-
-                        if node_id >= embedding_start
-                            && node_id < embedding_end
-                        {
-                            flat_values[
-                                node_id
-                                    - embedding_start
-                                ] = node.data;
-                        }
-                    }
-
-                    node.grad = 0.0;
-                }
-
-                Node::FusedLayer(_) => {
-                    panic!(
-                        "Embedding parameter cannot be a fused-layer output."
-                    );
-                }
-            }
-        }
-
-        // =========================================================
-        // MLP
-        //
-        // UNCHANGED.
-        //
-        // Process layer-by-layer using the precomputed trust-region
-        // clip for each layer.
-        // =========================================================
-
-        for (
-            layer_index,
-            range,
-        ) in layer_parameter_ranges.iter().enumerate()
-        {
-            let clip =
-                layer_update_clips[layer_index];
-
-            for param_index in range.clone() {
-                let p =
-                    &params[param_index];
-
-                let node_id =
-                    p.handle.node;
-
+            let node =
                 match &mut tape.nodes[node_id] {
-                    Node::Scalar(node) => {
-                        let m_hat =
-                            if beta1_correction > 1e-12 {
-                                (
-                                    first_moments[param_index] as f64
-                                ) / beta1_correction as f64
-                            } else {
-                                first_moments[param_index] as f64
-                            };
-
-                        let mut actual_update =
-                            (lr as f64)
-                                * (lr_scales[param_index] as f64)
-                                * clip
-                                * m_hat;
-
-                        actual_update =
-                            actual_update.clamp(
-                                -MAX_ABS_PARAMETER_UPDATE,
-                                MAX_ABS_PARAMETER_UPDATE,
-                            );
-
-                        if actual_update.is_finite() {
-                            node.data -= actual_update as f32;
-
-                            update_sq_sum +=
-                                actual_update
-                                    * actual_update;
-                        }
-
-                        node.grad = 0.0;
-                    }
+                    Node::Scalar(node) => node,
 
                     Node::FusedLayer(_) => {
-                        panic!("Parameter cannot be a fused-layer output.");
+                        panic!(
+                            "Parameter cannot be a fused-layer output."
+                        );
                     }
+                };
+
+            let grad_scale =
+                if param_index < mlp_parameter_start {
+                    embedding_grad_scale
+                } else {
+                    mlp_grad_scale
+                };
+
+            let g =
+                node.grad
+                    * batch_normalization
+                    * grad_scale;
+
+            let m =
+                &mut first_moments[param_index];
+
+            let v =
+                &mut second_moments[param_index];
+
+            *m =
+                BETA1 * *m
+                    + (1.0 - BETA1) * g;
+
+            *v =
+                BETA2 * *v
+                    + (1.0 - BETA2) * g * g;
+
+            let m_hat =
+                *m * beta1_correction_inv;
+
+            let v_hat =
+                *v * beta2_correction_inv;
+
+            let update =
+                lr
+                    * m_hat
+                    / (v_hat.sqrt() + EPS);
+
+            if update.is_finite() {
+                node.data -= update;
+
+                update_sq_sum +=
+                    (update as f64)
+                        * (update as f64);
+
+                if node_id >= embedding_start
+                    && node_id < embedding_end
+                {
+                    flat_values[
+                        node_id - embedding_start
+                        ] = node.data;
                 }
             }
+
+            node.grad = 0.0;
         }
 
         update_sq_sum.sqrt() as f32

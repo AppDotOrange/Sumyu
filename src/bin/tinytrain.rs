@@ -12,7 +12,7 @@ fn main() {
     //     CONFIG
     //------------------------------------------------------------------------------------------
 
-    let config = helper::poke_v5_to(0.1, 32, 10000);
+    let config = helper::poke_v5_to(1e-3, 32, 10000);
     let description = "A tiny Sumyu Hybrid trained on the Pokedex.";
 
     //------------------------------------------------------------------------------------------
@@ -32,7 +32,7 @@ fn main() {
     lm.train_options(0.55, 1, 256, 0);
     */
     lm.params();
-    lm.load_corpus(&*poke); //* REPLACE WITH REAL CORPUS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    lm.load_corpus(&*poke);
     lm.train(
         Some(10),
         None,

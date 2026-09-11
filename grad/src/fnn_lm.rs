@@ -51,44 +51,14 @@ pub struct SavedCheckpoint {
     pub plateau_count: usize,
 
     #[serde(default)]
-    pub layer_second_moments: Vec<f32>,
+    pub adam_first_moments: Vec<f32>,
 
     #[serde(default)]
-    pub layer_first_moments: Vec<f32>,
+    pub adam_second_moments: Vec<f32>,
 
     #[serde(default)]
-    pub layer_lr_scales: Vec<f32>,
-
-    #[serde(default)]
-    pub layer_search_direction: Vec<f32>,
-
-    #[serde(default)]
-    pub layer_search_factor: Vec<f32>,
-
-    #[serde(default)]
-    pub layer_adaptive_step: u64,
-
-    #[serde(default)]
-    pub embedding_first_moments: Vec<f32>,
-
-    #[serde(default)]
-    pub embedding_second_moments: Vec<f32>,
-
-    #[serde(default = "default_embedding_lr_scale")]
-    pub embedding_lr_scale: f32,
-
-    #[serde(default = "default_embedding_search_direction")]
-    pub embedding_search_direction: f32,
-
-    #[serde(default = "default_embedding_search_factor")]
-    pub embedding_search_factor: f32,
+    pub adam_step: u64,
 }
-
-fn default_embedding_lr_scale() -> f32 { 1.0 }
-
-fn default_embedding_search_direction() -> f32 { 1.0 }
-
-fn default_embedding_search_factor() -> f32 { 1.25 }
 
 #[derive(Deserialize)]
 pub struct SavedCheckpointV1 {
@@ -123,6 +93,21 @@ pub struct SavedCheckpointV1 {
 
     #[serde(default)]
     pub layer_adaptive_step: u64,
+
+    #[serde(default)]
+    pub embedding_first_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub embedding_second_moments: Vec<f32>,
+
+    #[serde(default)]
+    pub embedding_lr_scale: f32,
+
+    #[serde(default)]
+    pub embedding_search_direction: f32,
+
+    #[serde(default)]
+    pub embedding_search_factor: f32,
 }
 
 
@@ -937,29 +922,14 @@ impl LM {
                 best_loss: state.best_loss,
                 plateau_count: state.plateau_count,
 
-                layer_second_moments:
-                state.layer_second_moments,
+                adam_first_moments:
+                state.adam_first_moments,
 
-                layer_first_moments:
-                state.layer_first_moments,
+                adam_second_moments:
+                state.adam_second_moments,
 
-                layer_lr_scales:
-                state.layer_lr_scales,
-
-                layer_search_direction:
-                state.layer_search_direction,
-
-                layer_search_factor:
-                state.layer_search_factor,
-
-                layer_adaptive_step:
-                state.layer_adaptive_step,
-
-                embedding_first_moments: state.embedding_first_moments,
-                embedding_lr_scale: state.embedding_lr_scale,
-                embedding_search_direction: state.embedding_search_direction,
-                embedding_search_factor: state.embedding_search_factor,
-                embedding_second_moments: state.embedding_second_moments
+                adam_step:
+                state.adam_step,
             };
 
             let bytes = bincode::serde::encode_to_vec(
@@ -1008,10 +978,17 @@ impl LM {
         );
     }
 
-    pub fn load_checkpoint(&mut self, path: &str, lr: Option<f32>) -> ResumeState {
-        let bytes = fs::read(path).unwrap();
+    pub fn load_checkpoint(
+        &mut self,
+        path: &str,
+        lr: Option<f32>,
+    ) -> ResumeState {
+        let bytes =
+            fs::read(path)
+                .unwrap();
 
-        let checkpoint: SavedCheckpoint =
+        let checkpoint:
+            SavedCheckpoint =
             match bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
@@ -1021,84 +998,97 @@ impl LM {
                 Err(_) => {
                     println!(
                         "Checkpoint uses legacy format; \
-                     initializing new adaptive LR search state."
+                     loading model/position and \
+                     initializing fresh Adam state."
                     );
 
-                    let (old, _): (SavedCheckpointV1, usize) =
+                    let (
+                        old,
+                        _,
+                    ): (
+                        SavedCheckpointV1,
+                        usize,
+                    ) =
                         bincode::serde::decode_from_slice(
                             &bytes,
                             bincode::config::standard(),
                         )
-                            .expect("Failed to load checkpoint as either current or legacy format.");
+                            .expect(
+                                "Failed to load checkpoint as either \
+                         current or legacy format."
+                            );
 
                     SavedCheckpoint {
-                        model: old.model,
+                        model:
+                        old.model,
 
-                        epoch: old.epoch,
-                        batch: old.batch,
-                        sample: old.sample,
+                        epoch:
+                        old.epoch,
 
-                        sampler_seed: old.sampler_seed,
-                        sampler_version: old.sampler_version,
-                        sampler_data_len: old.sampler_data_len,
+                        batch:
+                        old.batch,
 
-                        lr: old.lr,
-                        best_loss: old.best_loss,
-                        plateau_count: old.plateau_count,
+                        sample:
+                        old.sample,
 
-                        layer_second_moments:
-                        old.layer_second_moments,
+                        sampler_seed:
+                        old.sampler_seed,
 
-                        // Legacy checkpoints did not contain
-                        // the per-parameter first moment.
-                        layer_first_moments:
+                        sampler_version:
+                        old.sampler_version,
+
+                        sampler_data_len:
+                        old.sampler_data_len,
+
+                        lr:
+                        old.lr,
+
+                        best_loss:
+                        old.best_loss,
+
+                        plateau_count:
+                        old.plateau_count,
+
+                        // Old optimizer state deliberately discarded.
+                        adam_first_moments:
                         Vec::new(),
 
-                        layer_lr_scales:
-                        old.layer_lr_scales,
-
-                        layer_search_direction:
-                        old.layer_search_direction,
-
-                        layer_search_factor:
-                        old.layer_search_factor,
-
-                        layer_adaptive_step:
-                        old.layer_adaptive_step,
-
-                        // Legacy checkpoints did not contain
-                        // embedding optimizer state.
-                        embedding_first_moments:
+                        adam_second_moments:
                         Vec::new(),
 
-                        embedding_second_moments: Vec::new(),
-
-                        embedding_lr_scale:
-                        1.0,
-
-                        embedding_search_direction:
-                        1.0,
-
-                        embedding_search_factor:
-                        1.25,
+                        adam_step:
+                        0,
                     }
                 }
             };
 
-        self.vocab = checkpoint.model.vocab;
-        self.context_len = checkpoint.model.context_len;
-        self.hidden_layers = checkpoint.model.hidden_layers;
+        // ---------------------------------------------------------
+        // Restore model
+        // ---------------------------------------------------------
 
-        self.embeddings = Arc::new(
-            Embeddings::load(
-                checkpoint.model.embeddings
-            )
-        );
+        self.vocab =
+            checkpoint.model.vocab;
 
-        self.mlp = MLP::load_with_embeddings(
-            &checkpoint.model.mlp,
-            Arc::clone(&self.embeddings),
-        );
+        self.context_len =
+            checkpoint.model.context_len;
+
+        self.hidden_layers =
+            checkpoint.model.hidden_layers;
+
+        self.embeddings =
+            Arc::new(
+                Embeddings::load(
+                    checkpoint.model.embeddings
+                )
+            );
+
+        self.mlp =
+            MLP::load_with_embeddings(
+                &checkpoint.model.mlp,
+                Arc::clone(
+                    &self.embeddings
+                ),
+            );
 
         println!(
             "Loaded checkpoint: epoch {}, batch {}, sample {}.",
@@ -1107,56 +1097,59 @@ impl LM {
             checkpoint.sample,
         );
 
-        let lr_ = match lr {
-            Some(t) => t,
-            None => checkpoint.lr,
-        };
+        // ---------------------------------------------------------
+        // Learning rate
+        //
+        // Explicit LR overrides checkpoint LR.
+        // Otherwise resume using checkpoint LR.
+        // ---------------------------------------------------------
+
+        let lr_ =
+            match lr {
+                Some(value) => value,
+                None => checkpoint.lr,
+            };
+
+        // ---------------------------------------------------------
+        // Resume state
+        // ---------------------------------------------------------
 
         ResumeState {
-            epoch: checkpoint.epoch,
-            batch: checkpoint.batch,
-            sample: checkpoint.sample,
+            epoch:
+            checkpoint.epoch,
 
-            sampler_seed: checkpoint.sampler_seed,
-            sampler_version: checkpoint.sampler_version,
-            sampler_data_len: checkpoint.sampler_data_len,
+            batch:
+            checkpoint.batch,
 
-            lr: lr_,
-            best_loss: checkpoint.best_loss,
-            plateau_count: checkpoint.plateau_count,
+            sample:
+            checkpoint.sample,
 
-            layer_second_moments:
-            checkpoint.layer_second_moments,
+            sampler_seed:
+            checkpoint.sampler_seed,
 
-            layer_first_moments:
-            checkpoint.layer_first_moments,
+            sampler_version:
+            checkpoint.sampler_version,
 
-            layer_lr_scales:
-            checkpoint.layer_lr_scales,
+            sampler_data_len:
+            checkpoint.sampler_data_len,
 
-            layer_search_direction:
-            checkpoint.layer_search_direction,
+            lr:
+            lr_,
 
-            layer_search_factor:
-            checkpoint.layer_search_factor,
+            best_loss:
+            checkpoint.best_loss,
 
-            layer_adaptive_step:
-            checkpoint.layer_adaptive_step,
+            plateau_count:
+            checkpoint.plateau_count,
 
-            embedding_first_moments:
-            checkpoint.embedding_first_moments,
+            adam_first_moments:
+            checkpoint.adam_first_moments,
 
-            embedding_second_moments:
-            checkpoint.embedding_second_moments,
+            adam_second_moments:
+            checkpoint.adam_second_moments,
 
-            embedding_lr_scale:
-            checkpoint.embedding_lr_scale,
-
-            embedding_search_direction:
-            checkpoint.embedding_search_direction,
-
-            embedding_search_factor:
-            checkpoint.embedding_search_factor,
+            adam_step:
+            checkpoint.adam_step,
         }
     }
 
