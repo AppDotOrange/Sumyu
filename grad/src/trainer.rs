@@ -173,6 +173,35 @@ impl PermutationSampler {
     }
 }
 
+#[inline]
+fn derive_context_len(
+    sample: usize,
+    epoch: usize,
+    max_context_len: usize,
+) -> usize {
+    debug_assert!(max_context_len > 0);
+
+    // Deterministic per-sample/per-epoch mixing.
+    // This keeps checkpoint/resume exactly reproducible without
+    // storing another RNG state in the checkpoint.
+    let mut x =
+        (sample as u64)
+            .wrapping_add(
+                (epoch as u64)
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+            );
+
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D049BB133111EB);
+    x ^= x >> 31;
+
+    let min_context_len = max_context_len.min(8);
+
+    min_context_len + (x as usize % (max_context_len - min_context_len + 1))
+}
+
 pub enum TrainResult {
     Finished,
     Interrupted,
@@ -526,6 +555,7 @@ impl Trainer {
         update_frequency: usize,
         batch_update_frequency: Option<usize>,
         mut resume: Option<ResumeState>,
+        variable_context: bool,
         checkpoint_frequency: CheckpointFrequency,
         mut savefn: Option<
             &mut dyn FnMut(
@@ -893,8 +923,7 @@ impl Trainer {
                     * embeddings.embedding_dim()
             );
 
-        let mut output_grads =
-            Vec::<f32>::new();
+        let mut output_grads = Vec::<f32>::new();
 
         // =============================================================
         // Process epochs
@@ -903,17 +932,12 @@ impl Trainer {
         for epoch in
             start_epoch..self.epochs + 1
         {
-            let now =
-                Instant::now();
+            let now = Instant::now();
 
             let mut count: usize;
             let mut batches_done: usize;
-
-            let mut grad_sum =
-                0.0f32;
-
-            let mut total_loss =
-                0.0f32;
+            let mut grad_sum = 0.0f32;
+            let mut total_loss = 0.0f32;
 
             let sampler =
                 PermutationSampler::new(
@@ -929,16 +953,10 @@ impl Trainer {
             if let Some(state) =
                 resume_state.take()
             {
-                debug_assert_eq!(
-                    state.epoch,
-                    epoch
-                );
+                debug_assert_eq!(state.epoch, epoch);
 
-                count =
-                    state.sample;
-
-                batches_done =
-                    state.batch;
+                count = state.sample;
+                batches_done = state.batch;
 
                 println!(
                     "Continuing epoch {} from batch {}.",
@@ -946,15 +964,11 @@ impl Trainer {
                     batches_done,
                 );
             } else {
-                count =
-                    0;
-
-                batches_done =
-                    0;
+                count = 0;
+                batches_done = 0;
             }
 
-            let epoch_start_count =
-                count;
+            let epoch_start_count = count;
 
             let total_batches =
                 (
@@ -967,35 +981,16 @@ impl Trainer {
             // ---------------------------------------------------------
             // Timing
             // ---------------------------------------------------------
-
             #[cfg(feature = "timing")]
-            let mut encode_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut forward_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut loss_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut backward_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut embedding_grad_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut clear_tape_time =
-                Duration::ZERO;
-
-            #[cfg(feature = "timing")]
-            let mut update_time =
-                Duration::ZERO;
-
+            {
+                let mut encode_time = Duration::ZERO;
+                let mut forward_time = Duration::ZERO;
+                let mut loss_time = Duration::ZERO;
+                let mut backward_time = Duration::ZERO;
+                let mut embedding_grad_time = Duration::ZERO;
+                let mut clear_tape_time = Duration::ZERO;
+                let mut update_time = Duration::ZERO;
+            }
             // =========================================================
             // Batches
             // =========================================================
@@ -1022,6 +1017,8 @@ impl Trainer {
                 batch_ids.clear();
                 targets.clear();
 
+                const PAD_ID: u16 = 0;
+
                 for batch_index in
                     0..current_batch
                 {
@@ -1031,17 +1028,43 @@ impl Trainer {
                                 + batch_index
                         );
 
+                    let actual_context_len =
+                        if variable_context {
+                            derive_context_len(
+                                sample,
+                                epoch,
+                                context_len,
+                            )
+                        } else {
+                            context_len
+                        };
+
+                    let pad_len =
+                        context_len
+                            - actual_context_len;
+
+                    // Left-padding: actual context is always right-aligned,
+                    // exactly like generation.
+                    batch_ids.extend(
+                        std::iter::repeat_n(
+                            PAD_ID,
+                            pad_len,
+                        )
+                    );
+
                     batch_ids.extend_from_slice(
                         &tokens[
                             sample
-                                ..sample + context_len
+                                ..sample + actual_context_len
                             ]
                     );
 
+                    // Predict the token immediately after the actual context,
+                    // rather than after the maximum context length.
                     targets.push(
                         tokens[
                             sample
-                                + context_len
+                                + actual_context_len
                             ]
                     );
                 }
@@ -1051,8 +1074,7 @@ impl Trainer {
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
-                let timer =
-                    Instant::now();
+                let timer = Instant::now();
 
                 embeddings.encode_batch_into(
                     &batch_ids,
@@ -1062,18 +1084,14 @@ impl Trainer {
                 );
 
                 #[cfg(feature = "timing")]
-                {
-                    encode_time +=
-                        timer.elapsed();
-                }
+                { encode_time += timer.elapsed() }
 
                 // -----------------------------------------------------
                 // Forward
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
-                let timer =
-                    Instant::now();
+                let timer = Instant::now();
 
                 let forward =
                     mlp.forward_batch(
@@ -1083,10 +1101,7 @@ impl Trainer {
                     );
 
                 #[cfg(feature = "timing")]
-                {
-                    forward_time +=
-                        timer.elapsed();
-                }
+                { forward_time += timer.elapsed() }
 
                 // -----------------------------------------------------
                 // Softmax cross entropy
@@ -1094,29 +1109,21 @@ impl Trainer {
                 // softmax_cross_entropy_batch() returns SUM CE.
                 // -----------------------------------------------------
 
-                let output_size =
-                    forward.output_size;
+                let output_size = forward.output_size;
 
-                let grad_len =
-                    current_batch
-                        * output_size;
+                let grad_len = current_batch * output_size;
 
-                if output_grads.len()
-                    != grad_len
-                {
+                if output_grads.len() != grad_len {
                     output_grads.resize(
                         grad_len,
                         0.0,
                     );
                 } else {
-                    output_grads.fill(
-                        0.0
-                    );
+                    output_grads.fill(0.0);
                 }
 
                 #[cfg(feature = "timing")]
-                let timer =
-                    Instant::now();
+                let timer = Instant::now();
 
                 let batch_loss =
                     softmax_cross_entropy_batch(
@@ -1128,15 +1135,8 @@ impl Trainer {
                     );
 
                 if !batch_loss.is_finite() {
-                    println!(
-                        "Non-finite batch loss detected. \
-     Stopping training before optimizer update."
-                    );
-
-                    crate::clear_tape_after(
-                        parameter_boundary
-                    );
-
+                    println!("Non-finite batch loss detected. Stopping training before optimizer update.");
+                    crate::clear_tape_after(parameter_boundary);
                     return TrainResult::Finished;
                 }
 
@@ -1225,10 +1225,7 @@ impl Trainer {
                         params[param_index].grad();
 
                     if !raw_g.is_finite() {
-                        println!(
-                            "Non-finite MLP gradient detected before optimizer update. \
-Stopping training."
-                        );
+                        println!("Non-finite MLP gradient detected before optimizer update. Stopping training.");
 
                         crate::clear_tape_after(
                             parameter_boundary
@@ -1276,10 +1273,7 @@ Stopping training."
                         params[param_index].grad();
 
                     if !raw_g.is_finite() {
-                        println!(
-                            "Non-finite embedding gradient detected before optimizer update. \
-Stopping training."
-                        );
+                        println!("Non-finite embedding gradient detected before optimizer update. Stopping training.");
 
                         crate::clear_tape_after(
                             parameter_boundary
@@ -1462,8 +1456,7 @@ Stopping training."
                             };
 
                         let running_loss =
-                            if processed_samples
-                                > 0
+                            if processed_samples > 0
                             {
                                 total_loss
                                     / processed_samples
@@ -1739,14 +1732,11 @@ Stopping training."
 
                 #[cfg(feature = "timing")]
                 {
-                    let elapsed_secs =
-                        elapsed.as_secs_f64();
+                    let elapsed_secs = elapsed.as_secs_f64();
 
                     let pct =
                         |duration: Duration| {
-                            if elapsed_secs
-                                > 0.0
-                            {
+                            if elapsed_secs > 0.0 {
                                 duration
                                     .as_secs_f64()
                                     / elapsed_secs

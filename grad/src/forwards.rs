@@ -133,6 +133,343 @@ fn activation_bias_simd(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_aggregate_avx2(
+    input: &[f32],
+    write_probs: &[f32],
+    global_vectors: &mut [f32],
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    debug_assert_eq!(
+        input.len(),
+        batch_size * positions * channels
+    );
+
+    debug_assert_eq!(
+        write_probs.len(),
+        batch_size * positions * global_dim
+    );
+
+    debug_assert_eq!(
+        global_vectors.len(),
+        batch_size * global_dim * channels
+    );
+
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for g in 0..global_dim {
+            let global_offset =
+                global_base + g * channels;
+
+            let mut c = 0usize;
+
+            while c + 8 <= channels {
+                let mut acc =
+                    _mm256_setzero_ps();
+
+                for p in 0..positions {
+                    let prob =
+                        *write_probs.get_unchecked(
+                            probs_base
+                                + p * global_dim
+                                + g
+                        );
+
+                    let prob_v =
+                        _mm256_set1_ps(prob);
+
+                    let x =
+                        _mm256_loadu_ps(
+                            input.as_ptr()
+                                .add(
+                                    input_base
+                                        + p * channels
+                                        + c
+                                )
+                        );
+
+                    acc =
+                        _mm256_fmadd_ps(
+                            x,
+                            prob_v,
+                            acc,
+                        );
+                }
+
+                _mm256_storeu_ps(
+                    global_vectors
+                        .as_mut_ptr()
+                        .add(global_offset + c),
+                    acc,
+                );
+
+                c += 8;
+            }
+
+            while c < channels {
+                let mut sum =
+                    0.0f32;
+
+                for p in 0..positions {
+                    let prob =
+                        *write_probs.get_unchecked(
+                            probs_base
+                                + p * global_dim
+                                + g
+                        );
+
+                    let x =
+                        *input.get_unchecked(
+                            input_base
+                                + p * channels
+                                + c
+                        );
+
+                    sum +=
+                        prob * x;
+                }
+
+                *global_vectors.get_unchecked_mut(
+                    global_offset + c
+                ) = sum;
+
+                c += 1;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_readback_avx2(
+    input: &[f32],
+    output: &mut [f32],
+    read_probs: &[f32],
+    global_vectors: &[f32],
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    debug_assert_eq!(
+        input.len(),
+        output.len()
+    );
+
+    debug_assert_eq!(
+        read_probs.len(),
+        batch_size * positions * global_dim
+    );
+
+    debug_assert_eq!(
+        global_vectors.len(),
+        batch_size * global_dim * channels
+    );
+
+    // Start with the residual connection.
+    output.copy_from_slice(input);
+
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for p in 0..positions {
+            let output_offset =
+                input_base + p * channels;
+
+            for g in 0..global_dim {
+                let prob =
+                    *read_probs.get_unchecked(
+                        probs_base
+                            + p * global_dim
+                            + g
+                    );
+
+                let prob_v =
+                    _mm256_set1_ps(prob);
+
+                let global_offset =
+                    global_base
+                        + g * channels;
+
+                let mut c = 0usize;
+
+                while c + 8 <= channels {
+                    let y =
+                        _mm256_loadu_ps(
+                            output
+                                .as_ptr()
+                                .add(output_offset + c)
+                        );
+
+                    let global =
+                        _mm256_loadu_ps(
+                            global_vectors
+                                .as_ptr()
+                                .add(global_offset + c)
+                        );
+
+                    let y =
+                        _mm256_fmadd_ps(
+                            global,
+                            prob_v,
+                            y,
+                        );
+
+                    _mm256_storeu_ps(
+                        output
+                            .as_mut_ptr()
+                            .add(output_offset + c),
+                        y,
+                    );
+
+                    c += 8;
+                }
+
+                while c < channels {
+                    let index =
+                        output_offset + c;
+
+                    let global_index =
+                        global_offset + c;
+
+                    *output.get_unchecked_mut(index) +=
+                        prob
+                            * *global_vectors.get_unchecked(
+                            global_index
+                        );
+
+                    c += 1;
+                }
+            }
+        }
+    }
+}
+
+fn global_mixer_aggregate_scalar(
+    input: &[f32],
+    write_probs: &[f32],
+    global_vectors: &mut [f32],
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for g in 0..global_dim {
+            let global_offset =
+                global_base + g * channels;
+
+            for c in 0..channels {
+                let mut sum =
+                    0.0f32;
+
+                for p in 0..positions {
+                    let prob =
+                        write_probs[
+                            probs_base
+                                + p * global_dim
+                                + g
+                            ];
+
+                    let x =
+                        input[
+                            input_base
+                                + p * channels
+                                + c
+                            ];
+
+                    sum +=
+                        prob * x;
+                }
+
+                global_vectors[
+                    global_offset + c
+                    ] = sum;
+            }
+        }
+    }
+}
+
+fn global_mixer_readback_scalar(
+    input: &[f32],
+    output: &mut [f32],
+    read_probs: &[f32],
+    global_vectors: &[f32],
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    output.copy_from_slice(input);
+
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for p in 0..positions {
+            let output_offset =
+                input_base + p * channels;
+
+            for g in 0..global_dim {
+                let prob =
+                    read_probs[
+                        probs_base
+                            + p * global_dim
+                            + g
+                        ];
+
+                let global_offset =
+                    global_base
+                        + g * channels;
+
+                for c in 0..channels {
+                    output[
+                        output_offset + c
+                        ] +=
+                        prob
+                            * global_vectors[
+                            global_offset + c
+                            ];
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn channel_scale_avx2(
     input: &[f32],
     output: &mut [f32],
@@ -815,7 +1152,7 @@ pub fn weight_tying_forward(
     output
 }
 
-fn global_mixer_aggregate_blas(
+fn global_mixer_aggregate(
     input: &[f32],
     write_probs: &[f32],
     global_vectors: &mut [f32],
@@ -839,56 +1176,39 @@ fn global_mixer_aggregate_blas(
         batch_size * global_dim * channels
     );
 
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                global_mixer_aggregate_avx2(
+                    input,
+                    write_probs,
+                    global_vectors,
+                    batch_size,
+                    positions,
+                    channels,
+                    global_dim,
+                );
+            }
 
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        let input_batch =
-            &input[
-                input_base
-                    ..input_base + positions * channels
-                ];
-
-        let probs_batch =
-            &write_probs[
-                probs_base
-                    ..probs_base + positions * global_dim
-                ];
-
-        let global_batch =
-            &mut global_vectors[
-                global_base
-                    ..global_base + global_dim * channels
-                ];
-
-        unsafe {
-            cblas::sgemm(
-                Layout::RowMajor,
-                Transpose::Ordinary,
-                Transpose::None,
-                global_dim as i32,
-                channels as i32,
-                positions as i32,
-                1.0,
-                probs_batch,
-                global_dim as i32,
-                input_batch,
-                channels as i32,
-                0.0,
-                global_batch,
-                channels as i32,
-            );
+            return;
         }
     }
+
+    global_mixer_aggregate_scalar(
+        input,
+        write_probs,
+        global_vectors,
+        batch_size,
+        positions,
+        channels,
+        global_dim,
+    );
 }
 
-fn global_mixer_readback_blas(
+fn global_mixer_readback(
     input: &[f32],
     output: &mut [f32],
     read_probs: &[f32],
@@ -913,64 +1233,44 @@ fn global_mixer_readback_blas(
         batch_size * global_dim * channels
     );
 
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                global_mixer_readback_avx2(
+                    input,
+                    output,
+                    read_probs,
+                    global_vectors,
+                    batch_size,
+                    positions,
+                    channels,
+                    global_dim,
+                );
+            }
 
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        let probs_batch =
-            &read_probs[
-                probs_base
-                    ..probs_base + positions * global_dim
-                ];
-
-        let global_batch =
-            &global_vectors[
-                global_base
-                    ..global_base + global_dim * channels
-                ];
-
-        let output_batch =
-            &mut output[
-                input_base
-                    ..input_base + positions * channels
-                ];
-
-        unsafe {
-            cblas::sgemm(
-                Layout::RowMajor,
-                Transpose::None,
-                Transpose::None,
-                positions as i32,
-                channels as i32,
-                global_dim as i32,
-                1.0,
-                probs_batch,
-                global_dim as i32,
-                global_batch,
-                channels as i32,
-                0.0,
-                output_batch,
-                channels as i32,
-            );
+            return;
         }
     }
 
-    // Residual addition.
-    add_f32_slice_simd(
-        output,
+    global_mixer_readback_scalar(
         input,
+        output,
+        read_probs,
+        global_vectors,
+        batch_size,
+        positions,
+        channels,
+        global_dim,
     );
 }
 
 fn global_mixer_softmax_write(
     values: &mut [f32],
     biases: &[f32],
+    positional_biases: &[f32],
     batch_size: usize,
     positions: usize,
     global_dim: usize,
@@ -983,7 +1283,6 @@ fn global_mixer_softmax_write(
             let mut max_value =
                 f32::NEG_INFINITY;
 
-            // Find max, including bias.
             for p in 0..positions {
                 let index =
                     base
@@ -992,7 +1291,10 @@ fn global_mixer_softmax_write(
 
                 let value =
                     values[index]
-                        + biases[g];
+                        + biases[g]
+                        + positional_biases[
+                        p * global_dim + g
+                        ];
 
                 if value > max_value {
                     max_value = value;
@@ -1002,7 +1304,6 @@ fn global_mixer_softmax_write(
             let mut sum =
                 0.0f32;
 
-            // exp + store.
             for p in 0..positions {
                 let index =
                     base
@@ -1010,10 +1311,14 @@ fn global_mixer_softmax_write(
                         + g;
 
                 let value =
-                    (values[index]
-                        + biases[g]
-                        - max_value)
-                        .exp();
+                    (
+                        values[index]
+                            + biases[g]
+                            + positional_biases[
+                            p * global_dim + g
+                            ]
+                            - max_value
+                    ).exp();
 
                 values[index] =
                     value;
@@ -1030,7 +1335,8 @@ fn global_mixer_softmax_write(
                         + p * global_dim
                         + g;
 
-                values[index] *= inv_sum;
+                values[index] *=
+                    inv_sum;
             }
         }
     }
@@ -1039,6 +1345,7 @@ fn global_mixer_softmax_write(
 fn global_mixer_softmax_read(
     values: &mut [f32],
     biases: &[f32],
+    positional_biases: &[f32],
     batch_size: usize,
     positions: usize,
     global_dim: usize,
@@ -1050,13 +1357,22 @@ fn global_mixer_softmax_read(
         let base =
             row * global_dim;
 
+        let position =
+            row % positions;
+
+        let positional_base =
+            position * global_dim;
+
         let mut max_value =
             f32::NEG_INFINITY;
 
         for g in 0..global_dim {
             let value =
                 values[base + g]
-                    + biases[g];
+                    + biases[g]
+                    + positional_biases[
+                    positional_base + g
+                    ];
 
             if value > max_value {
                 max_value = value;
@@ -1071,10 +1387,14 @@ fn global_mixer_softmax_read(
                 base + g;
 
             let value =
-                (values[index]
-                    + biases[g]
-                    - max_value)
-                    .exp();
+                (
+                    values[index]
+                        + biases[g]
+                        + positional_biases[
+                        positional_base + g
+                        ]
+                        - max_value
+                ).exp();
 
             values[index] =
                 value;
@@ -1092,6 +1412,95 @@ fn global_mixer_softmax_read(
     }
 }
 
+pub const GLOBAL_MIXER_POS_FEATURES: usize = 4;
+
+#[inline]
+pub fn global_mixer_position_features(
+    positions: usize,
+) -> Vec<[f32; GLOBAL_MIXER_POS_FEATURES]> {
+    let mut features =
+        vec![
+            [0.0f32; GLOBAL_MIXER_POS_FEATURES];
+            positions
+        ];
+
+    if positions == 0 {
+        return features;
+    }
+
+    if positions == 1 {
+        // Center of the normalized range.
+        features[0] = [
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+
+        return features;
+    }
+
+    let denom =
+        (positions - 1) as f32;
+
+    for p in 0..positions {
+        let x =
+            2.0f32
+                * (p as f32 / denom)
+                - 1.0;
+
+        features[p] = [
+            x,
+            x * x,
+            (std::f32::consts::PI * x).sin(),
+            (std::f32::consts::PI * x).cos(),
+        ];
+    }
+
+    features
+}
+
+fn global_mixer_build_positional_biases(
+    features: &[[f32; GLOBAL_MIXER_POS_FEATURES]],
+    positional_weights: &[f32],
+    global_dim: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(
+        positional_weights.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES
+    );
+
+    let positions =
+        features.len();
+
+    let mut biases =
+        vec![
+            0.0f32;
+            positions * global_dim
+        ];
+
+    for p in 0..positions {
+        let f =
+            features[p];
+
+        let row =
+            p * global_dim;
+
+        for g in 0..global_dim {
+            let w =
+                g * GLOBAL_MIXER_POS_FEATURES;
+
+            biases[row + g] =
+                f[0] * positional_weights[w]
+                    + f[1] * positional_weights[w + 1]
+                    + f[2] * positional_weights[w + 2]
+                    + f[3] * positional_weights[w + 3];
+        }
+    }
+
+    biases
+}
+
 pub fn global_mixer_forward(
     layer: &GlobalMixerLayer,
     input: &[f32],
@@ -1101,6 +1510,8 @@ pub fn global_mixer_forward(
     write_biases: &[f32],
     read_weights: &[f32],
     read_biases: &[f32],
+    write_positional_weights: &[f32],
+    read_positional_weights: &[f32],
 ) -> (
     Vec<f32>,
     Vec<f32>,
@@ -1140,8 +1551,36 @@ pub fn global_mixer_forward(
         global_dim
     );
 
-    let rows =
-        batch_size * positions;
+    let rows = batch_size * positions;
+
+    debug_assert_eq!(
+        write_positional_weights.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES
+    );
+
+    debug_assert_eq!(
+        read_positional_weights.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES
+    );
+
+    let position_features =
+        global_mixer_position_features(
+            positions
+        );
+
+    let write_positional_biases =
+        global_mixer_build_positional_biases(
+            &position_features,
+            write_positional_weights,
+            global_dim,
+        );
+
+    let read_positional_biases =
+        global_mixer_build_positional_biases(
+            &position_features,
+            read_positional_weights,
+            global_dim,
+        );
 
     // ------------------------------------------------------------
     // Write projection:
@@ -1180,6 +1619,7 @@ pub fn global_mixer_forward(
     global_mixer_softmax_write(
         &mut write_probs,
         write_biases,
+        &write_positional_biases,
         batch_size,
         positions,
         global_dim,
@@ -1202,7 +1642,7 @@ pub fn global_mixer_forward(
                 * channels
         ];
 
-    global_mixer_aggregate_blas(
+    global_mixer_aggregate(
         input,
         &write_probs,
         &mut global_vectors,
@@ -1249,6 +1689,7 @@ pub fn global_mixer_forward(
     global_mixer_softmax_read(
         &mut read_probs,
         read_biases,
+        &read_positional_biases,
         batch_size,
         positions,
         global_dim,
@@ -1265,7 +1706,7 @@ pub fn global_mixer_forward(
     let mut output =
         vec![0.0f32; input.len()];
 
-    global_mixer_readback_blas(
+    global_mixer_readback(
         input,
         &mut output,
         &read_probs,
@@ -1817,6 +2258,26 @@ fn forward_layer_batch(
                     layer.read_bias_handles.len()
                 ];
 
+            let positional_count =
+                layer.global_dim
+                    * GLOBAL_MIXER_POS_FEATURES;
+
+            let mut write_positional_weights =
+                vec![0.0f32; positional_count];
+
+            let mut read_positional_weights =
+                vec![0.0f32; positional_count];
+
+            crate::handle_data_slice(
+                &layer.write_positional_weight_handles,
+                &mut write_positional_weights,
+            );
+
+            crate::handle_data_slice(
+                &layer.read_positional_weight_handles,
+                &mut read_positional_weights,
+            );
+
             crate::handle_data_slice(
                 &layer.write_weight_handles,
                 &mut write_weights,
@@ -1864,6 +2325,8 @@ fn forward_layer_batch(
                     &write_biases,
                     &read_weights,
                     &read_biases,
+                    &write_positional_weights,
+                    &read_positional_weights,
                 );
 
             let cache =
@@ -1875,18 +2338,15 @@ fn forward_layer_batch(
                     positions,
                     channels: layer.channels,
                     global_dim: layer.global_dim,
-                    write_weight_handles: Arc::clone(
-                        &layer.write_weight_handles
-                    ),
-                    write_bias_handles: Arc::clone(
-                        &layer.write_bias_handles
-                    ),
-                    read_weight_handles: Arc::clone(
-                        &layer.read_weight_handles
-                    ),
-                    read_bias_handles: Arc::clone(
-                        &layer.read_bias_handles
-                    ),
+
+                    write_weight_handles: Arc::clone(&layer.write_weight_handles),
+                    write_bias_handles: Arc::clone(&layer.write_bias_handles),
+
+                    read_weight_handles: Arc::clone(&layer.read_weight_handles),
+                    read_bias_handles: Arc::clone(&layer.read_bias_handles),
+
+                    write_positional_weight_handles: Arc::clone(&layer.write_positional_weight_handles),
+                    read_positional_weight_handles: Arc::clone(&layer.read_positional_weight_handles),
                 };
 
             (

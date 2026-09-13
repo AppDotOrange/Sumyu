@@ -26,7 +26,8 @@ impl ChatFNN {
             let _ = io::stdout().flush();
             let bot = &*self.lm.generate_gpt_chatter(context.clone(), max_gen_length, temperature);
             context.push_str(bot);
-            context.push_str("<EOT>\n\n<USER>");
+            context.push_str("<EOT>\n<USER>");
+            println!()
         }
     }
 }

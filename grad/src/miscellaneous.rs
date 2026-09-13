@@ -485,6 +485,8 @@ pub fn print_layer_specs(
                     "GlobalMixer channel mismatch"
                 );
 
+                const POSITIONAL_FEATURES: usize = 4;
+
                 let write_weights =
                     mixer_channels * global_dim;
 
@@ -497,11 +499,24 @@ pub fn print_layer_specs(
                 let read_biases =
                     *global_dim;
 
+                let write_positional_weights =
+                    *global_dim
+                        * POSITIONAL_FEATURES;
+
+                let read_positional_weights =
+                    *global_dim
+                        * POSITIONAL_FEATURES;
+
+                let positional_total =
+                    write_positional_weights
+                        + read_positional_weights;
+
                 let total =
                     write_weights
                         + write_biases
                         + read_weights
-                        + read_biases;
+                        + read_biases
+                        + positional_total;
 
                 println!(
                     "{}████████████████████████████████   GlobalMixer {}: [{} × {}] → [{} × {}]",
@@ -514,14 +529,28 @@ pub fn print_layer_specs(
                 );
 
                 println!(
-                    "{}                                  global dim {} | {} write weights + {} write biases + {} read weights + {} read biases = {} params",
+                    "{}                                  global dim {} | {} write weights + {} write biases + {} read weights + {} read biases",
                     prefix,
                     global_dim,
                     write_weights,
                     write_biases,
                     read_weights,
                     read_biases,
-                    total
+                );
+
+                println!(
+                    "{}                                  positional features {} | {} write positional + {} read positional = {} params",
+                    prefix,
+                    POSITIONAL_FEATURES,
+                    write_positional_weights,
+                    read_positional_weights,
+                    positional_total,
+                );
+
+                println!(
+                    "{}                                  TOTAL = {} params",
+                    prefix,
+                    total,
                 );
 
                 // GlobalMixer preserves both sequence length

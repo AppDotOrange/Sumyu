@@ -115,6 +115,14 @@ pub enum SavedLayer {
 
         read_weights: Vec<f32>,
         read_biases: Vec<f32>,
+
+        // Added in save format v3.
+        // `serde(default)` keeps older v1/v2 models loadable.
+        #[serde(default)]
+        write_positional_weights: Vec<f32>,
+
+        #[serde(default)]
+        read_positional_weights: Vec<f32>,
     },
 }
 #[derive(Clone)]
@@ -300,6 +308,9 @@ pub enum BatchLayerCache {
 
         read_weight_handles: Arc<[TensorHandle]>,
         read_bias_handles: Arc<[TensorHandle]>,
+
+        write_positional_weight_handles: Arc<[TensorHandle]>,
+        read_positional_weight_handles: Arc<[TensorHandle]>,
     },
 }
 
@@ -962,18 +973,32 @@ impl LayerNormLayer {
 pub struct GlobalMixerLayer {
     pub(crate) channels: usize,
     pub(crate) global_dim: usize,
-
     pub(crate) write_weights: Vec<Tensor>,
     pub(crate) write_biases: Vec<Tensor>,
-
     pub(crate) read_weights: Vec<Tensor>,
     pub(crate) read_biases: Vec<Tensor>,
-
+    // Layout:
+    //
+    // [g0 f0, g0 f1, g0 f2, g0 f3,
+    //  g1 f0, g1 f1, g1 f2, g1 f3, ...]
+    //
+    // where:
+    //
+    // f0 = x
+    // f1 = x²
+    // f2 = sin(πx)
+    // f3 = cos(πx)
+    //
+    // These are initialized to zero so the initial mixer
+    // is mathematically identical to the old mixer.
+    pub(crate) write_positional_weights: Vec<Tensor>,
+    pub(crate) read_positional_weights: Vec<Tensor>,
     pub(crate) write_weight_handles: Arc<[TensorHandle]>,
     pub(crate) write_bias_handles: Arc<[TensorHandle]>,
-
     pub(crate) read_weight_handles: Arc<[TensorHandle]>,
     pub(crate) read_bias_handles: Arc<[TensorHandle]>,
+    pub(crate) write_positional_weight_handles: Arc<[TensorHandle]>,
+    pub(crate) read_positional_weight_handles: Arc<[TensorHandle]>,
 }
 
 impl GlobalMixerLayer {
@@ -1036,6 +1061,43 @@ impl GlobalMixerLayer {
             );
         }
 
+        const POS_FEATURES: usize = 4;
+
+        let positional_count =
+            global_dim * POS_FEATURES;
+
+        // Zero initialization is intentional:
+        //
+        // pos_bias == 0
+        //
+        // so the new GlobalMixer starts exactly like
+        // the old one and learns positional routing from scratch.
+        let write_positional_weights =
+            (0..positional_count)
+                .map(|_| Tensor::new(0.0))
+                .collect::<Vec<_>>();
+
+        let read_positional_weights =
+            (0..positional_count)
+                .map(|_| Tensor::new(0.0))
+                .collect::<Vec<_>>();
+
+        let write_positional_weight_handles:
+            Arc<[TensorHandle]> =
+            write_positional_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
+        let read_positional_weight_handles:
+            Arc<[TensorHandle]> =
+            read_positional_weights
+                .iter()
+                .map(|x| x.handle)
+                .collect::<Vec<_>>()
+                .into();
+
         let write_weight_handles: Arc<[TensorHandle]> =
             write_weights
                 .iter()
@@ -1074,11 +1136,17 @@ impl GlobalMixerLayer {
             read_weights,
             read_biases,
 
+            write_positional_weights,
+            read_positional_weights,
+
             write_weight_handles,
             write_bias_handles,
 
             read_weight_handles,
             read_bias_handles,
+
+            write_positional_weight_handles,
+            read_positional_weight_handles,
         }
     }
 
@@ -1088,13 +1156,16 @@ impl GlobalMixerLayer {
             self.write_weights.len()
                 + self.write_biases.len()
                 + self.read_weights.len()
-                + self.read_biases.len(),
+                + self.read_biases.len()
+                + self.write_positional_weights.len()
+                + self.read_positional_weights.len(),
         );
-
         params.extend_from_slice(&self.write_weights);
         params.extend_from_slice(&self.write_biases);
         params.extend_from_slice(&self.read_weights);
         params.extend_from_slice(&self.read_biases);
+        params.extend_from_slice(&self.write_positional_weights);
+        params.extend_from_slice(&self.read_positional_weights);
 
         params
     }
@@ -1528,7 +1599,7 @@ impl MLP {
 
     pub fn save(&self) -> SavedMLP {
         SavedMLP {
-            version: 2,
+            version: 3,
             layers: self.layers
                 .iter()
                 .map(save_layer)
@@ -1538,7 +1609,9 @@ impl MLP {
 
     pub fn load(saved: &SavedMLP) -> Self {
         assert!(
-            saved.version == 1 || saved.version == 2,
+            saved.version == 1
+                || saved.version == 2
+                || saved.version == 3,
             "Unsupported MLP save version: {}",
             saved.version
         );
@@ -1557,7 +1630,9 @@ impl MLP {
         embeddings: Arc<Embeddings>,
     ) -> Self {
         assert!(
-            saved.version == 1 || saved.version == 2,
+            saved.version == 1
+                || saved.version == 2
+                || saved.version == 3,
             "Unsupported MLP save version: {}",
             saved.version
         );
@@ -1796,6 +1871,18 @@ fn save_layer(layer: &Layer) -> SavedLayer {
 
                 read_biases: layer
                     .read_biases
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                write_positional_weights: layer
+                    .write_positional_weights
+                    .iter()
+                    .map(|x| x.data())
+                    .collect(),
+
+                read_positional_weights: layer
+                    .read_positional_weights
                     .iter()
                     .map(|x| x.data())
                     .collect(),
@@ -2265,6 +2352,8 @@ fn load_layer(
             write_biases,
             read_weights,
             read_biases,
+            write_positional_weights,
+            read_positional_weights,
         } => {
             assert!(
                 *channels > 0,
@@ -2340,6 +2429,61 @@ fn load_layer(
                 .map(|x| x.handle)
                 .collect();
 
+            const POS_FEATURES: usize = 4;
+
+            let positional_count =
+                global_dim * POS_FEATURES;
+
+            let write_positional_weights =
+                if write_positional_weights.is_empty() {
+                    vec![0.0f32; positional_count]
+                } else {
+                    assert_eq!(
+                        write_positional_weights.len(),
+                        positional_count,
+                        "Invalid GlobalMixer write positional weight count"
+                    );
+
+                    write_positional_weights.clone()
+                };
+
+            let read_positional_weights =
+                if read_positional_weights.is_empty() {
+                    vec![0.0f32; positional_count]
+                } else {
+                    assert_eq!(
+                        read_positional_weights.len(),
+                        positional_count,
+                        "Invalid GlobalMixer read positional weight count"
+                    );
+
+                    read_positional_weights.clone()
+                };
+
+            let write_positional_weights =
+                write_positional_weights
+                    .iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+            let read_positional_weights =
+                read_positional_weights
+                    .iter()
+                    .map(|&x| Tensor::new(x))
+                    .collect::<Vec<_>>();
+
+            let write_positional_weight_handles =
+                write_positional_weights
+                    .iter()
+                    .map(|x| x.handle)
+                    .collect();
+
+            let read_positional_weight_handles =
+                read_positional_weights
+                    .iter()
+                    .map(|x| x.handle)
+                    .collect();
+
             Layer::GlobalMixer(
                 GlobalMixerLayer {
                     channels: *channels,
@@ -2351,11 +2495,17 @@ fn load_layer(
                     read_weights,
                     read_biases,
 
+                    write_positional_weights,
+                    read_positional_weights,
+
                     write_weight_handles,
                     write_bias_handles,
 
                     read_weight_handles,
                     read_bias_handles,
+
+                    write_positional_weight_handles,
+                    read_positional_weight_handles,
                 }
             )
         }

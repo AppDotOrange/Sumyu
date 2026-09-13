@@ -16,6 +16,7 @@ use std::arch::x86_64::{
 };
 
 use crate::conv1d_backward::backward_direct;
+use crate::forwards::{global_mixer_position_features, GLOBAL_MIXER_POS_FEATURES};
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
 
 pub struct BackwardWorkspace {
@@ -44,6 +45,9 @@ pub struct BackwardWorkspace {
 
     mixer_global_grads: Vec<f32>,
     mixer_score_grads: Vec<f32>,
+
+    mixer_pos_grads_write: Vec<f32>,
+    mixer_pos_grads_read: Vec<f32>,
 }
 
 impl BackwardWorkspace {
@@ -74,6 +78,9 @@ impl BackwardWorkspace {
 
             mixer_global_grads: Vec::new(),
             mixer_score_grads: Vec::new(),
+
+            mixer_pos_grads_write: Vec::new(),
+            mixer_pos_grads_read: Vec::new(),
         }
     }
 }
@@ -2147,6 +2154,87 @@ fn global_mixer_read_softmax_backward_scalar(
     }
 }
 
+fn global_mixer_positional_backward(
+    score_grads: &[f32],
+    position_features: &[[f32; GLOBAL_MIXER_POS_FEATURES]],
+    batch_size: usize,
+    positions: usize,
+    global_dim: usize,
+    output_grads: &mut [f32],
+) {
+    debug_assert_eq!(
+        score_grads.len(),
+        batch_size
+            * positions
+            * global_dim
+    );
+
+    debug_assert_eq!(
+        output_grads.len(),
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES
+    );
+
+    output_grads.fill(0.0);
+
+    for g in 0..global_dim {
+        let weight_base =
+            g * GLOBAL_MIXER_POS_FEATURES;
+
+        let mut grad0 =
+            0.0f32;
+
+        let mut grad1 =
+            0.0f32;
+
+        let mut grad2 =
+            0.0f32;
+
+        let mut grad3 =
+            0.0f32;
+
+        for b in 0..batch_size {
+            let score_base =
+                b * positions * global_dim;
+
+            for p in 0..positions {
+                let ds =
+                    score_grads[
+                        score_base
+                            + p * global_dim
+                            + g
+                        ];
+
+                let f =
+                    position_features[p];
+
+                grad0 +=
+                    ds * f[0];
+
+                grad1 +=
+                    ds * f[1];
+
+                grad2 +=
+                    ds * f[2];
+
+                grad3 +=
+                    ds * f[3];
+            }
+        }
+
+        output_grads[weight_base] =
+            grad0;
+
+        output_grads[weight_base + 1] =
+            grad1;
+
+        output_grads[weight_base + 2] =
+            grad2;
+
+        output_grads[weight_base + 3] =
+            grad3;
+    }
+}
 
 // ============================================================
 // GlobalMixer backward
@@ -2166,10 +2254,13 @@ pub fn global_mixer_backward(
     write_bias_handles: &[TensorHandle],
     read_weight_handles: &[TensorHandle],
     read_bias_handles: &[TensorHandle],
+    write_positional_weight_handles: &[TensorHandle],
+    read_positional_weight_handles: &[TensorHandle],
     workspace: &mut BackwardWorkspace,
 ) -> Vec<f32> {
-    let rows =
-        batch_size * positions;
+    let rows = batch_size * positions;
+
+    let position_features = global_mixer_position_features(positions);
 
     debug_assert_eq!(
         input.len(),
@@ -2216,6 +2307,16 @@ pub fn global_mixer_backward(
     debug_assert_eq!(
         read_bias_handles.len(),
         global_dim,
+    );
+
+    debug_assert_eq!(
+        write_positional_weight_handles.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES,
+    );
+
+    debug_assert_eq!(
+        read_positional_weight_handles.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES,
     );
 
     #[cfg(target_arch = "x86_64")]
@@ -2656,6 +2757,39 @@ pub fn global_mixer_backward(
     }
 
     // ============================================================
+    // 3b. Positional read gradients
+    //
+    // dQ_read[g,k] =
+    //     sum_p dScore[p,g] * Feature[p,k]
+    //
+    // The positional features are deterministic, so there is
+    // no gradient path into the input tensor.
+    // ============================================================
+
+    workspace
+        .mixer_pos_grads_read
+        .resize(
+            global_dim
+                * GLOBAL_MIXER_POS_FEATURES,
+            0.0,
+        );
+
+    global_mixer_positional_backward(
+        &workspace.mixer_score_grads,
+        &position_features,
+        batch_size,
+        positions,
+        global_dim,
+        &mut workspace
+            .mixer_pos_grads_read,
+    );
+
+    crate::add_handle_grad_slices(
+        read_positional_weight_handles,
+        &workspace.mixer_pos_grads_read,
+    );
+
+    // ============================================================
     // 4. dW_read = dS_read^T X
     //
     //     [G,R] * [R,C] -> [G,C]
@@ -3054,6 +3188,34 @@ pub fn global_mixer_backward(
             }
         }
     }
+
+    // ============================================================
+    // 8b. Positional write gradients
+    // ============================================================
+
+    workspace
+        .mixer_pos_grads_write
+        .resize(
+            global_dim
+                * GLOBAL_MIXER_POS_FEATURES,
+            0.0,
+        );
+
+    global_mixer_positional_backward(
+        &workspace.mixer_score_grads,
+        &position_features,
+        batch_size,
+        positions,
+        global_dim,
+        &mut workspace
+            .mixer_pos_grads_write,
+    );
+
+    crate::add_handle_grad_slices(
+        write_positional_weight_handles,
+        &workspace
+            .mixer_pos_grads_write,
+    );
 
     // ============================================================
     // 9. dW_write = dS_write^T X
@@ -3758,6 +3920,8 @@ fn backward_layer_batch(
             write_bias_handles,
             read_weight_handles,
             read_bias_handles,
+            write_positional_weight_handles,
+            read_positional_weight_handles,
         } => {
             global_mixer_backward(
                 input,
@@ -3773,6 +3937,8 @@ fn backward_layer_batch(
                 write_bias_handles,
                 read_weight_handles,
                 read_bias_handles,
+                write_positional_weight_handles,
+                read_positional_weight_handles,
                 workspace,
             )
         }

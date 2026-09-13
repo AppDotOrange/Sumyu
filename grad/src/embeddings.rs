@@ -192,8 +192,7 @@ impl Embeddings {
         batch_size: usize,
         context_len: usize,
     ) {
-        let input_size =
-            context_len * self.embedding_dim;
+        let input_size = context_len * self.embedding_dim;
 
         debug_assert_eq!(
             ids.len(),
@@ -209,17 +208,14 @@ impl Embeddings {
             let mut tape = t.borrow_mut();
 
             for b in 0..batch_size {
-                let sample_start =
-                    b * context_len;
+                let sample_start = b * context_len;
 
-                let grad_start =
-                    b * input_size;
+                let grad_start = b * input_size;
 
                 for position in 0..context_len {
                     let token = ids[sample_start + position] as usize;
 
-                    let embedding_start =
-                        token * self.embedding_dim;
+                    let embedding_start = token * self.embedding_dim;
 
                     let grad_start =
                         grad_start
@@ -231,17 +227,14 @@ impl Embeddings {
                                 + embedding_start
                                 + i;
 
-                        let grad =
-                            input_grads[grad_start + i];
+                        let grad = input_grads[grad_start + i];
 
                         if let Node::Scalar(node) =
                             &mut tape.nodes[node_id]
                         {
                             node.grad += grad;
                         } else {
-                            unreachable!(
-                                "Embedding node is not Scalar"
-                            );
+                            unreachable!("Embedding node is not Scalar");
                         }
                     }
                 }

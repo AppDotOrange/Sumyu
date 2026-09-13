@@ -836,7 +836,21 @@ impl LM {
         checkpoint_frequency: CheckpointFrequency,
         lr: Option<f32>,
         seed: Option<u64>,
+        variable_context: bool,
+        threads: i32,
     ) {
+        assert!(
+            threads > 0,
+            "Must use at least one thread!"
+        );
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+            fn openblas_get_num_threads() -> i32;
+        }
+        unsafe {
+            openblas_set_num_threads(threads);
+            println!("OpenBLAS threads: {}", openblas_get_num_threads());
+        }
         // ---------------------------------------------------------
         // Load an existing checkpoint, if supplied.
         // ---------------------------------------------------------
@@ -967,6 +981,7 @@ impl LM {
             1,
             batch_update_frequency,
             resume_state,
+            variable_context,
             checkpoint_frequency,
             savefn,
             &mut self.mlp,

@@ -28,7 +28,8 @@ fn main() {
     //let oasst1 = fs::read_to_string("Datasets/oasst1.txt").expect("Can't read oasst1.txt!").replace("\r\n", "\n");
     //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
     //let fineweb2 = fs::read_to_string("Datasets/fineweb_v2.txt").expect("Can't read fineweb_v2.txt!");
-    let fineweb3 = fs::read_to_string("Datasets/fineweb_v3.txt").expect("Can't read fineweb_v3.txt!");
+    //let fineweb3 = fs::read_to_string("Datasets/fineweb_v3.txt").expect("Can't read fineweb_v3.txt!");
+    let tinychat = fs::read_to_string("Datasets/tinychat.txt").expect("Can't read tinychat.txt!");
     let test = 16;
     if test == -3 {
         #[cfg(target_arch = "x86_64")]
@@ -201,18 +202,10 @@ fn main() {
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(3);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         let mut lm = LM::from_config(config);
         lm.params();
         lm.load_corpus(&recipe_full);
-        lm.train(None, None, None, CheckpointFrequency::Disabled, None, None);
+        lm.train(None, None, None, CheckpointFrequency::Disabled, None, None, false, 3);
         lm.save(
             "RecipeP4.sumyu",
             &description,
@@ -232,14 +225,6 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         //let mut lm = LM::from_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         //*
         let (description, mut lm) = LM::load("Production/ChatterP1-preview.sumyu");
         lm.train_options(0.01, 10, 128, 0);
@@ -253,6 +238,8 @@ fn main() {
             CheckpointFrequency::EveryBatch(1000),
             Some(0.01),
             None,
+            false,
+            4,
         );
         lm.save(
             "ChatterP2.sumyu",
@@ -279,14 +266,6 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         /*
         let (description, mut lm) = LM::load("Production/ChatterP1-preview.sumyu");
         lm.train_options(0.01, 1, 256, 0);
@@ -300,20 +279,14 @@ fn main() {
             CheckpointFrequency::EveryBatch(1000),
             Some(0.08),
             None,
+            false,
+            4,
         );
         lm.save(
             "pretrainV2.sumyu",
             description,
         );
     } else if test == 12 {
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         //*
         let description = "Conv1D recipe experiment.";
 
@@ -457,6 +430,8 @@ fn main() {
             CheckpointFrequency::Disabled,
             None,
             None,
+            false,
+            4,
         );
         lm.save("MiniRecipe.sumyu", &description);
     } else if test == 13 {
@@ -471,14 +446,6 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_hybrid_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         /*
         let (description, mut lm) = LM::load("pretrainV2.sumyu");
         lm.train_options(0.55, 1, 256, 0);
@@ -492,6 +459,8 @@ fn main() {
             CheckpointFrequency::EveryBatch(1000),
             Some(0.3),
             None,
+            false,
+            4,
         );
         lm.save(
             "pretrainV4.sumyu",
@@ -509,14 +478,6 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_hybrid_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         /*
         let (description, mut lm) = LM::load("pretrainV2.sumyu");
         lm.train_options(0.55, 1, 256, 0);
@@ -530,6 +491,8 @@ fn main() {
             CheckpointFrequency::EveryBatch(1000),
             Some(0.2),
             None,
+            false,
+            4,
         );
         lm.save(
             "pretrainV5.sumyu",
@@ -547,14 +510,6 @@ fn main() {
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_hybrid_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
         /*
         let (description, mut lm) = LM::load("pretrainV2.sumyu");
         lm.train_options(0.55, 1, 256, 0);
@@ -568,6 +523,8 @@ fn main() {
             CheckpointFrequency::EveryBatch(1000),
             Some(0.3),
             None,
+            false,
+            4,
         );
         lm.save(
             "pretrainV6.sumyu",
@@ -578,37 +535,27 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::fineweb_hybrid_v9_to(1e-3, 512, 1);
-        let description = "A large Sumyu Hybrid model pre-trained on the FineWeb dataset family.";
+        let config = helper::tinychat_v3_hybrid(1e-3, 256, 1);
+        let description = "A large Sumyu Hybrid model trained on TinyChat.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_hybrid_config(config);
-        unsafe extern "C" {
-            fn openblas_set_num_threads(num_threads: i32);
-            fn openblas_get_num_threads() -> i32;
-        }
-        unsafe {
-            openblas_set_num_threads(4);
-            println!("OpenBLAS threads: {}", openblas_get_num_threads());
-        }
-        /*
-        let (description, mut lm) = LM::load("pretrainV2.sumyu");
-        lm.train_options(0.55, 1, 256, 0);
-        */
         lm.params();
-        lm.load_corpus(&fineweb3);
+        lm.load_corpus(&tinychat);
         lm.train(
             Some(10),
             None,
-            Some("pretraining_v9/pretrainConV9"),
+            Some("tinychat3/MiniChatterV3"),
             CheckpointFrequency::EveryBatch(500),
             None,
             None,
+            true,
+            4,
         );
         lm.save(
-            "pretrainV9.sumyu",
+            "MiniChatterV3.sumyu",
             &description,
         );
     }
