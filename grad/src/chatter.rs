@@ -13,7 +13,7 @@ impl ChatFNN {
         }
     }
 
-    pub fn start_chat(&self, max_gen_length: usize, temperature: f32) {
+    pub fn start_chat(&self, max_gen_length: usize, temperature: f32, threads: usize) {
         let mut context = "<USER>".to_string();
         loop {
             print!("USER: ");
@@ -24,7 +24,7 @@ impl ChatFNN {
             context.push_str("<EOT>\n<BOT>");
             print!("BOT: ");
             let _ = io::stdout().flush();
-            let bot = &*self.lm.generate_gpt_chatter(context.clone(), max_gen_length, temperature);
+            let bot = &*self.lm.generate_gpt_chatter(context.clone(), max_gen_length, temperature, threads);
             context.push_str(bot);
             context.push_str("<EOT>\n<USER>");
             println!()

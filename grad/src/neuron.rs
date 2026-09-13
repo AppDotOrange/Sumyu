@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use rayon::ThreadPool;
 use rand_distr::{Distribution, Normal as NormalDist};
 use serde::{Deserialize, Serialize};
 use crate::{Tensor, TensorHandle, embeddings::Embeddings};
@@ -1224,11 +1225,6 @@ impl Layer {
     }
 }
 
-#[derive(Clone)]
-pub struct MLP {
-    layers: Vec<Layer>,
-}
-
 fn build_layers(
     current_size: usize,
     specs: &[LayerSpec],
@@ -1499,6 +1495,26 @@ fn layer_output_size(layer: &Layer, current_size: usize) -> usize {
     }
 }
 
+fn build_thread_pool(num_threads: usize) -> Arc<ThreadPool> {
+    assert!(
+        num_threads > 0,
+        "MLP thread count must be greater than zero"
+    );
+
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .expect("failed to build Rayon thread pool")
+    )
+}
+
+#[derive(Clone)]
+pub struct MLP {
+    layers: Vec<Layer>,
+    thread_pool: Arc<ThreadPool>,
+}
+
 impl MLP {
     pub fn new(num_inputs: usize, layer_sizes: &[usize]) -> Self {
         let specs = layer_sizes
@@ -1517,6 +1533,11 @@ impl MLP {
         Self::from_layers(num_inputs, &specs)
     }
 
+    pub fn set_num_threads(&mut self, num_threads: usize) {
+        self.thread_pool =
+            build_thread_pool(num_threads);
+    }
+
     pub fn from_layers(
         num_inputs: usize,
         specs: &[LayerSpec],
@@ -1528,7 +1549,10 @@ impl MLP {
                 None,
             );
 
-        Self { layers }
+        Self {
+            layers,
+            thread_pool: build_thread_pool(1),
+        }
     }
 
     pub fn from_layers_with_embeddings(
@@ -1543,7 +1567,10 @@ impl MLP {
                 Some(&embeddings),
             );
 
-        Self { layers }
+        Self {
+            layers,
+            thread_pool: build_thread_pool(1),
+        }
     }
 
     pub(crate) fn forward_batch(
@@ -1563,6 +1590,7 @@ impl MLP {
                 input,
                 batch_size,
                 input_size,
+                &self.thread_pool,
             );
 
         BatchForward {
@@ -1622,6 +1650,7 @@ impl MLP {
                 .iter()
                 .map(|layer| load_layer(layer, None))
                 .collect(),
+            thread_pool: build_thread_pool(1),
         }
     }
 
@@ -1648,6 +1677,7 @@ impl MLP {
                     )
                 })
                 .collect(),
+            thread_pool: build_thread_pool(1),
         }
     }
 

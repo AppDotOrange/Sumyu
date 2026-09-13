@@ -21,5 +21,5 @@ fn main() {
     );
     */
     let chatter = ChatFNN::new(lm);
-    chatter.start_chat(tokens, 0.7);
+    chatter.start_chat(tokens, 0.7, 4);
 }

@@ -380,6 +380,7 @@ impl LM {
         &self,
         ids: &[u16],
         temp: f32,
+        threads: usize,
     ) -> usize {
         let input = self.embeddings.encode_batch(
             ids,
@@ -447,6 +448,7 @@ impl LM {
         &self,
         context: String,
         temp: f32,
+        threads: usize,
     ) -> String {
         let mut ids =
             self.encode_nums(context);
@@ -472,12 +474,13 @@ impl LM {
             self.generate_one_ids(
                 &ids,
                 temp,
+                threads,
             );
 
         self.vocab[idx].clone()
     }
 
-    pub fn generate_one_distribution(&self, context: String, top_k: usize) {
+    pub fn generate_one_distribution(&self, context: String, top_k: usize, threads: usize) {
         let mut ids = self.encode_nums(context);
         if ids.len() > self.context_len as usize {
             ids = ids[ids.len() - self.context_len as usize..ids.len()].to_owned();
@@ -529,12 +532,13 @@ impl LM {
         context: String,
         gen_length: usize,
         temp: f32,
+        threads: usize,
     ) -> String {
         let mut context_ = context;
         let mut tokens = Vec::<String>::new();
 
         for _ in 0..gen_length {
-            let token = self.generate_one(context_.clone(), temp);
+            let token = self.generate_one(context_.clone(), temp, threads);
 
             context_.push_str(&token);
             tokens.push(token);
@@ -548,6 +552,7 @@ impl LM {
         context: String,
         gen_length: usize,
         temp: f32,
+        threads: usize,
     ) -> String {
         let trie =
             crate::helper::Trie::from_vocab(
@@ -634,6 +639,7 @@ impl LM {
                 self.generate_one_ids(
                     &*ids,
                     temp,
+                    threads,
                 );
 
             let generation =
@@ -675,6 +681,7 @@ impl LM {
         context: String,
         gen_length: usize,
         temp: f32,
+        threads: usize,
     ) -> String {
         let trie =
             crate::helper::Trie::from_vocab(
@@ -712,6 +719,7 @@ impl LM {
                 self.generate_one_ids(
                     &*ids,
                     temp,
+                    threads,
                 );
 
             let generation =
@@ -990,6 +998,7 @@ impl LM {
             &self.embeddings,
             params,
             seed.unwrap_or(PermutationSampler::DEFAULT_SEED),
+            threads as usize,
         );
     }
 

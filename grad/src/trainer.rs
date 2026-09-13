@@ -330,6 +330,7 @@ impl Trainer {
         mlp: &mut MLP,
         dataset: &mut [(Vec<Tensor>, Vec<f32>)],
         params: Vec<Tensor>,
+        threads: usize,
     ) -> TrainResult {
         let param_count = params.len() as f32;
 
@@ -381,6 +382,8 @@ impl Trainer {
                 "All targets must have the same size"
             );
         }
+
+        mlp.set_num_threads(threads);
 
         let mut indices: Vec<usize> = (0..data_len).collect();
 
@@ -570,6 +573,7 @@ impl Trainer {
         embeddings: &Embeddings,
         params: Vec<Tensor>,
         sampler_seed: u64,
+        threads: usize,
     ) -> TrainResult {
         let param_count =
             params.len() as f32;
@@ -641,6 +645,8 @@ impl Trainer {
         if self.batch_size == 0 {
             self.batch_size = data_len;
         }
+
+        mlp.set_num_threads(threads);
 
         // =============================================================
         // Basic training state

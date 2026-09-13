@@ -15,6 +15,7 @@ use std::arch::x86_64::{
     _CMP_LE_OQ,
 };
 use cblas::{Layout, Transpose};
+use rayon::ThreadPool;
 use crate::backwards::add_f32_slice_simd;
 use crate::neuron::{Activation, BatchLayerCache, ChannelScaleLayer, GlobalMixerLayer, Layer, LowRankPointwiseLayer, WeightTyingLayer};
 use crate::conv1d_kernels::conv1d_forward;
@@ -1730,6 +1731,7 @@ pub fn forward_layers_batch(
     input: &[f32],
     batch_size: usize,
     input_size: usize,
+    thread_pool: &ThreadPool,
 ) -> (Vec<f32>, usize, Vec<BatchLayerCache>) {
     let mut current = input.to_vec();
     let mut current_size = input_size;
@@ -1737,7 +1739,7 @@ pub fn forward_layers_batch(
 
     for layer in layers {
         let (output, output_size, cache) =
-            forward_layer_batch(layer, &current, batch_size, current_size);
+            forward_layer_batch(layer, &current, batch_size, current_size, thread_pool);
 
         current = output;
         current_size = output_size;
@@ -1752,6 +1754,7 @@ fn forward_layer_batch(
     input: &[f32],
     batch_size: usize,
     input_size: usize,
+    thread_pool: &ThreadPool,
 ) -> (Vec<f32>, usize, BatchLayerCache) {
     match layer {
         Layer::Dense(layer) => {
@@ -1878,6 +1881,7 @@ fn forward_layer_batch(
                 input,
                 batch_size,
                 input_size,
+                thread_pool,
             );
 
             assert_eq!(
@@ -1923,6 +1927,7 @@ fn forward_layer_batch(
                     batch_size,
                     input_length,
                     output_length,
+                    thread_pool,
                 );
 
             let output_size =

@@ -27,12 +27,13 @@ use std::arch::x86_64::{
     _mm256_setzero_ps,
     _mm256_storeu_ps,
 };
-
 use crate::{
     handle_data_slice,
     neuron::Activation,
     neuron::DepthwiseConv1DLayer,
 };
+use rayon::prelude::*;
+use rayon::ThreadPool;
 
 const SIMD_WIDTH: usize = 8;
 
@@ -48,23 +49,14 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
     packed_weights: &[f32],
     biases: &[f32],
     output: &mut [f32],
-    batch: usize,
     out_pos: usize,
     input_length: usize,
-    output_length: usize,
     slope: f32,
 ) {
     let channels = layer.in_channels;
     let kernel_size = layer.kernel_size;
 
     let base = out_pos * layer.stride;
-
-    // ------------------------------------------------------------------------
-    // Find valid kernel taps once.
-    //
-    // After this point every src_pos used by the hot loop is valid, so there
-    // is no per-tap bounds check.
-    // ------------------------------------------------------------------------
 
     let (k_start, k_end) = if layer.causal {
         let left = kernel_size - 1;
@@ -108,18 +100,7 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
         )
     };
 
-    let input_batch_base =
-        batch * input_length * channels;
-
-    let output_batch_base =
-        batch * output_length * channels;
-
-    let output_base =
-        output_batch_base + out_pos * channels;
-
-    // ------------------------------------------------------------------------
-    // SIMD constants.
-    // ------------------------------------------------------------------------
+    let output_base = out_pos * channels;
 
     let zero = _mm256_setzero_ps();
 
@@ -129,22 +110,13 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
         zero
     };
 
-    // ------------------------------------------------------------------------
-    // 8 channels at a time.
-    // ------------------------------------------------------------------------
-
     let mut c = 0;
 
     while c + SIMD_WIDTH <= channels {
-        // Start with 8 independent biases.
         let mut acc =
             _mm256_loadu_ps(
                 biases.as_ptr().add(c)
             );
-
-        // ------------------------------------------------------------
-        // Kernel taps.
-        // ------------------------------------------------------------
 
         for k in k_start..k_end {
             let src_pos = if layer.causal {
@@ -154,13 +126,10 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
             };
 
             let input_index =
-                input_batch_base
-                    + src_pos * channels
-                    + c;
+                src_pos * channels + c;
 
             let weight_index =
-                k * channels
-                    + c;
+                k * channels + c;
 
             let x =
                 _mm256_loadu_ps(
@@ -181,19 +150,6 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
                     acc,
                 );
         }
-
-        // ------------------------------------------------------------
-        // Activation.
-        //
-        // None:
-        //     acc
-        //
-        // LeakyReLU:
-        //     max(acc, 0) + slope * min(acc, 0)
-        //
-        // Because LEAKY is const-generic, the unused path disappears
-        // at compile time.
-        // ------------------------------------------------------------
 
         if LEAKY {
             let positive =
@@ -228,10 +184,6 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
         c += SIMD_WIDTH;
     }
 
-    // ------------------------------------------------------------------------
-    // Scalar channel tail.
-    // ------------------------------------------------------------------------
-
     while c < channels {
         let mut sum = biases[c];
 
@@ -243,13 +195,10 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
             };
 
             let input_index =
-                input_batch_base
-                    + src_pos * channels
-                    + c;
+                src_pos * channels + c;
 
             let weight_index =
-                k * channels
-                    + c;
+                k * channels + c;
 
             sum +=
                 input[input_index]
@@ -266,8 +215,7 @@ unsafe fn depthwise_position_avx2<const LEAKY: bool>(
             sum
         };
 
-        output[output_base + c] =
-            value;
+        output[output_base + c] = value;
 
         c += 1;
     }
@@ -284,25 +232,15 @@ fn depthwise_position_scalar<const LEAKY: bool>(
     packed_weights: &[f32],
     biases: &[f32],
     output: &mut [f32],
-    batch: usize,
     out_pos: usize,
     input_length: usize,
-    output_length: usize,
     slope: f32,
 ) {
     let channels = layer.in_channels;
     let kernel_size = layer.kernel_size;
 
     let base = out_pos * layer.stride;
-
-    let input_batch_base =
-        batch * input_length * channels;
-
-    let output_batch_base =
-        batch * output_length * channels;
-
-    let output_base =
-        output_batch_base + out_pos * channels;
+    let output_base = out_pos * channels;
 
     for c in 0..channels {
         let mut sum = biases[c];
@@ -322,13 +260,10 @@ fn depthwise_position_scalar<const LEAKY: bool>(
                 && (src_pos as usize) < input_length
             {
                 let input_index =
-                    input_batch_base
-                        + src_pos as usize * channels
-                        + c;
+                    src_pos as usize * channels + c;
 
                 let weight_index =
-                    k * channels
-                        + c;
+                    k * channels + c;
 
                 sum +=
                     input[input_index]
@@ -346,8 +281,7 @@ fn depthwise_position_scalar<const LEAKY: bool>(
             sum
         };
 
-        output[output_base + c] =
-            value;
+        output[output_base + c] = value;
     }
 }
 
@@ -362,6 +296,7 @@ fn depthwise_conv1d_forward_impl<const LEAKY: bool>(
     input_length: usize,
     output_length: usize,
     slope: f32,
+    thread_pool: &ThreadPool,
 ) -> Vec<f32> {
     let channels = layer.in_channels;
     let kernel_size = layer.kernel_size;
@@ -385,14 +320,6 @@ fn depthwise_conv1d_forward_impl<const LEAKY: bool>(
         "DepthwiseConv1D output length mismatch",
     );
 
-    // ------------------------------------------------------------------------
-    // Load current parameter values.
-    //
-    // Stored layout:
-    //
-    //     [c0 k0, c0 k1, ..., c1 k0, c1 k1, ...]
-    // ------------------------------------------------------------------------
-
     let mut weights =
         vec![0.0f32; channels * kernel_size];
 
@@ -409,34 +336,20 @@ fn depthwise_conv1d_forward_impl<const LEAKY: bool>(
         &mut biases,
     );
 
-    // ------------------------------------------------------------------------
-    // Pack weights into k-major layout:
-    //
-    //     [k0 c0, k0 c1, ..., k1 c0, k1 c1, ...]
-    //
-    // This makes one complete channel vector contiguous.
-    // ------------------------------------------------------------------------
-
     let mut packed_weights =
         vec![0.0f32; channels * kernel_size];
 
     for c in 0..channels {
-        let src_base =
-            c * kernel_size;
+        let src_base = c * kernel_size;
 
         for k in 0..kernel_size {
             packed_weights[
                 k * channels + c
-                ] =
-                weights[
-                    src_base + k
-                    ];
+                ] = weights[
+                src_base + k
+                ];
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Allocate output.
-    // ------------------------------------------------------------------------
 
     let mut output =
         vec![
@@ -446,68 +359,165 @@ fn depthwise_conv1d_forward_impl<const LEAKY: bool>(
                 * channels
         ];
 
-    // ------------------------------------------------------------------------
-    // Runtime CPU dispatch.
-    // ------------------------------------------------------------------------
-
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("fma")
         {
-            for b in 0..batch_size {
-                for out_pos in 0..output_length {
-                    // SAFETY:
-                    //
-                    // AVX2/FMA was checked above.
-                    //
-                    // The input/output sizes were validated.
-                    //
-                    // The kernel computes k_start/k_end such that all
-                    // source positions accessed by the SIMD loop are valid.
-                    //
-                    // Every SIMD load contains exactly 8 valid channels.
-                    //
-                    unsafe {
-                        depthwise_position_avx2::<LEAKY>(
-                            layer,
-                            input,
-                            &packed_weights,
-                            &biases,
-                            &mut output,
-                            b,
-                            out_pos,
-                            input_length,
-                            output_length,
-                            slope,
-                        );
+            if thread_pool.current_num_threads() == 1 || batch_size == 1 {
+                for b in 0..batch_size {
+                    let input_batch_start =
+                        b * input_length * channels;
+
+                    let input_batch_end =
+                        input_batch_start
+                            + input_length * channels;
+
+                    let output_batch_start =
+                        b * output_length * channels;
+
+                    let output_batch_end =
+                        output_batch_start
+                            + output_length * channels;
+
+                    let input_batch =
+                        &input[
+                            input_batch_start
+                                ..input_batch_end
+                            ];
+
+                    let output_batch =
+                        &mut output[
+                            output_batch_start
+                                ..output_batch_end
+                            ];
+
+                    for out_pos in 0..output_length {
+                        unsafe {
+                            depthwise_position_avx2::<LEAKY>(
+                                layer,
+                                input_batch,
+                                &packed_weights,
+                                &biases,
+                                output_batch,
+                                out_pos,
+                                input_length,
+                                slope,
+                            );
+                        }
                     }
                 }
+            } else {
+                thread_pool.install(|| {
+                    output
+                        .par_chunks_mut(
+                            output_length * channels
+                        )
+                        .zip(
+                            input.par_chunks(
+                                input_length * channels
+                            )
+                        )
+                        .for_each(
+                            |(output_batch, input_batch)| {
+                                for out_pos
+                                in 0..output_length
+                                {
+                                    unsafe {
+                                        depthwise_position_avx2::<LEAKY>(
+                                            layer,
+                                            input_batch,
+                                            &packed_weights,
+                                            &biases,
+                                            output_batch,
+                                            out_pos,
+                                            input_length,
+                                            slope,
+                                        );
+                                    }
+                                }
+                            },
+                        );
+                });
             }
 
             return output;
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Portable scalar fallback.
-    // ------------------------------------------------------------------------
+    // Scalar fallback.
 
-    for b in 0..batch_size {
-        for out_pos in 0..output_length {
-            depthwise_position_scalar::<LEAKY>(
-                layer,
-                input,
-                &packed_weights,
-                &biases,
-                &mut output,
-                b,
-                out_pos,
-                input_length,
-                output_length,
-                slope,
-            );
+    if thread_pool.current_num_threads() == 1 || batch_size == 1 {
+        for b in 0..batch_size {
+            let input_batch_start =
+                b * input_length * channels;
+
+            let input_batch_end =
+                input_batch_start
+                    + input_length * channels;
+
+            let output_batch_start =
+                b * output_length * channels;
+
+            let output_batch_end =
+                output_batch_start
+                    + output_length * channels;
+
+            let input_batch =
+                &input[
+                    input_batch_start
+                        ..input_batch_end
+                    ];
+
+            let output_batch =
+                &mut output[
+                    output_batch_start
+                        ..output_batch_end
+                    ];
+
+            for out_pos in 0..output_length {
+                depthwise_position_scalar::<LEAKY>(
+                    layer,
+                    input_batch,
+                    &packed_weights,
+                    &biases,
+                    output_batch,
+                    out_pos,
+                    input_length,
+                    slope,
+                );
+            }
         }
+    } else {
+        thread_pool.install(|| {
+            output
+                .par_chunks_mut(
+                    output_length * channels
+                )
+                .zip(
+                    input.par_chunks(
+                        input_length * channels
+                    )
+                )
+                .for_each(
+                    |(output_batch, input_batch)| {
+                        for out_pos
+                        in 0..output_length
+                        {
+                            depthwise_position_scalar::<LEAKY>(
+                                layer,
+                                input_batch,
+                                &packed_weights,
+                                &biases,
+                                output_batch,
+                                out_pos,
+                                input_length,
+                                slope,
+                            );
+                        }
+                    },
+                );
+        });
     }
 
     output
@@ -523,6 +533,7 @@ pub fn depthwise_conv1d_forward(
     batch_size: usize,
     input_length: usize,
     output_length: usize,
+    thread_pool: &ThreadPool,
 ) -> Vec<f32> {
     match &layer.activation {
         Activation::None => {
@@ -533,6 +544,7 @@ pub fn depthwise_conv1d_forward(
                 input_length,
                 output_length,
                 0.0,
+                thread_pool,
             )
         }
 
@@ -544,6 +556,7 @@ pub fn depthwise_conv1d_forward(
                 input_length,
                 output_length,
                 *slope,
+                thread_pool,
             )
         }
     }
