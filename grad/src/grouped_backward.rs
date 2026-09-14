@@ -1,5 +1,4 @@
 use crate::neuron::Activation;
-use crate::TensorHandle;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
@@ -131,6 +130,13 @@ fn accum_weight_input(
 /// Unlike the old implementation this does not build im2col, group_grad,
 /// or col_grad buffers and does not call GEMM. The contiguous input-channel
 /// dimension is SIMD-vectorized with AVX2/FMA when available.
+///
+/// Returns:
+///
+///     (input_grads, weight_grads, bias_grads)
+///
+/// The caller is responsible for accumulating the parameter gradients into
+/// the model's ParameterStore.
 pub fn backward_direct(
     input: &[f32],
     output: &[f32],
@@ -145,14 +151,14 @@ pub fn backward_direct(
     stride: usize,
     padding: usize,
     causal: bool,
-    weight_handles: &[TensorHandle],
-    bias_handles: &[TensorHandle],
+    weights: &[f32],
     activation: &Activation,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     debug_assert!(batch_size > 0);
     debug_assert!(in_channels > 0);
     debug_assert!(out_channels > 0);
     debug_assert!(groups > 0);
+
     debug_assert_eq!(in_channels % groups, 0);
     debug_assert_eq!(out_channels % groups, 0);
 
@@ -160,10 +166,12 @@ pub fn backward_direct(
         input.len(),
         batch_size * input_length * in_channels,
     );
+
     debug_assert_eq!(
         output.len(),
         batch_size * output_length * out_channels,
     );
+
     debug_assert_eq!(grad.len(), output.len());
 
     let group_in = in_channels / groups;
@@ -171,21 +179,12 @@ pub fn backward_direct(
     let kernel_width = group_in * kernel_size;
 
     debug_assert_eq!(
-        weight_handles.len(),
+        weights.len(),
         out_channels * kernel_width,
     );
-    debug_assert_eq!(bias_handles.len(), out_channels);
 
-    // Read the current parameters once. Gradients are accumulated into the
-    // returned buffers first, then added to TensorHandles by the caller.
-    let mut weights = vec![0.0f32; weight_handles.len()];
-    let mut biases = vec![0.0f32; bias_handles.len()];
-
-    crate::handle_data_slice(weight_handles, &mut weights);
-    crate::handle_data_slice(bias_handles, &mut biases);
-
-    // Convert dL/d(output-after-activation) into dL/d(pre-activation) in
-    // place. This preserves the semantics of the existing backward path.
+    // Convert dL/d(output-after-activation) into dL/d(pre-activation)
+    // in place. This preserves the semantics of the existing backward path.
     for i in 0..grad.len() {
         activation.backward(output[i], &mut grad[i]);
     }
@@ -205,6 +204,7 @@ pub fn backward_direct(
     for b in 0..batch_size {
         let input_batch_base =
             b * input_length * in_channels;
+
         let output_batch_base =
             b * output_length * out_channels;
 
@@ -216,50 +216,73 @@ pub fn backward_direct(
                 out_pos * kernel_size;
 
             for group in 0..groups {
-                let input_channel_base = group * group_in;
-                let output_channel_base = group * group_out;
+                let input_channel_base =
+                    group * group_in;
+
+                let output_channel_base =
+                    group * group_out;
+
                 let weight_group_base =
                     group * group_out * kernel_width;
 
                 for oc in 0..group_out {
-                    let global_oc = output_channel_base + oc;
-                    let g = grad[output_base + global_oc];
+                    let global_oc =
+                        output_channel_base + oc;
 
+                    let g =
+                        grad[output_base + global_oc];
+
+                    // dB += dY
                     bias_grads[global_oc] += g;
 
                     let weight_oc_base =
                         weight_group_base + oc * kernel_width;
 
                     for k in 0..kernel_size {
-                        let src_pos = positions[position_base + k];
+                        let src_pos =
+                            positions[position_base + k];
 
-                        if src_pos < 0 || src_pos as usize >= input_length {
+                        if src_pos < 0
+                            || src_pos as usize >= input_length
+                        {
                             continue;
                         }
 
-                        let src_base = input_batch_base
-                            + src_pos as usize * in_channels
-                            + input_channel_base;
+                        let src_base =
+                            input_batch_base
+                                + src_pos as usize * in_channels
+                                + input_channel_base;
 
-                        let offset = k * group_in;
+                        let offset =
+                            k * group_in;
 
-                        let input_slice = &input[
-                            src_base..src_base + group_in
-                            ];
+                        let input_slice =
+                            &input[
+                                src_base
+                                    ..src_base + group_in
+                                ];
 
-                        let weight_slice = &weights[
-                            weight_oc_base + offset
-                                ..weight_oc_base + offset + group_in
-                            ];
+                        let weight_slice =
+                            &weights[
+                                weight_oc_base + offset
+                                    ..weight_oc_base
+                                    + offset
+                                    + group_in
+                                ];
 
-                        let input_grad_slice = &mut input_grads[
-                            src_base..src_base + group_in
-                            ];
+                        let input_grad_slice =
+                            &mut input_grads[
+                                src_base
+                                    ..src_base + group_in
+                                ];
 
-                        let weight_grad_slice = &mut weight_grads[
-                            weight_oc_base + offset
-                                ..weight_oc_base + offset + group_in
-                            ];
+                        let weight_grad_slice =
+                            &mut weight_grads[
+                                weight_oc_base + offset
+                                    ..weight_oc_base
+                                    + offset
+                                    + group_in
+                                ];
 
                         accum_weight_input(
                             input_slice,
@@ -274,12 +297,9 @@ pub fn backward_direct(
         }
     }
 
-    crate::add_handle_grad_slices_2(
-        weight_handles,
-        &weight_grads,
-        bias_handles,
-        &bias_grads,
-    );
-
-    input_grads
+    (
+        input_grads,
+        weight_grads,
+        bias_grads,
+    )
 }

@@ -1,27 +1,45 @@
-use std::sync::Arc;
-
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     _mm256_add_ps,
-    _mm256_sub_ps,
-    _mm256_fmadd_ps,
-    _mm256_loadu_ps,
-    _mm256_storeu_ps,
     _mm256_blendv_ps,
     _mm256_cmp_ps,
+    _mm256_fmadd_ps,
+    _mm256_loadu_ps,
     _mm256_mul_ps,
     _mm256_set1_ps,
     _mm256_setzero_ps,
+    _mm256_storeu_ps,
+    _mm256_sub_ps,
     _CMP_LE_OQ,
 };
-use cblas::{Layout, Transpose};
+
+use std::sync::Arc;
+
+use cblas::{
+    Layout,
+    Transpose,
+};
 use rayon::ThreadPool;
+
 use crate::backwards::add_f32_slice_simd;
-use crate::neuron::{Activation, BatchLayerCache, ChannelScaleLayer, GlobalMixerLayer, Layer, LowRankPointwiseLayer, WeightTyingLayer};
 use crate::conv1d_kernels::conv1d_forward;
 use crate::depthwise_kernel::depthwise_conv1d_forward;
 pub use crate::grouped_kernel::forward_direct as grouped_conv1d_forward;
-use crate::TensorHandle;
+use crate::neuron::{
+    Activation,
+    BatchLayerCache,
+    ChannelScaleLayer,
+    GlobalMixerLayer,
+    Layer,
+    LayerNormLayer,
+    LowRankPointwiseLayer,
+    WeightTyingLayer,
+};
+use crate::parameters::ParameterStore;
+
+// ============================================================================
+// Activation + bias
+// ============================================================================
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -30,65 +48,95 @@ pub unsafe fn leaky_relu_bias_avx2(
     biases: &[f32],
     channels: usize,
     slope: f32,
-) { unsafe {
-    let zero = _mm256_setzero_ps();
-    let slope_v = _mm256_set1_ps(slope);
+) {
+    unsafe {
+        let zero =
+            _mm256_setzero_ps();
 
-    let rows = values.len() / channels;
-
-    for row in 0..rows {
-        let base = row * channels;
-
-        let mut c = 0;
-
-        while c + 8 <= channels {
-            let x = _mm256_loadu_ps(
-                values.as_ptr().add(base + c)
+        let slope_v =
+            _mm256_set1_ps(
+                slope
             );
 
-            let b = _mm256_loadu_ps(
-                biases.as_ptr().add(c)
-            );
+        let rows =
+            values.len() / channels;
 
-            let x = _mm256_add_ps(x, b);
+        for row in 0..rows {
+            let base =
+                row * channels;
 
-            let mask =
-                _mm256_cmp_ps(x, zero, _CMP_LE_OQ);
+            let mut c =
+                0usize;
 
-            let negative =
-                _mm256_mul_ps(x, slope_v);
+            while c + 8 <= channels {
+                let x =
+                    _mm256_loadu_ps(
+                        values.as_ptr()
+                            .add(base + c)
+                    );
 
-            let y =
-                _mm256_blendv_ps(
-                    x,
-                    negative,
-                    mask,
+                let b =
+                    _mm256_loadu_ps(
+                        biases.as_ptr()
+                            .add(c)
+                    );
+
+                let x =
+                    _mm256_add_ps(
+                        x,
+                        b,
+                    );
+
+                let mask =
+                    _mm256_cmp_ps(
+                        x,
+                        zero,
+                        _CMP_LE_OQ,
+                    );
+
+                let negative =
+                    _mm256_mul_ps(
+                        x,
+                        slope_v,
+                    );
+
+                let y =
+                    _mm256_blendv_ps(
+                        x,
+                        negative,
+                        mask,
+                    );
+
+                _mm256_storeu_ps(
+                    values
+                        .as_mut_ptr()
+                        .add(base + c),
+                    y,
                 );
 
-            _mm256_storeu_ps(
-                values.as_mut_ptr().add(base + c),
-                y,
-            );
+                c += 8;
+            }
 
-            c += 8;
-        }
+            while c < channels {
+                let i =
+                    base + c;
 
-        while c < channels {
-            let i = base + c;
+                let x =
+                    values[i]
+                        + biases[c];
 
-            let x = values[i] + biases[c];
+                values[i] =
+                    if x <= 0.0 {
+                        x * slope
+                    } else {
+                        x
+                    };
 
-            values[i] =
-                if x <= 0.0 {
-                    x * slope
-                } else {
-                    x
-                };
-
-            c += 1;
+                c += 1;
+            }
         }
     }
-}}
+}
 
 fn activation_bias_simd(
     values: &mut [f32],
@@ -116,21 +164,29 @@ fn activation_bias_simd(
         }
     }
 
-    let rows = values.len() / channels;
+    let rows =
+        values.len() / channels;
 
     for row in 0..rows {
-        let base = row * channels;
+        let base =
+            row * channels;
 
         for c in 0..channels {
-            let i = base + c;
+            let i =
+                base + c;
 
             values[i] =
                 activation.apply(
-                    values[i] + biases[c]
+                    values[i]
+                        + biases[c]
                 );
         }
     }
 }
+
+// ============================================================================
+// Global Mixer
+// ============================================================================
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -143,218 +199,135 @@ unsafe fn global_mixer_aggregate_avx2(
     channels: usize,
     global_dim: usize,
 ) {
-    debug_assert_eq!(
-        input.len(),
-        batch_size * positions * channels
-    );
+    unsafe {
+        debug_assert_eq!(
+            input.len(),
+            batch_size
+                * positions
+                * channels
+        );
 
-    debug_assert_eq!(
-        write_probs.len(),
-        batch_size * positions * global_dim
-    );
+        debug_assert_eq!(
+            write_probs.len(),
+            batch_size
+                * positions
+                * global_dim
+        );
 
-    debug_assert_eq!(
-        global_vectors.len(),
-        batch_size * global_dim * channels
-    );
+        debug_assert_eq!(
+            global_vectors.len(),
+            batch_size
+                * global_dim
+                * channels
+        );
 
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
+        for b in 0..batch_size {
+            let input_base =
+                b
+                    * positions
+                    * channels;
 
-        let probs_base =
-            b * positions * global_dim;
+            let probs_base =
+                b
+                    * positions
+                    * global_dim;
 
-        let global_base =
-            b * global_dim * channels;
-
-        for g in 0..global_dim {
-            let global_offset =
-                global_base + g * channels;
-
-            let mut c = 0usize;
-
-            while c + 8 <= channels {
-                let mut acc =
-                    _mm256_setzero_ps();
-
-                for p in 0..positions {
-                    let prob =
-                        *write_probs.get_unchecked(
-                            probs_base
-                                + p * global_dim
-                                + g
-                        );
-
-                    let prob_v =
-                        _mm256_set1_ps(prob);
-
-                    let x =
-                        _mm256_loadu_ps(
-                            input.as_ptr()
-                                .add(
-                                    input_base
-                                        + p * channels
-                                        + c
-                                )
-                        );
-
-                    acc =
-                        _mm256_fmadd_ps(
-                            x,
-                            prob_v,
-                            acc,
-                        );
-                }
-
-                _mm256_storeu_ps(
-                    global_vectors
-                        .as_mut_ptr()
-                        .add(global_offset + c),
-                    acc,
-                );
-
-                c += 8;
-            }
-
-            while c < channels {
-                let mut sum =
-                    0.0f32;
-
-                for p in 0..positions {
-                    let prob =
-                        *write_probs.get_unchecked(
-                            probs_base
-                                + p * global_dim
-                                + g
-                        );
-
-                    let x =
-                        *input.get_unchecked(
-                            input_base
-                                + p * channels
-                                + c
-                        );
-
-                    sum +=
-                        prob * x;
-                }
-
-                *global_vectors.get_unchecked_mut(
-                    global_offset + c
-                ) = sum;
-
-                c += 1;
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn global_mixer_readback_avx2(
-    input: &[f32],
-    output: &mut [f32],
-    read_probs: &[f32],
-    global_vectors: &[f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    debug_assert_eq!(
-        input.len(),
-        output.len()
-    );
-
-    debug_assert_eq!(
-        read_probs.len(),
-        batch_size * positions * global_dim
-    );
-
-    debug_assert_eq!(
-        global_vectors.len(),
-        batch_size * global_dim * channels
-    );
-
-    // Start with the residual connection.
-    output.copy_from_slice(input);
-
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
-
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        for p in 0..positions {
-            let output_offset =
-                input_base + p * channels;
+            let global_base =
+                b
+                    * global_dim
+                    * channels;
 
             for g in 0..global_dim {
-                let prob =
-                    *read_probs.get_unchecked(
-                        probs_base
-                            + p * global_dim
-                            + g
-                    );
-
-                let prob_v =
-                    _mm256_set1_ps(prob);
-
                 let global_offset =
                     global_base
                         + g * channels;
 
-                let mut c = 0usize;
+                let mut c =
+                    0usize;
 
                 while c + 8 <= channels {
-                    let y =
-                        _mm256_loadu_ps(
-                            output
-                                .as_ptr()
-                                .add(output_offset + c)
-                        );
+                    let mut acc =
+                        _mm256_setzero_ps();
 
-                    let global =
-                        _mm256_loadu_ps(
-                            global_vectors
-                                .as_ptr()
-                                .add(global_offset + c)
-                        );
+                    for p in 0..positions {
+                        let prob =
+                            *write_probs
+                                .get_unchecked(
+                                    probs_base
+                                        + p * global_dim
+                                        + g,
+                                );
 
-                    let y =
-                        _mm256_fmadd_ps(
-                            global,
-                            prob_v,
-                            y,
-                        );
+                        let prob_v =
+                            _mm256_set1_ps(
+                                prob
+                            );
+
+                        let x =
+                            _mm256_loadu_ps(
+                                input
+                                    .as_ptr()
+                                    .add(
+                                        input_base
+                                            + p
+                                            * channels
+                                            + c,
+                                    )
+                            );
+
+                        acc =
+                            _mm256_fmadd_ps(
+                                x,
+                                prob_v,
+                                acc,
+                            );
+                    }
 
                     _mm256_storeu_ps(
-                        output
+                        global_vectors
                             .as_mut_ptr()
-                            .add(output_offset + c),
-                        y,
+                            .add(
+                                global_offset
+                                    + c,
+                            ),
+                        acc,
                     );
 
                     c += 8;
                 }
 
                 while c < channels {
-                    let index =
-                        output_offset + c;
+                    let mut sum =
+                        0.0f32;
 
-                    let global_index =
-                        global_offset + c;
+                    for p in 0..positions {
+                        let prob =
+                            *write_probs
+                                .get_unchecked(
+                                    probs_base
+                                        + p * global_dim
+                                        + g,
+                                );
 
-                    *output.get_unchecked_mut(index) +=
-                        prob
-                            * *global_vectors.get_unchecked(
-                            global_index
-                        );
+                        let x =
+                            *input
+                                .get_unchecked(
+                                    input_base
+                                        + p
+                                        * channels
+                                        + c,
+                                );
+
+                        sum +=
+                            prob * x;
+                    }
+
+                    *global_vectors
+                        .get_unchecked_mut(
+                            global_offset
+                                + c,
+                        ) =
+                        sum;
 
                     c += 1;
                 }
@@ -374,17 +347,24 @@ fn global_mixer_aggregate_scalar(
 ) {
     for b in 0..batch_size {
         let input_base =
-            b * positions * channels;
+            b
+                * positions
+                * channels;
 
         let probs_base =
-            b * positions * global_dim;
+            b
+                * positions
+                * global_dim;
 
         let global_base =
-            b * global_dim * channels;
+            b
+                * global_dim
+                * channels;
 
         for g in 0..global_dim {
             let global_offset =
-                global_base + g * channels;
+                global_base
+                    + g * channels;
 
             for c in 0..channels {
                 let mut sum =
@@ -394,14 +374,16 @@ fn global_mixer_aggregate_scalar(
                     let prob =
                         write_probs[
                             probs_base
-                                + p * global_dim
+                                + p
+                                * global_dim
                                 + g
                             ];
 
                     let x =
                         input[
                             input_base
-                                + p * channels
+                                + p
+                                * channels
                                 + c
                             ];
 
@@ -417,6 +399,153 @@ fn global_mixer_aggregate_scalar(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_readback_avx2(
+    input: &[f32],
+    output: &mut [f32],
+    read_probs: &[f32],
+    global_vectors: &[f32],
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    unsafe {
+        debug_assert_eq!(
+            input.len(),
+            output.len()
+        );
+
+        debug_assert_eq!(
+            read_probs.len(),
+            batch_size
+                * positions
+                * global_dim
+        );
+
+        debug_assert_eq!(
+            global_vectors.len(),
+            batch_size
+                * global_dim
+                * channels
+        );
+
+        output.copy_from_slice(
+            input
+        );
+
+        for b in 0..batch_size {
+            let input_base =
+                b
+                    * positions
+                    * channels;
+
+            let probs_base =
+                b
+                    * positions
+                    * global_dim;
+
+            let global_base =
+                b
+                    * global_dim
+                    * channels;
+
+            for p in 0..positions {
+                let output_offset =
+                    input_base
+                        + p * channels;
+
+                for g in 0..global_dim {
+                    let prob =
+                        *read_probs
+                            .get_unchecked(
+                                probs_base
+                                    + p
+                                    * global_dim
+                                    + g,
+                            );
+
+                    let prob_v =
+                        _mm256_set1_ps(
+                            prob
+                        );
+
+                    let global_offset =
+                        global_base
+                            + g * channels;
+
+                    let mut c =
+                        0usize;
+
+                    while c + 8 <= channels {
+                        let y =
+                            _mm256_loadu_ps(
+                                output
+                                    .as_ptr()
+                                    .add(
+                                        output_offset
+                                            + c,
+                                    )
+                            );
+
+                        let global =
+                            _mm256_loadu_ps(
+                                global_vectors
+                                    .as_ptr()
+                                    .add(
+                                        global_offset
+                                            + c,
+                                    )
+                            );
+
+                        let y =
+                            _mm256_fmadd_ps(
+                                global,
+                                prob_v,
+                                y,
+                            );
+
+                        _mm256_storeu_ps(
+                            output
+                                .as_mut_ptr()
+                                .add(
+                                    output_offset
+                                        + c,
+                                ),
+                            y,
+                        );
+
+                        c += 8;
+                    }
+
+                    while c < channels {
+                        let index =
+                            output_offset
+                                + c;
+
+                        let global_index =
+                            global_offset
+                                + c;
+
+                        *output
+                            .get_unchecked_mut(
+                                index,
+                            ) +=
+                            prob
+                                * *global_vectors
+                                .get_unchecked(
+                                    global_index,
+                                );
+
+                        c += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn global_mixer_readback_scalar(
     input: &[f32],
     output: &mut [f32],
@@ -427,21 +556,30 @@ fn global_mixer_readback_scalar(
     channels: usize,
     global_dim: usize,
 ) {
-    output.copy_from_slice(input);
+    output.copy_from_slice(
+        input
+    );
 
     for b in 0..batch_size {
         let input_base =
-            b * positions * channels;
+            b
+                * positions
+                * channels;
 
         let probs_base =
-            b * positions * global_dim;
+            b
+                * positions
+                * global_dim;
 
         let global_base =
-            b * global_dim * channels;
+            b
+                * global_dim
+                * channels;
 
         for p in 0..positions {
             let output_offset =
-                input_base + p * channels;
+                input_base
+                    + p * channels;
 
             for g in 0..global_dim {
                 let prob =
@@ -469,690 +607,6 @@ fn global_mixer_readback_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn channel_scale_avx2(
-    input: &[f32],
-    output: &mut [f32],
-    scales: &[f32],
-    biases: &[f32],
-    channels: usize,
-) { unsafe {
-    let positions = input.len() / channels;
-
-    for position in 0..positions {
-        let offset = position * channels;
-
-        let mut c = 0;
-
-        // 8 f32s = 256 bits
-        while c + 8 <= channels {
-            let x = _mm256_loadu_ps(
-                input.as_ptr().add(offset + c)
-            );
-
-            let s = _mm256_loadu_ps(
-                scales.as_ptr().add(c)
-            );
-
-            let b = _mm256_loadu_ps(
-                biases.as_ptr().add(c)
-            );
-
-            // x * s + b
-            let y = _mm256_fmadd_ps(x, s, b);
-
-            _mm256_storeu_ps(
-                output.as_mut_ptr().add(offset + c),
-                y,
-            );
-
-            c += 8;
-        }
-
-        // Scalar fallback for remaining channels.
-        while c < channels {
-            output[offset + c] =
-                input[offset + c] * scales[c] + biases[c];
-
-            c += 1;
-        }
-    }
-}}
-
-pub fn channel_scale_simd(
-    input: &[f32],
-    output: &mut [f32],
-    scales: &[f32],
-    biases: &[f32],
-    channels: usize,
-) {
-    debug_assert_eq!(input.len(), output.len());
-    debug_assert!(channels > 0);
-    debug_assert_eq!(input.len() % channels, 0);
-    debug_assert_eq!(scales.len(), channels);
-    debug_assert_eq!(biases.len(), channels);
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            unsafe {
-                channel_scale_avx2(
-                    input,
-                    output,
-                    scales,
-                    biases,
-                    channels,
-                );
-            }
-
-            return;
-        }
-    }
-
-    // Portable scalar fallback.
-    let positions = input.len() / channels;
-
-    for position in 0..positions {
-        let offset = position * channels;
-
-        for c in 0..channels {
-            output[offset + c] =
-                input[offset + c] * scales[c] + biases[c];
-        }
-    }
-}
-
-pub fn channel_scale_forward(
-    layer: &ChannelScaleLayer,
-    input: &[f32],
-    batch_size: usize,
-) -> Vec<f32> {
-    let mut scales = vec![0.0; layer.channels];
-    let mut biases = vec![0.0; layer.channels];
-
-    crate::handle_data_slice(
-        &layer.scale_handles,
-        &mut scales,
-    );
-
-    crate::handle_data_slice(
-        &layer.bias_handles,
-        &mut biases,
-    );
-
-    let sequence_size = input.len() / batch_size;
-
-    debug_assert_eq!(
-        sequence_size % layer.channels,
-        0
-    );
-
-    let mut output = vec![0.0; input.len()];
-
-    for b in 0..batch_size {
-        let base = b * sequence_size;
-        let end = base + sequence_size;
-
-        channel_scale_simd(
-            &input[base..end],
-            &mut output[base..end],
-            &scales,
-            &biases,
-            layer.channels,
-        );
-    }
-
-    output
-}
-
-pub fn low_rank_pointwise_forward(
-    layer: &LowRankPointwiseLayer,
-    input: &[f32],
-    batch_size: usize,
-    positions: usize,
-    first_weights: &[f32],
-    first_biases: &[f32],
-    second_weights: &[f32],
-    second_biases: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    let rows =
-        batch_size * positions;
-
-    let mut hidden =
-        vec![0.0; rows * layer.rank];
-
-    let mut output =
-        vec![0.0; rows * layer.out_channels];
-
-    // ------------------------------------------------------------
-    // First projection:
-    //
-    // input [rows, in_channels]
-    // W1    [rank, in_channels]
-    //
-    // hidden_pre = input @ W1^T
-    // ------------------------------------------------------------
-
-    unsafe {
-        cblas::sgemm(
-            Layout::RowMajor,
-            Transpose::None,
-            Transpose::Ordinary,
-            rows as i32,
-            layer.rank as i32,
-            layer.in_channels as i32,
-            1.0,
-            input,
-            layer.in_channels as i32,
-            first_weights,
-            layer.in_channels as i32,
-            0.0,
-            &mut hidden,
-            layer.rank as i32,
-        );
-    }
-
-    // ------------------------------------------------------------
-    // First bias + activation:
-    //
-    // hidden = activation(hidden_pre + b1)
-    // ------------------------------------------------------------
-
-    activation_bias_simd(
-        &mut hidden,
-        first_biases,
-        layer.rank,
-        &layer.activation,
-    );
-
-    // ------------------------------------------------------------
-    // Second projection:
-    //
-    // hidden [rows, rank]
-    // W2     [out_channels, rank]
-    //
-    // output_pre = hidden @ W2^T
-    // ------------------------------------------------------------
-
-    unsafe {
-        cblas::sgemm(
-            Layout::RowMajor,
-            Transpose::None,
-            Transpose::Ordinary,
-            rows as i32,
-            layer.out_channels as i32,
-            layer.rank as i32,
-            1.0,
-            &hidden,
-            layer.rank as i32,
-            second_weights,
-            layer.rank as i32,
-            0.0,
-            &mut output,
-            layer.out_channels as i32,
-        );
-    }
-
-    // ------------------------------------------------------------
-    // Second bias + activation:
-    //
-    // output = activation(output_pre + b2)
-    // ------------------------------------------------------------
-
-    activation_bias_simd(
-        &mut output,
-        second_biases,
-        layer.out_channels,
-        &layer.activation,
-    );
-
-    (output, hidden)
-}
-
-#[inline]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn layer_norm_group_avx2(
-    input: &[f32],
-    output: &mut [f32],
-    gamma: &[f32],
-    beta: &[f32],
-    epsilon: f32,
-) -> (f32, f32) {
-    debug_assert_eq!(input.len(), output.len());
-    debug_assert_eq!(input.len(), gamma.len());
-    debug_assert_eq!(input.len(), beta.len());
-
-    let channels = input.len();
-
-    // ------------------------------------------------------------
-    // Mean.
-    // ------------------------------------------------------------
-
-    let mut sum_vec =
-        _mm256_setzero_ps();
-
-    let mut c =
-        0usize;
-
-    while c + 8 <= channels {
-        let x =
-            _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
-
-        sum_vec =
-            _mm256_add_ps(
-                sum_vec,
-                x,
-            );
-
-        c += 8;
-    }
-
-    // Horizontal reduction.
-    let mut tmp =
-        [0.0f32; 8];
-
-    _mm256_storeu_ps(
-        tmp.as_mut_ptr(),
-        sum_vec,
-    );
-
-    let mut sum =
-        tmp[0]
-            + tmp[1]
-            + tmp[2]
-            + tmp[3]
-            + tmp[4]
-            + tmp[5]
-            + tmp[6]
-            + tmp[7];
-
-    while c < channels {
-        sum += input[c];
-        c += 1;
-    }
-
-    let channels_f32 =
-        channels as f32;
-
-    let mean =
-        sum / channels_f32;
-
-    // ------------------------------------------------------------
-    // Variance.
-    // ------------------------------------------------------------
-
-    let mean_vec =
-        _mm256_set1_ps(mean);
-
-    let mut variance_vec =
-        _mm256_setzero_ps();
-
-    c = 0;
-
-    while c + 8 <= channels {
-        let x =
-            _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
-
-        let diff =
-            _mm256_sub_ps(
-                x,
-                mean_vec,
-            );
-
-        variance_vec =
-            _mm256_add_ps(
-                variance_vec,
-                _mm256_mul_ps(
-                    diff,
-                    diff,
-                ),
-            );
-
-        c += 8;
-    }
-
-    _mm256_storeu_ps(
-        tmp.as_mut_ptr(),
-        variance_vec,
-    );
-
-    let mut variance =
-        tmp[0]
-            + tmp[1]
-            + tmp[2]
-            + tmp[3]
-            + tmp[4]
-            + tmp[5]
-            + tmp[6]
-            + tmp[7];
-
-    while c < channels {
-        let diff =
-            input[c] - mean;
-
-        variance +=
-            diff * diff;
-
-        c += 1;
-    }
-
-    variance /=
-        channels_f32;
-
-    let inv_std =
-        1.0f32
-            / (variance + epsilon).sqrt();
-
-    // ------------------------------------------------------------
-    // Normalize + affine.
-    // ------------------------------------------------------------
-
-    let inv_std_vec =
-        _mm256_set1_ps(inv_std);
-
-    let mut gamma_ptr =
-        gamma.as_ptr();
-
-    let mut beta_ptr =
-        beta.as_ptr();
-
-    c = 0;
-
-    while c + 8 <= channels {
-        let x =
-            _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
-
-        let g =
-            _mm256_loadu_ps(
-                gamma_ptr
-            );
-
-        let b =
-            _mm256_loadu_ps(
-                beta_ptr
-            );
-
-        let normalized =
-            _mm256_mul_ps(
-                _mm256_sub_ps(
-                    x,
-                    mean_vec,
-                ),
-                inv_std_vec,
-            );
-
-        let y =
-            _mm256_add_ps(
-                _mm256_mul_ps(
-                    normalized,
-                    g,
-                ),
-                b,
-            );
-
-        _mm256_storeu_ps(
-            output.as_mut_ptr().add(c),
-            y,
-        );
-
-        gamma_ptr =
-            gamma_ptr.add(8);
-
-        beta_ptr =
-            beta_ptr.add(8);
-
-        c += 8;
-    }
-
-    while c < channels {
-        let normalized =
-            (input[c] - mean)
-                * inv_std;
-
-        output[c] =
-            normalized * gamma[c]
-                + beta[c];
-
-        c += 1;
-    }
-
-    (mean, inv_std)
-}
-
-pub fn layer_norm_forward(
-    input: &[f32],
-    batch_size: usize,
-    channels: usize,
-    epsilon: f32,
-    gamma_handles: &[TensorHandle],
-    beta_handles: &[TensorHandle],
-) -> (
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-) {
-    debug_assert!(
-        batch_size > 0
-    );
-
-    debug_assert!(
-        channels > 0
-    );
-
-    debug_assert_eq!(
-        input.len() % batch_size,
-        0
-    );
-
-    debug_assert_eq!(
-        gamma_handles.len(),
-        channels
-    );
-
-    debug_assert_eq!(
-        beta_handles.len(),
-        channels
-    );
-
-    let sequence_size =
-        input.len() / batch_size;
-
-    debug_assert_eq!(
-        sequence_size % channels,
-        0
-    );
-
-    let positions =
-        sequence_size / channels;
-
-    let group_count =
-        batch_size * positions;
-
-    let mut gamma =
-        vec![0.0f32; channels];
-
-    let mut beta =
-        vec![0.0f32; channels];
-
-    crate::handle_data_slice(
-        gamma_handles,
-        &mut gamma,
-    );
-
-    crate::handle_data_slice(
-        beta_handles,
-        &mut beta,
-    );
-
-    let mut output =
-        vec![0.0f32; input.len()];
-
-    let mut means =
-        vec![0.0f32; group_count];
-
-    let mut inv_stds =
-        vec![0.0f32; group_count];
-
-    for group in 0..group_count {
-        let base =
-            group * channels;
-
-        let input_group =
-            &input[
-                base..base + channels
-                ];
-
-        let output_group =
-            &mut output[
-                base..base + channels
-                ];
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                let (mean, inv_std) =
-                    unsafe {
-                        layer_norm_group_avx2(
-                            input_group,
-                            output_group,
-                            &gamma,
-                            &beta,
-                            epsilon,
-                        )
-                    };
-
-                means[group] =
-                    mean;
-
-                inv_stds[group] =
-                    inv_std;
-
-                continue;
-            }
-        }
-
-        // Scalar fallback.
-        let channels_f32 =
-            channels as f32;
-
-        let mut sum =
-            0.0f32;
-
-        for &x in input_group {
-            sum += x;
-        }
-
-        let mean =
-            sum / channels_f32;
-
-        means[group] =
-            mean;
-
-        let mut variance =
-            0.0f32;
-
-        for &x in input_group {
-            let diff =
-                x - mean;
-
-            variance +=
-                diff * diff;
-        }
-
-        variance /=
-            channels_f32;
-
-        let inv_std =
-            1.0f32
-                / (variance + epsilon).sqrt();
-
-        inv_stds[group] =
-            inv_std;
-
-        for c in 0..channels {
-            let normalized =
-                (
-                    input_group[c]
-                        - mean
-                )
-                    * inv_std;
-
-            output_group[c] =
-                normalized * gamma[c]
-                    + beta[c];
-        }
-    }
-
-    (
-        output,
-        means,
-        inv_stds,
-    )
-}
-
-pub fn weight_tying_forward(
-    layer: &WeightTyingLayer,
-    input: &[f32],
-    batch_size: usize,
-) -> Vec<f32> {
-    let embedding_dim =
-        layer.embeddings.embedding_dim();
-
-    let vocab_size =
-        layer.embeddings.vocab_size();
-
-    assert_eq!(
-        input.len(),
-        batch_size * embedding_dim,
-        "Invalid WeightTying input size"
-    );
-
-    // IMPORTANT:
-    // flat_values is already a contiguous copy of the embedding matrix.
-    // Do NOT rebuild it here.
-    let weights =
-        layer.embeddings.flat_values();
-
-    debug_assert_eq!(
-        weights.len(),
-        vocab_size * embedding_dim
-    );
-
-    let mut output =
-        vec![0.0; batch_size * vocab_size];
-
-    unsafe {
-        cblas::sgemm(
-            Layout::RowMajor,
-            Transpose::None,
-            Transpose::Ordinary,
-            batch_size as i32,
-            vocab_size as i32,
-            embedding_dim as i32,
-            1.0,
-            input,
-            embedding_dim as i32,
-            &weights,
-            embedding_dim as i32,
-            0.0,
-            &mut output,
-            vocab_size as i32,
-        );
-    }
-
-    output
-}
-
 fn global_mixer_aggregate(
     input: &[f32],
     write_probs: &[f32],
@@ -1164,17 +618,23 @@ fn global_mixer_aggregate(
 ) {
     debug_assert_eq!(
         input.len(),
-        batch_size * positions * channels
+        batch_size
+            * positions
+            * channels
     );
 
     debug_assert_eq!(
         write_probs.len(),
-        batch_size * positions * global_dim
+        batch_size
+            * positions
+            * global_dim
     );
 
     debug_assert_eq!(
         global_vectors.len(),
-        batch_size * global_dim * channels
+        batch_size
+            * global_dim
+            * channels
     );
 
     #[cfg(target_arch = "x86_64")]
@@ -1226,12 +686,16 @@ fn global_mixer_readback(
 
     debug_assert_eq!(
         read_probs.len(),
-        batch_size * positions * global_dim
+        batch_size
+            * positions
+            * global_dim
     );
 
     debug_assert_eq!(
         global_vectors.len(),
-        batch_size * global_dim * channels
+        batch_size
+            * global_dim
+            * channels
     );
 
     #[cfg(target_arch = "x86_64")]
@@ -1278,7 +742,9 @@ fn global_mixer_softmax_write(
 ) {
     for b in 0..batch_size {
         let base =
-            b * positions * global_dim;
+            b
+                * positions
+                * global_dim;
 
         for g in 0..global_dim {
             let mut max_value =
@@ -1294,11 +760,13 @@ fn global_mixer_softmax_write(
                     values[index]
                         + biases[g]
                         + positional_biases[
-                        p * global_dim + g
+                        p * global_dim
+                            + g
                         ];
 
                 if value > max_value {
-                    max_value = value;
+                    max_value =
+                        value;
                 }
             }
 
@@ -1316,15 +784,18 @@ fn global_mixer_softmax_write(
                         values[index]
                             + biases[g]
                             + positional_biases[
-                            p * global_dim + g
+                            p * global_dim
+                                + g
                             ]
                             - max_value
-                    ).exp();
+                    )
+                        .exp();
 
                 values[index] =
                     value;
 
-                sum += value;
+                sum +=
+                    value;
             }
 
             let inv_sum =
@@ -1352,7 +823,8 @@ fn global_mixer_softmax_read(
     global_dim: usize,
 ) {
     let rows =
-        batch_size * positions;
+        batch_size
+            * positions;
 
     for row in 0..rows {
         let base =
@@ -1362,7 +834,8 @@ fn global_mixer_softmax_read(
             row % positions;
 
         let positional_base =
-            position * global_dim;
+            position
+                * global_dim;
 
         let mut max_value =
             f32::NEG_INFINITY;
@@ -1376,7 +849,8 @@ fn global_mixer_softmax_read(
                     ];
 
             if value > max_value {
-                max_value = value;
+                max_value =
+                    value;
             }
         }
 
@@ -1395,12 +869,14 @@ fn global_mixer_softmax_read(
                         positional_base + g
                         ]
                         - max_value
-                ).exp();
+                )
+                    .exp();
 
             values[index] =
                 value;
 
-            sum += value;
+            sum +=
+                value;
         }
 
         let inv_sum =
@@ -1418,7 +894,9 @@ pub const GLOBAL_MIXER_POS_FEATURES: usize = 4;
 #[inline]
 pub fn global_mixer_position_features(
     positions: usize,
-) -> Vec<[f32; GLOBAL_MIXER_POS_FEATURES]> {
+) -> Vec<
+    [f32; GLOBAL_MIXER_POS_FEATURES]
+> {
     let mut features =
         vec![
             [0.0f32; GLOBAL_MIXER_POS_FEATURES];
@@ -1430,7 +908,6 @@ pub fn global_mixer_position_features(
     }
 
     if positions == 1 {
-        // Center of the normalized range.
         features[0] = [
             0.0,
             0.0,
@@ -1462,13 +939,16 @@ pub fn global_mixer_position_features(
 }
 
 fn global_mixer_build_positional_biases(
-    features: &[[f32; GLOBAL_MIXER_POS_FEATURES]],
+    features: &[
+        [f32; GLOBAL_MIXER_POS_FEATURES]
+    ],
     positional_weights: &[f32],
     global_dim: usize,
 ) -> Vec<f32> {
     debug_assert_eq!(
         positional_weights.len(),
-        global_dim * GLOBAL_MIXER_POS_FEATURES
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES
     );
 
     let positions =
@@ -1477,7 +957,8 @@ fn global_mixer_build_positional_biases(
     let mut biases =
         vec![
             0.0f32;
-            positions * global_dim
+            positions
+                * global_dim
         ];
 
     for p in 0..positions {
@@ -1489,13 +970,24 @@ fn global_mixer_build_positional_biases(
 
         for g in 0..global_dim {
             let w =
-                g * GLOBAL_MIXER_POS_FEATURES;
+                g
+                    * GLOBAL_MIXER_POS_FEATURES;
 
             biases[row + g] =
-                f[0] * positional_weights[w]
-                    + f[1] * positional_weights[w + 1]
-                    + f[2] * positional_weights[w + 2]
-                    + f[3] * positional_weights[w + 3];
+                f[0]
+                    * positional_weights[w]
+                    + f[1]
+                    * positional_weights[
+                    w + 1
+                    ]
+                    + f[2]
+                    * positional_weights[
+                    w + 2
+                    ]
+                    + f[3]
+                    * positional_weights[
+                    w + 3
+                    ];
         }
     }
 
@@ -1534,7 +1026,8 @@ pub fn global_mixer_forward(
 
     debug_assert_eq!(
         write_weights.len(),
-        global_dim * channels
+        global_dim
+            * channels
     );
 
     debug_assert_eq!(
@@ -1544,7 +1037,8 @@ pub fn global_mixer_forward(
 
     debug_assert_eq!(
         read_weights.len(),
-        global_dim * channels
+        global_dim
+            * channels
     );
 
     debug_assert_eq!(
@@ -1552,16 +1046,20 @@ pub fn global_mixer_forward(
         global_dim
     );
 
-    let rows = batch_size * positions;
+    let rows =
+        batch_size
+            * positions;
 
     debug_assert_eq!(
         write_positional_weights.len(),
-        global_dim * GLOBAL_MIXER_POS_FEATURES
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES
     );
 
     debug_assert_eq!(
         read_positional_weights.len(),
-        global_dim * GLOBAL_MIXER_POS_FEATURES
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES
     );
 
     let position_features =
@@ -1583,14 +1081,14 @@ pub fn global_mixer_forward(
             global_dim,
         );
 
-    // ------------------------------------------------------------
-    // Write projection:
+    // ------------------------------------------------------------------------
+    // Write projection.
     //
-    // X [rows, C] @ W_write^T [C, G]
-    // -> [rows, G]
+    // X       [rows, C]
+    // W_write [G, C]
     //
-    // W_write is stored [G, C].
-    // ------------------------------------------------------------
+    // X @ W_write^T -> [rows, G]
+    // ------------------------------------------------------------------------
 
     let mut write_probs =
         vec![
@@ -1626,14 +1124,9 @@ pub fn global_mixer_forward(
         global_dim,
     );
 
-    // ------------------------------------------------------------
-    // Global vectors:
-    //
-    // global[g,c] =
-    //     Σ_p write_prob[p,g] * X[p,c]
-    //
-    // [G, C]
-    // ------------------------------------------------------------
+    // ------------------------------------------------------------------------
+    // Aggregate global vectors.
+    // ------------------------------------------------------------------------
 
     let mut global_vectors =
         vec![
@@ -1653,14 +1146,12 @@ pub fn global_mixer_forward(
         global_dim,
     );
 
-    // ------------------------------------------------------------
-    // Read projection:
+    // ------------------------------------------------------------------------
+    // Read projection.
     //
-    // X [rows, C] @ W_read^T [C, G]
-    // -> [rows, G]
-    //
+    // X @ W_read^T -> [rows, G]
     // Softmax over G.
-    // ------------------------------------------------------------
+    // ------------------------------------------------------------------------
 
     let mut read_probs =
         vec![
@@ -1696,13 +1187,9 @@ pub fn global_mixer_forward(
         global_dim,
     );
 
-    // ------------------------------------------------------------
-    // Read global vectors back into each position:
-    //
-    // output[p,c] =
-    //     X[p,c]
-    //     + Σ_g read_prob[p,g] * global[g,c]
-    // ------------------------------------------------------------
+    // ------------------------------------------------------------------------
+    // Residual readback.
+    // ------------------------------------------------------------------------
 
     let mut output =
         vec![0.0f32; input.len()];
@@ -1726,53 +1213,860 @@ pub fn global_mixer_forward(
     )
 }
 
+// ============================================================================
+// Channel Scale
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn channel_scale_avx2(
+    input: &[f32],
+    output: &mut [f32],
+    scales: &[f32],
+    biases: &[f32],
+    channels: usize,
+) {
+    unsafe {
+        let positions =
+            input.len() / channels;
+
+        for position in 0..positions {
+            let offset =
+                position * channels;
+
+            let mut c =
+                0usize;
+
+            while c + 8 <= channels {
+                let x =
+                    _mm256_loadu_ps(
+                        input.as_ptr()
+                            .add(offset + c)
+                    );
+
+                let s =
+                    _mm256_loadu_ps(
+                        scales.as_ptr()
+                            .add(c)
+                    );
+
+                let b =
+                    _mm256_loadu_ps(
+                        biases.as_ptr()
+                            .add(c)
+                    );
+
+                let y =
+                    _mm256_fmadd_ps(
+                        x,
+                        s,
+                        b,
+                    );
+
+                _mm256_storeu_ps(
+                    output
+                        .as_mut_ptr()
+                        .add(offset + c),
+                    y,
+                );
+
+                c += 8;
+            }
+
+            while c < channels {
+                output[offset + c] =
+                    input[offset + c]
+                        * scales[c]
+                        + biases[c];
+
+                c += 1;
+            }
+        }
+    }
+}
+
+pub fn channel_scale_simd(
+    input: &[f32],
+    output: &mut [f32],
+    scales: &[f32],
+    biases: &[f32],
+    channels: usize,
+) {
+    debug_assert_eq!(
+        input.len(),
+        output.len()
+    );
+
+    debug_assert!(
+        channels > 0
+    );
+
+    debug_assert_eq!(
+        input.len() % channels,
+        0
+    );
+
+    debug_assert_eq!(
+        scales.len(),
+        channels
+    );
+
+    debug_assert_eq!(
+        biases.len(),
+        channels
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                channel_scale_avx2(
+                    input,
+                    output,
+                    scales,
+                    biases,
+                    channels,
+                );
+            }
+
+            return;
+        }
+    }
+
+    let positions =
+        input.len() / channels;
+
+    for position in 0..positions {
+        let offset =
+            position * channels;
+
+        for c in 0..channels {
+            output[offset + c] =
+                input[offset + c]
+                    * scales[c]
+                    + biases[c];
+        }
+    }
+}
+
+pub fn channel_scale_forward(
+    layer: &ChannelScaleLayer,
+    input: &[f32],
+    batch_size: usize,
+    params: &ParameterStore,
+) -> Vec<f32> {
+    let scales =
+        params.values(
+            layer.scales
+        );
+
+    let biases =
+        params.values(
+            layer.biases
+        );
+
+    let sequence_size =
+        input.len() / batch_size;
+
+    debug_assert_eq!(
+        sequence_size % layer.channels,
+        0
+    );
+
+    let mut output =
+        vec![0.0; input.len()];
+
+    for b in 0..batch_size {
+        let base =
+            b * sequence_size;
+
+        let end =
+            base + sequence_size;
+
+        channel_scale_simd(
+            &input[base..end],
+            &mut output[base..end],
+            scales,
+            biases,
+            layer.channels,
+        );
+    }
+
+    output
+}
+
+// ============================================================================
+// Low-rank pointwise
+// ============================================================================
+
+pub fn low_rank_pointwise_forward(
+    layer: &LowRankPointwiseLayer,
+    input: &[f32],
+    batch_size: usize,
+    positions: usize,
+    first_weights: &[f32],
+    first_biases: &[f32],
+    second_weights: &[f32],
+    second_biases: &[f32],
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+) {
+    let rows =
+        batch_size
+            * positions;
+
+    let mut hidden =
+        vec![
+            0.0;
+            rows * layer.rank
+        ];
+
+    let mut output =
+        vec![
+            0.0;
+            rows * layer.out_channels
+        ];
+
+    unsafe {
+        cblas::sgemm(
+            Layout::RowMajor,
+            Transpose::None,
+            Transpose::Ordinary,
+            rows as i32,
+            layer.rank as i32,
+            layer.in_channels as i32,
+            1.0,
+            input,
+            layer.in_channels as i32,
+            first_weights,
+            layer.in_channels as i32,
+            0.0,
+            &mut hidden,
+            layer.rank as i32,
+        );
+    }
+
+    activation_bias_simd(
+        &mut hidden,
+        first_biases,
+        layer.rank,
+        &layer.activation,
+    );
+
+    unsafe {
+        cblas::sgemm(
+            Layout::RowMajor,
+            Transpose::None,
+            Transpose::Ordinary,
+            rows as i32,
+            layer.out_channels as i32,
+            layer.rank as i32,
+            1.0,
+            &hidden,
+            layer.rank as i32,
+            second_weights,
+            layer.rank as i32,
+            0.0,
+            &mut output,
+            layer.out_channels as i32,
+        );
+    }
+
+    activation_bias_simd(
+        &mut output,
+        second_biases,
+        layer.out_channels,
+        &layer.activation,
+    );
+
+    (
+        output,
+        hidden,
+    )
+}
+
+// ============================================================================
+// LayerNorm
+// ============================================================================
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn layer_norm_group_avx2(
+    input: &[f32],
+    output: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    epsilon: f32,
+) -> (f32, f32) {
+    unsafe {
+        debug_assert_eq!(
+            input.len(),
+            output.len()
+        );
+
+        debug_assert_eq!(
+            input.len(),
+            gamma.len()
+        );
+
+        debug_assert_eq!(
+            input.len(),
+            beta.len()
+        );
+
+        let channels =
+            input.len();
+
+        let mut sum_vec =
+            _mm256_setzero_ps();
+
+        let mut c =
+            0usize;
+
+        while c + 8 <= channels {
+            let x =
+                _mm256_loadu_ps(
+                    input.as_ptr()
+                        .add(c)
+                );
+
+            sum_vec =
+                _mm256_add_ps(
+                    sum_vec,
+                    x,
+                );
+
+            c += 8;
+        }
+
+        let mut tmp =
+            [0.0f32; 8];
+
+        _mm256_storeu_ps(
+            tmp.as_mut_ptr(),
+            sum_vec,
+        );
+
+        let mut sum =
+            tmp[0]
+                + tmp[1]
+                + tmp[2]
+                + tmp[3]
+                + tmp[4]
+                + tmp[5]
+                + tmp[6]
+                + tmp[7];
+
+        while c < channels {
+            sum +=
+                input[c];
+
+            c += 1;
+        }
+
+        let channels_f32 =
+            channels as f32;
+
+        let mean =
+            sum / channels_f32;
+
+        let mean_vec =
+            _mm256_set1_ps(
+                mean
+            );
+
+        let mut variance_vec =
+            _mm256_setzero_ps();
+
+        c = 0;
+
+        while c + 8 <= channels {
+            let x =
+                _mm256_loadu_ps(
+                    input.as_ptr()
+                        .add(c)
+                );
+
+            let diff =
+                _mm256_sub_ps(
+                    x,
+                    mean_vec,
+                );
+
+            variance_vec =
+                _mm256_add_ps(
+                    variance_vec,
+                    _mm256_mul_ps(
+                        diff,
+                        diff,
+                    ),
+                );
+
+            c += 8;
+        }
+
+        _mm256_storeu_ps(
+            tmp.as_mut_ptr(),
+            variance_vec,
+        );
+
+        let mut variance =
+            tmp[0]
+                + tmp[1]
+                + tmp[2]
+                + tmp[3]
+                + tmp[4]
+                + tmp[5]
+                + tmp[6]
+                + tmp[7];
+
+        while c < channels {
+            let diff =
+                input[c]
+                    - mean;
+
+            variance +=
+                diff * diff;
+
+            c += 1;
+        }
+
+        variance /=
+            channels_f32;
+
+        let inv_std =
+            1.0f32
+                / (variance + epsilon).sqrt();
+
+        let inv_std_vec =
+            _mm256_set1_ps(
+                inv_std
+            );
+
+        let mut c =
+            0usize;
+
+        while c + 8 <= channels {
+            let x =
+                _mm256_loadu_ps(
+                    input.as_ptr()
+                        .add(c)
+                );
+
+            let g =
+                _mm256_loadu_ps(
+                    gamma.as_ptr()
+                        .add(c)
+                );
+
+            let b =
+                _mm256_loadu_ps(
+                    beta.as_ptr()
+                        .add(c)
+                );
+
+            let normalized =
+                _mm256_mul_ps(
+                    _mm256_sub_ps(
+                        x,
+                        mean_vec,
+                    ),
+                    inv_std_vec,
+                );
+
+            let y =
+                _mm256_add_ps(
+                    _mm256_mul_ps(
+                        normalized,
+                        g,
+                    ),
+                    b,
+                );
+
+            _mm256_storeu_ps(
+                output.as_mut_ptr()
+                    .add(c),
+                y,
+            );
+
+            c += 8;
+        }
+
+        while c < channels {
+            let normalized =
+                (input[c] - mean)
+                    * inv_std;
+
+            output[c] =
+                normalized * gamma[c]
+                    + beta[c];
+
+            c += 1;
+        }
+
+        (
+            mean,
+            inv_std,
+        )
+    }
+}
+
+pub fn layer_norm_forward(
+    layer: &LayerNormLayer,
+    input: &[f32],
+    batch_size: usize,
+    params: &ParameterStore,
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
+    debug_assert!(
+        batch_size > 0
+    );
+
+    debug_assert!(
+        layer.channels > 0
+    );
+
+    debug_assert_eq!(
+        input.len() % batch_size,
+        0
+    );
+
+    let channels =
+        layer.channels;
+
+    let epsilon =
+        layer.epsilon;
+
+    let sequence_size =
+        input.len() / batch_size;
+
+    debug_assert_eq!(
+        sequence_size % channels,
+        0
+    );
+
+    let positions =
+        sequence_size / channels;
+
+    let group_count =
+        batch_size * positions;
+
+    let gamma =
+        params.values(
+            layer.gamma
+        );
+
+    let beta =
+        params.values(
+            layer.beta
+        );
+
+    debug_assert_eq!(
+        gamma.len(),
+        channels
+    );
+
+    debug_assert_eq!(
+        beta.len(),
+        channels
+    );
+
+    let mut output =
+        vec![
+            0.0f32;
+            input.len()
+        ];
+
+    let mut means =
+        vec![
+            0.0f32;
+            group_count
+        ];
+
+    let mut inv_stds =
+        vec![
+            0.0f32;
+            group_count
+        ];
+
+    for group in 0..group_count {
+        let base =
+            group * channels;
+
+        let input_group =
+            &input[
+                base..base + channels
+                ];
+
+        let output_group =
+            &mut output[
+                base..base + channels
+                ];
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!(
+                "avx2"
+            ) {
+                let (
+                    mean,
+                    inv_std,
+                ) =
+                    unsafe {
+                        layer_norm_group_avx2(
+                            input_group,
+                            output_group,
+                            gamma,
+                            beta,
+                            epsilon,
+                        )
+                    };
+
+                means[group] =
+                    mean;
+
+                inv_stds[group] =
+                    inv_std;
+
+                continue;
+            }
+        }
+
+        let channels_f32 =
+            channels as f32;
+
+        let mut sum =
+            0.0f32;
+
+        for &x in input_group {
+            sum += x;
+        }
+
+        let mean =
+            sum / channels_f32;
+
+        means[group] =
+            mean;
+
+        let mut variance =
+            0.0f32;
+
+        for &x in input_group {
+            let diff =
+                x - mean;
+
+            variance +=
+                diff * diff;
+        }
+
+        variance /=
+            channels_f32;
+
+        let inv_std =
+            1.0f32
+                / (variance + epsilon)
+                .sqrt();
+
+        inv_stds[group] =
+            inv_std;
+
+        for c in 0..channels {
+            let normalized =
+                (input_group[c] - mean)
+                    * inv_std;
+
+            output_group[c] =
+                normalized * gamma[c]
+                    + beta[c];
+        }
+    }
+
+    (
+        output,
+        means,
+        inv_stds,
+    )
+}
+
+// ============================================================================
+// Weight tying
+// ============================================================================
+
+pub fn weight_tying_forward(
+    layer: &WeightTyingLayer,
+    params: &ParameterStore,
+    input: &[f32],
+    batch_size: usize,
+) -> Vec<f32> {
+    let embedding_dim =
+        layer.embeddings.embedding_dim();
+
+    let vocab_size =
+        layer.embeddings.vocab_size();
+
+    assert_eq!(
+        input.len(),
+        batch_size * embedding_dim,
+        "Invalid WeightTying input size"
+    );
+
+    let weights =
+        params.values(
+            layer.embeddings.parameter_range()
+        );
+
+    debug_assert_eq!(
+        weights.len(),
+        vocab_size * embedding_dim
+    );
+
+    let mut output =
+        vec![
+            0.0;
+            batch_size * vocab_size
+        ];
+
+    unsafe {
+        cblas::sgemm(
+            Layout::RowMajor,
+            Transpose::None,
+            Transpose::Ordinary,
+            batch_size as i32,
+            vocab_size as i32,
+            embedding_dim as i32,
+            1.0,
+            input,
+            embedding_dim as i32,
+            weights,
+            embedding_dim as i32,
+            0.0,
+            &mut output,
+            vocab_size as i32,
+        );
+    }
+
+    output
+}
+
+// ============================================================================
+// Layer stack
+// ============================================================================
+
 pub fn forward_layers_batch(
     layers: &[Layer],
+    params: &ParameterStore,
     input: &[f32],
     batch_size: usize,
     input_size: usize,
     thread_pool: &ThreadPool,
-) -> (Vec<f32>, usize, Vec<BatchLayerCache>) {
-    let mut current = input.to_vec();
-    let mut current_size = input_size;
-    let mut caches = Vec::with_capacity(layers.len());
+) -> (
+    Vec<f32>,
+    usize,
+    Vec<BatchLayerCache>,
+) {
+    let mut current =
+        input.to_vec();
+
+    let mut current_size =
+        input_size;
+
+    let mut caches =
+        Vec::with_capacity(
+            layers.len()
+        );
 
     for layer in layers {
-        let (output, output_size, cache) =
-            forward_layer_batch(layer, &current, batch_size, current_size, thread_pool);
+        let (
+            output,
+            output_size,
+            cache,
+        ) =
+            forward_layer_batch(
+                layer,
+                params,
+                &current,
+                batch_size,
+                current_size,
+                thread_pool,
+            );
 
-        current = output;
-        current_size = output_size;
+        current =
+            output;
+
+        current_size =
+            output_size;
+
         caches.push(cache);
     }
 
-    (current, current_size, caches)
+    (
+        current,
+        current_size,
+        caches,
+    )
 }
 
 fn forward_layer_batch(
     layer: &Layer,
+    params: &ParameterStore,
     input: &[f32],
     batch_size: usize,
     input_size: usize,
     thread_pool: &ThreadPool,
-) -> (Vec<f32>, usize, BatchLayerCache) {
+) -> (
+    Vec<f32>,
+    usize,
+    BatchLayerCache,
+) {
     match layer {
+        // ====================================================================
+        // Dense
+        // ====================================================================
+
         Layer::Dense(layer) => {
-            let output_size = layer.biases.len();
+            let output_size =
+                layer.output_size;
 
             assert_eq!(
                 input.len(),
-                batch_size * input_size
+                batch_size
+                    * input_size
             );
 
-            let mut weights = vec![0.0; layer.fused_weights.len()];
-            let mut biases = vec![0.0; layer.fused_biases.len()];
+            let weights =
+                params.values(
+                    layer.weights
+                );
 
-            crate::handle_data_slice(&layer.fused_weights, &mut weights);
-            crate::handle_data_slice(&layer.fused_biases, &mut biases);
+            let biases =
+                params.values(
+                    layer.biases
+                );
+
+            debug_assert_eq!(
+                weights.len(),
+                input_size
+                    * output_size
+            );
+
+            debug_assert_eq!(
+                biases.len(),
+                output_size
+            );
 
             let mut output =
-                vec![0.0; batch_size * output_size];
+                vec![
+                    0.0;
+                    batch_size
+                        * output_size
+                ];
 
             unsafe {
                 cblas::sgemm(
@@ -1785,7 +2079,7 @@ fn forward_layer_batch(
                     1.0,
                     input,
                     input_size as i32,
-                    &weights,
+                    weights,
                     input_size as i32,
                     0.0,
                     &mut output,
@@ -1795,76 +2089,116 @@ fn forward_layer_batch(
 
             activation_bias_simd(
                 &mut output,
-                &biases,
+                biases,
                 output_size,
                 &layer.activation,
             );
 
             let activation_output =
                 match layer.activation {
-                    Activation::None => None,
-                    _ => Some(output.clone()),
+                    Activation::None =>
+                        None,
+
+                    _ =>
+                        Some(
+                            output.clone()
+                        ),
                 };
 
-            let cache = BatchLayerCache::Dense {
-                input_size,
-                output_size,
-                input: input.to_vec(),
-                activation_output,
-                weights,
-                weight_handles: Arc::clone(&layer.fused_weights),
-                bias_handles: Arc::clone(&layer.fused_biases),
-                activation: layer.activation.clone(),
-            };
+            let cache =
+                BatchLayerCache::Dense {
+                    input_size,
+                    output_size,
+                    input: input.to_vec(),
+                    activation_output,
+                    activation:
+                    layer.activation,
+                };
 
-            (output, output_size, cache)
+            (
+                output,
+                output_size,
+                cache,
+            )
         }
+
+        // ====================================================================
+        // Conv1D
+        // ====================================================================
 
         Layer::Conv1D(layer) => {
             assert_eq!(
-                input_size % layer.in_channels,
+                input_size
+                    % layer.in_channels,
                 0
             );
 
             let input_length =
-                input_size / layer.in_channels;
+                input_size
+                    / layer.in_channels;
 
             let output_length =
-                layer.output_length(input_length);
+                layer.output_length(
+                    input_length
+                );
 
-            let output = conv1d_forward(
-                layer,
-                input,
-                batch_size,
-                input_length,
-                output_length,
-            );
+            let weights =
+                params.values(
+                    layer.weights
+                );
+
+            let biases =
+                params.values(
+                    layer.biases
+                );
+
+            let output =
+                conv1d_forward(
+                    layer,
+                    weights,
+                    biases,
+                    input,
+                    batch_size,
+                    input_length,
+                    output_length,
+                );
 
             let output_size =
-                output_length * layer.out_channels;
+                output_length
+                    * layer.out_channels;
 
-            let cache = BatchLayerCache::Conv1D {
-                input: input.to_vec(),
-                output: output.clone(),
-                input_length,
-                output_length,
-                in_channels: layer.in_channels,
-                out_channels: layer.out_channels,
-                kernel_size: layer.kernel_size,
-                stride: layer.stride,
-                padding: layer.padding,
-                causal: layer.causal,
-                weight_handles: Arc::clone(
-                    &layer.weight_handles
-                ),
-                bias_handles: Arc::clone(
-                    &layer.bias_handles
-                ),
-                activation: layer.activation.clone(),
-            };
+            let cache =
+                BatchLayerCache::Conv1D {
+                    input: input.to_vec(),
+                    output: output.clone(),
+                    input_length,
+                    output_length,
+                    in_channels:
+                    layer.in_channels,
+                    out_channels:
+                    layer.out_channels,
+                    kernel_size:
+                    layer.kernel_size,
+                    stride:
+                    layer.stride,
+                    padding:
+                    layer.padding,
+                    causal:
+                    layer.causal,
+                    activation:
+                    layer.activation,
+                };
 
-            (output, output_size, cache)
+            (
+                output,
+                output_size,
+                cache,
+            )
         }
+
+        // ====================================================================
+        // Residual
+        // ====================================================================
 
         Layer::Residual(layer) => {
             assert_eq!(
@@ -1876,13 +2210,15 @@ fn forward_layer_batch(
                 inner_output,
                 inner_output_size,
                 inner_caches,
-            ) = forward_layers_batch(
-                &layer.layers,
-                input,
-                batch_size,
-                input_size,
-                thread_pool,
-            );
+            ) =
+                forward_layers_batch(
+                    &layer.layers,
+                    params,
+                    input,
+                    batch_size,
+                    input_size,
+                    thread_pool,
+                );
 
             assert_eq!(
                 inner_output_size,
@@ -1890,16 +2226,19 @@ fn forward_layer_batch(
                 "Residual block changed tensor size"
             );
 
-            let mut output = inner_output;
+            let mut output =
+                inner_output;
 
             add_f32_slice_simd(
                 &mut output,
                 input,
             );
 
-            let cache = BatchLayerCache::Residual {
-                inner: inner_caches,
-            };
+            let cache =
+                BatchLayerCache::Residual {
+                    inner:
+                    inner_caches,
+                };
 
             (
                 output,
@@ -1908,21 +2247,41 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Depthwise Conv1D
+        // ====================================================================
+
         Layer::DepthwiseConv1D(layer) => {
             assert_eq!(
-                input_size % layer.in_channels,
+                input_size
+                    % layer.in_channels,
                 0
             );
 
             let input_length =
-                input_size / layer.in_channels;
+                input_size
+                    / layer.in_channels;
 
             let output_length =
-                layer.output_length(input_length);
+                layer.output_length(
+                    input_length
+                );
+
+            let weights =
+                params.values(
+                    layer.weights
+                );
+
+            let biases =
+                params.values(
+                    layer.biases
+                );
 
             let output =
                 depthwise_conv1d_forward(
                     layer,
+                    weights,
+                    biases,
                     input,
                     batch_size,
                     input_length,
@@ -1931,7 +2290,8 @@ fn forward_layer_batch(
                 );
 
             let output_size =
-                output_length * layer.in_channels;
+                output_length
+                    * layer.in_channels;
 
             let cache =
                 BatchLayerCache::DepthwiseConv1D {
@@ -1939,18 +2299,18 @@ fn forward_layer_batch(
                     output: output.clone(),
                     input_length,
                     output_length,
-                    in_channels: layer.in_channels,
-                    kernel_size: layer.kernel_size,
-                    stride: layer.stride,
-                    padding: layer.padding,
-                    causal: layer.causal,
-                    weight_handles: Arc::clone(
-                        &layer.weight_handles
-                    ),
-                    bias_handles: Arc::clone(
-                        &layer.bias_handles
-                    ),
-                    activation: layer.activation.clone(),
+                    in_channels:
+                    layer.in_channels,
+                    kernel_size:
+                    layer.kernel_size,
+                    stride:
+                    layer.stride,
+                    padding:
+                    layer.padding,
+                    causal:
+                    layer.causal,
+                    activation:
+                    layer.activation,
                 };
 
             (
@@ -1960,21 +2320,41 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Grouped Conv1D
+        // ====================================================================
+
         Layer::GroupedConv1D(layer) => {
             assert_eq!(
-                input_size % layer.in_channels,
+                input_size
+                    % layer.in_channels,
                 0
             );
 
             let input_length =
-                input_size / layer.in_channels;
+                input_size
+                    / layer.in_channels;
 
             let output_length =
-                layer.output_length(input_length);
+                layer.output_length(
+                    input_length
+                );
+
+            let weights =
+                params.values(
+                    layer.weights
+                );
+
+            let biases =
+                params.values(
+                    layer.biases
+                );
 
             let output =
                 grouped_conv1d_forward(
                     layer,
+                    weights,
+                    biases,
                     input,
                     batch_size,
                     input_length,
@@ -1982,7 +2362,8 @@ fn forward_layer_batch(
                 );
 
             let output_size =
-                output_length * layer.out_channels;
+                output_length
+                    * layer.out_channels;
 
             let cache =
                 BatchLayerCache::GroupedConv1D {
@@ -1990,20 +2371,22 @@ fn forward_layer_batch(
                     output: output.clone(),
                     input_length,
                     output_length,
-                    in_channels: layer.in_channels,
-                    out_channels: layer.out_channels,
-                    groups: layer.groups,
-                    kernel_size: layer.kernel_size,
-                    stride: layer.stride,
-                    padding: layer.padding,
-                    causal: layer.causal,
-                    weight_handles: Arc::clone(
-                        &layer.weight_handles
-                    ),
-                    bias_handles: Arc::clone(
-                        &layer.bias_handles
-                    ),
-                    activation: layer.activation.clone(),
+                    in_channels:
+                    layer.in_channels,
+                    out_channels:
+                    layer.out_channels,
+                    groups:
+                    layer.groups,
+                    kernel_size:
+                    layer.kernel_size,
+                    stride:
+                    layer.stride,
+                    padding:
+                    layer.padding,
+                    causal:
+                    layer.causal,
+                    activation:
+                    layer.activation,
                 };
 
             (
@@ -2013,66 +2396,63 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Low-Rank Pointwise
+        // ====================================================================
+
         Layer::LowRankPointwise(layer) => {
             assert_eq!(
-                input_size % layer.in_channels,
+                input_size
+                    % layer.in_channels,
                 0
             );
 
             let positions =
-                input_size / layer.in_channels;
+                input_size
+                    / layer.in_channels;
 
-            let mut first_weights =
-                vec![0.0; layer.first_weight_handles.len()];
+            let first_weights =
+                params.values(
+                    layer.first_weights
+                );
 
-            let mut first_biases =
-                vec![0.0; layer.first_bias_handles.len()];
+            let first_biases =
+                params.values(
+                    layer.first_biases
+                );
 
-            let mut second_weights =
-                vec![0.0; layer.second_weight_handles.len()];
+            let second_weights =
+                params.values(
+                    layer.second_weights
+                );
 
-            let mut second_biases =
-                vec![0.0; layer.second_bias_handles.len()];
-
-            crate::handle_data_slice(
-                &layer.first_weight_handles,
-                &mut first_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.first_bias_handles,
-                &mut first_biases,
-            );
-
-            crate::handle_data_slice(
-                &layer.second_weight_handles,
-                &mut second_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.second_bias_handles,
-                &mut second_biases,
-            );
+            let second_biases =
+                params.values(
+                    layer.second_biases
+                );
 
             let (
                 output,
                 hidden,
-            ) = low_rank_pointwise_forward(
-                layer,
-                input,
-                batch_size,
-                positions,
-                &first_weights,
-                &first_biases,
-                &second_weights,
-                &second_biases,
-            );
+            ) =
+                low_rank_pointwise_forward(
+                    layer,
+                    input,
+                    batch_size,
+                    positions,
+                    first_weights,
+                    first_biases,
+                    second_weights,
+                    second_biases,
+                );
 
             let output_size =
-                positions * layer.out_channels;
+                positions
+                    * layer.out_channels;
 
             let rows =
-                batch_size * positions;
+                batch_size
+                    * positions;
 
             let cache =
                 BatchLayerCache::LowRankPointwise {
@@ -2080,24 +2460,18 @@ fn forward_layer_batch(
                     hidden,
                     output: output.clone(),
                     rows,
-                    in_channels: layer.in_channels,
-                    rank: layer.rank,
-                    out_channels: layer.out_channels,
-                    first_weights,
-                    second_weights,
-                    first_weight_handles: Arc::clone(
-                        &layer.first_weight_handles
-                    ),
-                    first_bias_handles: Arc::clone(
-                        &layer.first_bias_handles
-                    ),
-                    second_weight_handles: Arc::clone(
-                        &layer.second_weight_handles
-                    ),
-                    second_bias_handles: Arc::clone(
-                        &layer.second_bias_handles
-                    ),
-                    activation: layer.activation.clone(),
+                    in_channels:
+                    layer.in_channels,
+                    rank:
+                    layer.rank,
+                    out_channels:
+                    layer.out_channels,
+                    first_weights:
+                    first_weights.to_vec(),
+                    second_weights:
+                    second_weights.to_vec(),
+                    activation:
+                    layer.activation,
                 };
 
             (
@@ -2107,9 +2481,14 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Channel Scale
+        // ====================================================================
+
         Layer::ChannelScale(layer) => {
             assert_eq!(
-                input_size % layer.channels,
+                input_size
+                    % layer.channels,
                 0
             );
 
@@ -2118,18 +2497,14 @@ fn forward_layer_batch(
                     layer,
                     input,
                     batch_size,
+                    params,
                 );
 
             let cache =
                 BatchLayerCache::ChannelScale {
                     input: input.to_vec(),
-                    channels: layer.channels,
-                    scale_handles: Arc::clone(
-                        &layer.scale_handles
-                    ),
-                    bias_handles: Arc::clone(
-                        &layer.bias_handles
-                    ),
+                    channels:
+                    layer.channels,
                 };
 
             (
@@ -2139,9 +2514,14 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // LayerNorm
+        // ====================================================================
+
         Layer::LayerNorm(layer) => {
             assert_eq!(
-                input_size % layer.channels,
+                input_size
+                    % layer.channels,
                 0,
                 "LayerNorm channels must divide input size"
             );
@@ -2152,12 +2532,10 @@ fn forward_layer_batch(
                 inv_stds,
             ) =
                 layer_norm_forward(
+                    layer,
                     input,
                     batch_size,
-                    layer.channels,
-                    layer.epsilon,
-                    &layer.gamma_handles,
-                    &layer.beta_handles,
+                    params,
                 );
 
             let cache =
@@ -2165,13 +2543,8 @@ fn forward_layer_batch(
                     input: input.to_vec(),
                     means,
                     inv_stds,
-                    channels: layer.channels,
-                    gamma_handles: Arc::clone(
-                        &layer.gamma_handles
-                    ),
-                    beta_handles: Arc::clone(
-                        &layer.beta_handles
-                    ),
+                    channels:
+                    layer.channels,
                 };
 
             (
@@ -2181,12 +2554,18 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Weight Tying
+        // ====================================================================
+
         Layer::WeightTying(layer) => {
             let embedding_dim =
-                layer.embeddings.embedding_dim();
+                layer.embeddings
+                    .embedding_dim();
 
             let vocab_size =
-                layer.embeddings.vocab_size();
+                layer.embeddings
+                    .vocab_size();
 
             assert_eq!(
                 input_size,
@@ -2197,6 +2576,7 @@ fn forward_layer_batch(
             let output =
                 weight_tying_forward(
                     layer,
+                    params,
                     input,
                     batch_size,
                 );
@@ -2204,7 +2584,8 @@ fn forward_layer_batch(
             let cache =
                 BatchLayerCache::WeightTying {
                     input: input.to_vec(),
-                    embeddings: Arc::clone(
+                    embeddings:
+                    Arc::clone(
                         &layer.embeddings
                     ),
                     batch_size,
@@ -2219,6 +2600,10 @@ fn forward_layer_batch(
             )
         }
 
+        // ====================================================================
+        // Global Mixer
+        // ====================================================================
+
         Layer::GlobalMixer(layer) => {
             assert!(
                 layer.channels > 0,
@@ -2231,77 +2616,45 @@ fn forward_layer_batch(
             );
 
             assert_eq!(
-                input_size % layer.channels,
+                input_size
+                    % layer.channels,
                 0,
                 "GlobalMixer channels must divide input size"
             );
 
             let positions =
-                input_size / layer.channels;
+                input_size
+                    / layer.channels;
 
-            let mut write_weights =
-                vec![
-                    0.0f32;
-                    layer.write_weight_handles.len()
-                ];
+            let write_weights =
+                params.values(
+                    layer.write_weights
+                );
 
-            let mut write_biases =
-                vec![
-                    0.0f32;
-                    layer.write_bias_handles.len()
-                ];
+            let write_biases =
+                params.values(
+                    layer.write_biases
+                );
 
-            let mut read_weights =
-                vec![
-                    0.0f32;
-                    layer.read_weight_handles.len()
-                ];
+            let read_weights =
+                params.values(
+                    layer.read_weights
+                );
 
-            let mut read_biases =
-                vec![
-                    0.0f32;
-                    layer.read_bias_handles.len()
-                ];
+            let read_biases =
+                params.values(
+                    layer.read_biases
+                );
 
-            let positional_count =
-                layer.global_dim
-                    * GLOBAL_MIXER_POS_FEATURES;
+            let write_positional_weights =
+                params.values(
+                    layer.write_positional_weights
+                );
 
-            let mut write_positional_weights =
-                vec![0.0f32; positional_count];
-
-            let mut read_positional_weights =
-                vec![0.0f32; positional_count];
-
-            crate::handle_data_slice(
-                &layer.write_positional_weight_handles,
-                &mut write_positional_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.read_positional_weight_handles,
-                &mut read_positional_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.write_weight_handles,
-                &mut write_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.write_bias_handles,
-                &mut write_biases,
-            );
-
-            crate::handle_data_slice(
-                &layer.read_weight_handles,
-                &mut read_weights,
-            );
-
-            crate::handle_data_slice(
-                &layer.read_bias_handles,
-                &mut read_biases,
-            );
+            let read_positional_weights =
+                params.values(
+                    layer.read_positional_weights
+                );
 
             debug_assert_eq!(
                 write_weights.len(),
@@ -2315,6 +2668,30 @@ fn forward_layer_batch(
                     * layer.channels
             );
 
+            debug_assert_eq!(
+                write_biases.len(),
+                layer.global_dim
+            );
+
+            debug_assert_eq!(
+                read_biases.len(),
+                layer.global_dim
+            );
+
+            let positional_count =
+                layer.global_dim
+                    * GLOBAL_MIXER_POS_FEATURES;
+
+            debug_assert_eq!(
+                write_positional_weights.len(),
+                positional_count
+            );
+
+            debug_assert_eq!(
+                read_positional_weights.len(),
+                positional_count
+            );
+
             let (
                 output,
                 write_probs,
@@ -2326,12 +2703,12 @@ fn forward_layer_batch(
                     input,
                     batch_size,
                     positions,
-                    &write_weights,
-                    &write_biases,
-                    &read_weights,
-                    &read_biases,
-                    &write_positional_weights,
-                    &read_positional_weights,
+                    write_weights,
+                    write_biases,
+                    read_weights,
+                    read_biases,
+                    write_positional_weights,
+                    read_positional_weights,
                 );
 
             let cache =
@@ -2341,17 +2718,10 @@ fn forward_layer_batch(
                     global_vectors,
                     read_probs,
                     positions,
-                    channels: layer.channels,
-                    global_dim: layer.global_dim,
-
-                    write_weight_handles: Arc::clone(&layer.write_weight_handles),
-                    write_bias_handles: Arc::clone(&layer.write_bias_handles),
-
-                    read_weight_handles: Arc::clone(&layer.read_weight_handles),
-                    read_bias_handles: Arc::clone(&layer.read_bias_handles),
-
-                    write_positional_weight_handles: Arc::clone(&layer.write_positional_weight_handles),
-                    read_positional_weight_handles: Arc::clone(&layer.read_positional_weight_handles),
+                    channels:
+                    layer.channels,
+                    global_dim:
+                    layer.global_dim,
                 };
 
             (

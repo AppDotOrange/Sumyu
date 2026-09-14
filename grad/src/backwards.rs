@@ -1,6 +1,13 @@
-use crate::neuron::{Activation, BatchLayerCache};
-use crate::TensorHandle;
+use crate::embeddings::Embeddings;
+use crate::neuron::{
+    Activation,
+    BatchLayerCache,
+    Layer,
+};
+use crate::parameters::ParameterStore;
+
 use cblas::{Layout, Transpose};
+
 use std::cell::RefCell;
 
 #[cfg(target_arch = "x86_64")]
@@ -16,8 +23,17 @@ use std::arch::x86_64::{
 };
 
 use crate::conv1d_backward::backward_direct;
-use crate::forwards::{global_mixer_position_features, GLOBAL_MIXER_POS_FEATURES};
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
+
+use crate::forwards::{
+    global_mixer_position_features,
+    GLOBAL_MIXER_POS_FEATURES,
+};
+
+
+// ============================================================================
+// Shared backward workspace
+// ============================================================================
 
 pub struct BackwardWorkspace {
     pub(crate) weights: Vec<f32>,
@@ -26,6 +42,7 @@ pub struct BackwardWorkspace {
     weight_grads: Vec<f32>,
     bias_grads: Vec<f32>,
 
+    // Retained as reusable scratch for compatibility with existing code.
     col: Vec<f32>,
     col_grads: Vec<f32>,
     group_grad: Vec<f32>,
@@ -86,12 +103,33 @@ impl BackwardWorkspace {
 }
 
 thread_local! {
-    static BACKWARD_WORKSPACE:
-        RefCell<BackwardWorkspace> =
-            RefCell::new(
-                BackwardWorkspace::new()
-            );
+    static BACKWARD_WORKSPACE: RefCell<BackwardWorkspace> =
+        RefCell::new(BackwardWorkspace::new());
 }
+
+
+// ============================================================================
+// Small helpers
+// ============================================================================
+
+#[inline]
+fn accumulate_parameter_grads(
+    params: &mut ParameterStore,
+    range: crate::parameters::ParamRange,
+    local_grads: &[f32],
+) {
+    debug_assert_eq!(range.len, local_grads.len());
+
+    add_f32_slice_simd(
+        params.grads_mut(range),
+        local_grads,
+    );
+}
+
+
+// ============================================================================
+// Convolution position helper
+// ============================================================================
 
 #[inline]
 pub fn make_conv_positions(
@@ -101,15 +139,12 @@ pub fn make_conv_positions(
     padding: usize,
     causal: bool,
 ) -> Vec<i32> {
-    let total =
-        output_length * kernel_size;
+    let total = output_length * kernel_size;
 
-    let mut positions =
-        Vec::with_capacity(total);
+    let mut positions = Vec::with_capacity(total);
 
     for out_pos in 0..output_length {
-        let base =
-            out_pos * stride;
+        let base = out_pos * stride;
 
         for k in 0..kernel_size {
             let pos =
@@ -130,16 +165,21 @@ pub fn make_conv_positions(
     positions
 }
 
+
+// ============================================================================
+// SIMD helpers
+// ============================================================================
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn add_f32_slice_avx2(
     dst: &mut [f32],
     src: &[f32],
-) { unsafe {
+) {
     debug_assert_eq!(dst.len(), src.len());
 
     let len = dst.len();
-    let mut i = 0;
+    let mut i = 0usize;
 
     while i + 8 <= len {
         let a = _mm256_loadu_ps(
@@ -162,7 +202,7 @@ pub unsafe fn add_f32_slice_avx2(
         dst[i] += src[i];
         i += 1;
     }
-}}
+}
 
 #[inline]
 pub fn add_f32_slice_simd(
@@ -195,12 +235,12 @@ unsafe fn mul_add_f32_slice_avx2(
     dst: &mut [f32],
     a: &[f32],
     b: &[f32],
-) { unsafe {
+) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
 
     let len = dst.len();
-    let mut i = 0;
+    let mut i = 0usize;
 
     while i + 8 <= len {
         let x = _mm256_loadu_ps(
@@ -233,7 +273,7 @@ unsafe fn mul_add_f32_slice_avx2(
         dst[i] += a[i] * b[i];
         i += 1;
     }
-}}
+}
 
 #[inline]
 fn mul_add_f32_slice_simd(
@@ -266,6 +306,11 @@ fn mul_add_f32_slice_simd(
     }
 }
 
+
+// ============================================================================
+// Conv1D backward wrapper
+// ============================================================================
+
 pub fn conv1d_backward(
     input: &[f32],
     output: &[f32],
@@ -279,8 +324,7 @@ pub fn conv1d_backward(
     stride: usize,
     padding: usize,
     causal: bool,
-    weight_handles: &[TensorHandle],
-    bias_handles: &[TensorHandle],
+    weights: &[f32],
     activation: &Activation,
     workspace: &mut BackwardWorkspace,
 ) -> Vec<f32> {
@@ -289,14 +333,9 @@ pub fn conv1d_backward(
             * kernel_size
             * in_channels;
 
-    workspace.weights.resize(
+    debug_assert_eq!(
+        weights.len(),
         weights_len,
-        0.0,
-    );
-
-    crate::handle_data_slice(
-        weight_handles,
-        &mut workspace.weights,
     );
 
     let (
@@ -305,8 +344,8 @@ pub fn conv1d_backward(
         bias_grads,
     ) = backward_direct(
         input,
-        grad,
         output,
+        grad,
         batch_size,
         input_length,
         output_length,
@@ -316,19 +355,29 @@ pub fn conv1d_backward(
         stride,
         padding,
         causal,
-        &workspace.weights,
+        weights,
         activation,
     );
 
-    crate::add_handle_grad_slices_2(
-        weight_handles,
-        &weight_grads,
-        bias_handles,
-        &bias_grads,
+    workspace.weight_grads.clear();
+    workspace.bias_grads.clear();
+
+    // These are only scratch references for callers/debugging.
+    workspace.weight_grads.extend_from_slice(
+        &weight_grads
+    );
+
+    workspace.bias_grads.extend_from_slice(
+        &bias_grads
     );
 
     input_grads
 }
+
+
+// ============================================================================
+// Depthwise Conv1D backward
+// ============================================================================
 
 pub fn depthwise_conv1d_backward(
     input: &[f32],
@@ -342,11 +391,14 @@ pub fn depthwise_conv1d_backward(
     stride: usize,
     padding: usize,
     causal: bool,
-    weight_handles: &[TensorHandle],
-    bias_handles: &[TensorHandle],
+    weights: &[f32],
     activation: &Activation,
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
     debug_assert_eq!(
         input.len(),
         batch_size * input_length * in_channels
@@ -363,23 +415,8 @@ pub fn depthwise_conv1d_backward(
     );
 
     debug_assert_eq!(
-        weight_handles.len(),
+        weights.len(),
         in_channels * kernel_size
-    );
-
-    debug_assert_eq!(
-        bias_handles.len(),
-        in_channels
-    );
-
-    workspace.weights.resize(
-        weight_handles.len(),
-        0.0,
-    );
-
-    crate::handle_data_slice(
-        weight_handles,
-        &mut workspace.weights,
     );
 
     workspace.positions =
@@ -398,8 +435,11 @@ pub fn depthwise_conv1d_backward(
         );
     }
 
+    let depthwise_size =
+        in_channels * kernel_size;
+
     workspace.weight_grads.resize(
-        in_channels * kernel_size,
+        depthwise_size,
         0.0,
     );
     workspace.weight_grads.fill(0.0);
@@ -409,13 +449,6 @@ pub fn depthwise_conv1d_backward(
         0.0,
     );
     workspace.bias_grads.fill(0.0);
-
-    // K-major temporary layout:
-    //
-    // [k0 c0, k0 c1, ..., k0 cN,
-    //  k1 c0, k1 c1, ..., k1 cN, ...]
-    let depthwise_size =
-        in_channels * kernel_size;
 
     workspace.depthwise_weights_kmajor.resize(
         depthwise_size,
@@ -427,21 +460,23 @@ pub fn depthwise_conv1d_backward(
         0.0,
     );
 
-    workspace.depthwise_weight_grads_kmajor.fill(0.0);
+    workspace.depthwise_weight_grads_kmajor.fill(
+        0.0
+    );
 
     for c in 0..in_channels {
         for k in 0..kernel_size {
             workspace.depthwise_weights_kmajor[
                 k * in_channels + c
                 ] =
-                workspace.weights[
+                weights[
                     c * kernel_size + k
                     ];
         }
     }
 
     let mut input_grads =
-        vec![0.0; input.len()];
+        vec![0.0f32; input.len()];
 
     for b in 0..batch_size {
         let input_batch_base =
@@ -455,13 +490,11 @@ pub fn depthwise_conv1d_backward(
                 output_batch_base
                     + out_pos * in_channels;
 
-            // Bias gradient:
-            //
-            // bias_grad[c] += grad[c]
             add_f32_slice_simd(
                 &mut workspace.bias_grads,
                 &grad[
-                    grad_base..grad_base + in_channels
+                    grad_base
+                        ..grad_base + in_channels
                     ],
             );
 
@@ -489,36 +522,40 @@ pub fn depthwise_conv1d_backward(
                     k * in_channels;
 
                 mul_add_f32_slice_simd(
-                    &mut workspace.depthwise_weight_grads_kmajor[
+                    &mut workspace
+                        .depthwise_weight_grads_kmajor[
                         weight_base
                             ..weight_base + in_channels
                         ],
                     &input[
-                        src_base..src_base + in_channels
+                        src_base
+                            ..src_base + in_channels
                         ],
                     &grad[
-                        grad_base..grad_base + in_channels
+                        grad_base
+                            ..grad_base + in_channels
                         ],
                 );
 
                 mul_add_f32_slice_simd(
                     &mut input_grads[
-                        src_base..src_base + in_channels
+                        src_base
+                            ..src_base + in_channels
                         ],
-                    &workspace.depthwise_weights_kmajor[
+                    &workspace
+                        .depthwise_weights_kmajor[
                         weight_base
                             ..weight_base + in_channels
                         ],
                     &grad[
-                        grad_base..grad_base + in_channels
+                        grad_base
+                            ..grad_base + in_channels
                         ],
                 );
             }
         }
     }
 
-    // Convert k-major gradients back to the original
-    // channel-major parameter layout.
     for c in 0..in_channels {
         for k in 0..kernel_size {
             workspace.weight_grads[
@@ -530,18 +567,17 @@ pub fn depthwise_conv1d_backward(
         }
     }
 
-    crate::add_handle_grad_slices(
-        weight_handles,
-        &workspace.weight_grads,
-    );
-
-    crate::add_handle_grad_slices(
-        bias_handles,
-        &workspace.bias_grads,
-    );
-
-    input_grads
+    (
+        input_grads,
+        workspace.weight_grads.clone(),
+        workspace.bias_grads.clone(),
+    )
 }
+
+
+// ============================================================================
+// ChannelScale backward
+// ============================================================================
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -553,7 +589,7 @@ unsafe fn channel_scale_backward_avx2(
     bias_grads: &mut [f32],
     scales: &[f32],
     channels: usize,
-) { unsafe {
+) {
     let positions =
         input.len() / channels;
 
@@ -561,7 +597,7 @@ unsafe fn channel_scale_backward_avx2(
         let offset =
             position * channels;
 
-        let mut c = 0;
+        let mut c = 0usize;
 
         while c + 8 <= channels {
             let x =
@@ -641,13 +677,9 @@ unsafe fn channel_scale_backward_avx2(
             c += 8;
         }
 
-        // Scalar tail.
         while c < channels {
-            let x =
-                input[offset + c];
-
-            let g =
-                grad[offset + c];
+            let x = input[offset + c];
+            let g = grad[offset + c];
 
             input_grads[offset + c] +=
                 g * scales[c];
@@ -661,7 +693,7 @@ unsafe fn channel_scale_backward_avx2(
             c += 1;
         }
     }
-}}
+}
 
 #[inline]
 fn channel_scale_backward_simd(
@@ -742,13 +774,16 @@ fn channel_scale_backward_simd(
 
 pub fn channel_scale_backward(
     input: &[f32],
-    grad: &mut [f32],
+    grad: &[f32],
     batch_size: usize,
     channels: usize,
-    scale_handles: &[TensorHandle],
-    bias_handles: &[TensorHandle],
+    scales: &[f32],
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
     debug_assert_eq!(
         input.len(),
         grad.len()
@@ -760,23 +795,8 @@ pub fn channel_scale_backward(
     );
 
     debug_assert_eq!(
-        scale_handles.len(),
+        scales.len(),
         channels
-    );
-
-    debug_assert_eq!(
-        bias_handles.len(),
-        channels
-    );
-
-    workspace.weights.resize(
-        channels,
-        0.0,
-    );
-
-    crate::handle_data_slice(
-        scale_handles,
-        &mut workspace.weights,
     );
 
     workspace.weight_grads.resize(
@@ -792,7 +812,7 @@ pub fn channel_scale_backward(
     workspace.bias_grads.fill(0.0);
 
     let mut input_grads =
-        vec![0.0; input.len()];
+        vec![0.0f32; input.len()];
 
     let sequence_size =
         input.len() / batch_size;
@@ -818,20 +838,22 @@ pub fn channel_scale_backward(
                 ],
             &mut workspace.weight_grads,
             &mut workspace.bias_grads,
-            &workspace.weights,
+            scales,
             channels,
         );
     }
 
-    crate::add_handle_grad_slices_2(
-        scale_handles,
-        &workspace.weight_grads,
-        bias_handles,
-        &workspace.bias_grads,
-    );
-
-    input_grads
+    (
+        input_grads,
+        workspace.weight_grads.clone(),
+        workspace.bias_grads.clone(),
+    )
 }
+
+
+// ============================================================================
+// Low-rank pointwise backward
+// ============================================================================
 
 pub fn low_rank_pointwise_backward(
     input: &[f32],
@@ -844,24 +866,15 @@ pub fn low_rank_pointwise_backward(
     out_channels: usize,
     first_weights: &[f32],
     second_weights: &[f32],
-    first_weight_handles: &[TensorHandle],
-    first_bias_handles: &[TensorHandle],
-    second_weight_handles: &[TensorHandle],
-    second_bias_handles: &[TensorHandle],
     activation: &Activation,
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
-
-    // ============================================================
-    // Backprop through SECOND activation.
-    //
-    // grad:
-    // dL/d(output)
-    //
-    // becomes:
-    // dL/d(output_pre)
-    // ============================================================
-
+) -> (
+    Vec<f32>, // input gradients
+    Vec<f32>, // first weight gradients
+    Vec<f32>, // first bias gradients
+    Vec<f32>, // second weight gradients
+    Vec<f32>, // second bias gradients
+) {
     for i in 0..grad.len() {
         activation.backward(
             output[i],
@@ -869,32 +882,21 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // Allocate/reset second-layer gradients.
-    // ============================================================
+    // ------------------------------------------------------------
+    // Second layer gradients
+    // ------------------------------------------------------------
 
     workspace.second_weight_grads.resize(
         out_channels * rank,
         0.0,
     );
-
     workspace.second_weight_grads.fill(0.0);
 
     workspace.second_bias_grads.resize(
         out_channels,
         0.0,
     );
-
     workspace.second_bias_grads.fill(0.0);
-
-    // ============================================================
-    // dW2 = grad^T @ hidden
-    //
-    // grad   [rows, out_channels]
-    // hidden [rows, rank]
-    //
-    // dW2    [out_channels, rank]
-    // ============================================================
 
     unsafe {
         cblas::sgemm(
@@ -915,13 +917,8 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // db2 = sum over rows
-    // ============================================================
-
     for row in 0..rows {
-        let base =
-            row * out_channels;
+        let base = row * out_channels;
 
         for oc in 0..out_channels {
             workspace.second_bias_grads[oc] +=
@@ -929,20 +926,14 @@ pub fn low_rank_pointwise_backward(
         }
     }
 
-    // ============================================================
-    // dHidden = grad @ W2
-    //
-    // grad [rows, out_channels]
-    // W2   [out_channels, rank]
-    //
-    // dHidden [rows, rank]
-    // ============================================================
+    // ------------------------------------------------------------
+    // dHidden = dOutput * W2
+    // ------------------------------------------------------------
 
     workspace.hidden_grads.resize(
         rows * rank,
         0.0,
     );
-
     workspace.hidden_grads.fill(0.0);
 
     unsafe {
@@ -964,17 +955,7 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // Backprop through FIRST activation.
-    //
-    // hidden contains:
-    //
-    // activation(first_pre + b1)
-    //
-    // so activation.backward(hidden[i], ...)
-    // gives dL/d(first_pre).
-    // ============================================================
-
+    // First activation backward.
     for i in 0..workspace.hidden_grads.len() {
         activation.backward(
             hidden[i],
@@ -982,32 +963,21 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // Allocate/reset first-layer gradients.
-    // ============================================================
+    // ------------------------------------------------------------
+    // First layer gradients
+    // ------------------------------------------------------------
 
     workspace.first_weight_grads.resize(
         rank * in_channels,
         0.0,
     );
-
     workspace.first_weight_grads.fill(0.0);
 
     workspace.first_bias_grads.resize(
         rank,
         0.0,
     );
-
     workspace.first_bias_grads.fill(0.0);
-
-    // ============================================================
-    // dW1 = dHidden^T @ input
-    //
-    // dHidden [rows, rank]
-    // input   [rows, in_channels]
-    //
-    // dW1     [rank, in_channels]
-    // ============================================================
 
     unsafe {
         cblas::sgemm(
@@ -1028,13 +998,8 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // db1 = sum over rows
-    // ============================================================
-
     for row in 0..rows {
-        let base =
-            row * rank;
+        let base = row * rank;
 
         for r in 0..rank {
             workspace.first_bias_grads[r] +=
@@ -1044,20 +1009,12 @@ pub fn low_rank_pointwise_backward(
         }
     }
 
-    // ============================================================
-    // dInput = dHidden @ W1
-    //
-    // dHidden [rows, rank]
-    // W1      [rank, in_channels]
-    //
-    // dInput  [rows, in_channels]
-    // ============================================================
+    // ------------------------------------------------------------
+    // dInput = dHidden * W1
+    // ------------------------------------------------------------
 
     let mut input_grads =
-        vec![
-            0.0;
-            rows * in_channels
-        ];
+        vec![0.0f32; rows * in_channels];
 
     unsafe {
         cblas::sgemm(
@@ -1078,32 +1035,18 @@ pub fn low_rank_pointwise_backward(
         );
     }
 
-    // ============================================================
-    // Accumulate parameter gradients.
-    // ============================================================
-
-    crate::add_handle_grad_slices(
-        first_weight_handles,
-        &workspace.first_weight_grads,
-    );
-
-    crate::add_handle_grad_slices(
-        first_bias_handles,
-        &workspace.first_bias_grads,
-    );
-
-    crate::add_handle_grad_slices(
-        second_weight_handles,
-        &workspace.second_weight_grads,
-    );
-
-    crate::add_handle_grad_slices(
-        second_bias_handles,
-        &workspace.second_bias_grads,
-    );
-
-    input_grads
+    (
+        input_grads,
+        workspace.first_weight_grads.clone(),
+        workspace.first_bias_grads.clone(),
+        workspace.second_weight_grads.clone(),
+        workspace.second_bias_grads.clone(),
+    )
 }
+
+// ============================================================================
+// LayerNorm backward
+// ============================================================================
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
@@ -1121,59 +1064,20 @@ unsafe fn layer_norm_backward_group_avx2(
     let channels =
         input.len();
 
-    debug_assert_eq!(
-        grad.len(),
-        channels
-    );
+    debug_assert_eq!(grad.len(), channels);
+    debug_assert_eq!(output_grad.len(), channels);
+    debug_assert_eq!(gamma.len(), channels);
 
-    debug_assert_eq!(
-        output_grad.len(),
-        channels
-    );
-
-    debug_assert_eq!(
-        gamma.len(),
-        channels
-    );
-
-    debug_assert_eq!(
-        weight_grads.len(),
-        channels
-    );
-
-    debug_assert_eq!(
-        bias_grads.len(),
-        channels
-    );
-
-    // ------------------------------------------------------------
-    // First pass:
-    //
-    // dxhat = dy * gamma
-    //
-    // We need:
-    //
-    //   mean(dxhat)
-    //   mean(dxhat * xhat)
-    //
-    // because:
-    //
-    //   dx = inv_std *
-    //        (dxhat
-    //         - mean(dxhat)
-    //         - xhat * mean(dxhat * xhat))
-    // ------------------------------------------------------------
-
-    let mut grad_gamma_sum_0 =
+    let mut grad_sum0 =
         _mm256_setzero_ps();
 
-    let mut grad_gamma_sum_1 =
+    let mut grad_sum1 =
         _mm256_setzero_ps();
 
-    let mut grad_gamma_xhat_sum_0 =
+    let mut grad_xhat_sum0 =
         _mm256_setzero_ps();
 
-    let mut grad_gamma_xhat_sum_1 =
+    let mut grad_xhat_sum1 =
         _mm256_setzero_ps();
 
     let mean_vec =
@@ -1182,12 +1086,7 @@ unsafe fn layer_norm_backward_group_avx2(
     let inv_std_vec =
         _mm256_set1_ps(inv_std);
 
-    let mut c =
-        0usize;
-
-    // ------------------------------------------------------------
-    // 16 channels per iteration.
-    // ------------------------------------------------------------
+    let mut c = 0usize;
 
     while c + 16 <= channels {
         let x0 =
@@ -1250,30 +1149,30 @@ unsafe fn layer_norm_backward_group_avx2(
                 g1,
             );
 
-        grad_gamma_sum_0 =
+        grad_sum0 =
             _mm256_add_ps(
-                grad_gamma_sum_0,
+                grad_sum0,
                 dxhat0,
             );
 
-        grad_gamma_sum_1 =
+        grad_sum1 =
             _mm256_add_ps(
-                grad_gamma_sum_1,
+                grad_sum1,
                 dxhat1,
             );
 
-        grad_gamma_xhat_sum_0 =
+        grad_xhat_sum0 =
             _mm256_add_ps(
-                grad_gamma_xhat_sum_0,
+                grad_xhat_sum0,
                 _mm256_mul_ps(
                     dxhat0,
                     xhat0,
                 ),
             );
 
-        grad_gamma_xhat_sum_1 =
+        grad_xhat_sum1 =
             _mm256_add_ps(
-                grad_gamma_xhat_sum_1,
+                grad_xhat_sum1,
                 _mm256_mul_ps(
                     dxhat1,
                     xhat1,
@@ -1282,10 +1181,6 @@ unsafe fn layer_norm_backward_group_avx2(
 
         c += 16;
     }
-
-    // ------------------------------------------------------------
-    // Remaining complete SIMD vector.
-    // ------------------------------------------------------------
 
     while c + 8 <= channels {
         let x =
@@ -1318,15 +1213,15 @@ unsafe fn layer_norm_backward_group_avx2(
                 g,
             );
 
-        grad_gamma_sum_0 =
+        grad_sum0 =
             _mm256_add_ps(
-                grad_gamma_sum_0,
+                grad_sum0,
                 dxhat,
             );
 
-        grad_gamma_xhat_sum_0 =
+        grad_xhat_sum0 =
             _mm256_add_ps(
-                grad_gamma_xhat_sum_0,
+                grad_xhat_sum0,
                 _mm256_mul_ps(
                     dxhat,
                     xhat,
@@ -1336,19 +1231,15 @@ unsafe fn layer_norm_backward_group_avx2(
         c += 8;
     }
 
-    // ------------------------------------------------------------
-    // Reduce SIMD accumulators.
-    // ------------------------------------------------------------
-
     let mut tmp =
         [0.0f32; 8];
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_gamma_sum_0,
+        grad_sum0,
     );
 
-    let mut grad_gamma_sum =
+    let mut grad_sum =
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1360,10 +1251,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_gamma_sum_1,
+        grad_sum1,
     );
 
-    grad_gamma_sum +=
+    grad_sum +=
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1375,10 +1266,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_gamma_xhat_sum_0,
+        grad_xhat_sum0,
     );
 
-    let mut grad_gamma_xhat_sum =
+    let mut grad_xhat_sum =
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1390,10 +1281,10 @@ unsafe fn layer_norm_backward_group_avx2(
 
     _mm256_storeu_ps(
         tmp.as_mut_ptr(),
-        grad_gamma_xhat_sum_1,
+        grad_xhat_sum1,
     );
 
-    grad_gamma_xhat_sum +=
+    grad_xhat_sum +=
         tmp[0]
             + tmp[1]
             + tmp[2]
@@ -1402,10 +1293,6 @@ unsafe fn layer_norm_backward_group_avx2(
             + tmp[5]
             + tmp[6]
             + tmp[7];
-
-    // ------------------------------------------------------------
-    // Scalar tail.
-    // ------------------------------------------------------------
 
     while c < channels {
         let dy =
@@ -1421,10 +1308,10 @@ unsafe fn layer_norm_backward_group_avx2(
         let dxhat =
             dy * g;
 
-        grad_gamma_sum +=
+        grad_sum +=
             dxhat;
 
-        grad_gamma_xhat_sum +=
+        grad_xhat_sum +=
             dxhat * xhat;
 
         c += 1;
@@ -1434,11 +1321,10 @@ unsafe fn layer_norm_backward_group_avx2(
         channels as f32;
 
     let mean_dyg =
-        grad_gamma_sum
-            / channels_f32;
+        grad_sum / channels_f32;
 
     let mean_dyg_xhat =
-        grad_gamma_xhat_sum
+        grad_xhat_sum
             / channels_f32;
 
     let mean_dyg_vec =
@@ -1450,14 +1336,6 @@ unsafe fn layer_norm_backward_group_avx2(
         _mm256_set1_ps(
             mean_dyg_xhat
         );
-
-    // ------------------------------------------------------------
-    // Second pass:
-    //
-    //   dgamma
-    //   dbeta
-    //   dx
-    // ------------------------------------------------------------
 
     c = 0;
 
@@ -1486,7 +1364,6 @@ unsafe fn layer_norm_backward_group_avx2(
                 inv_std_vec,
             );
 
-        // dgamma += dy * xhat
         let dgamma =
             _mm256_mul_ps(
                 dy,
@@ -1495,53 +1372,36 @@ unsafe fn layer_norm_backward_group_avx2(
 
         let old_dgamma =
             _mm256_loadu_ps(
-                weight_grads
-                    .as_ptr()
-                    .add(c)
+                weight_grads.as_ptr().add(c)
             );
 
         _mm256_storeu_ps(
-            weight_grads
-                .as_mut_ptr()
-                .add(c),
+            weight_grads.as_mut_ptr().add(c),
             _mm256_add_ps(
                 old_dgamma,
                 dgamma,
             ),
         );
 
-        // dbeta += dy
         let old_dbeta =
             _mm256_loadu_ps(
-                bias_grads
-                    .as_ptr()
-                    .add(c)
+                bias_grads.as_ptr().add(c)
             );
 
         _mm256_storeu_ps(
-            bias_grads
-                .as_mut_ptr()
-                .add(c),
+            bias_grads.as_mut_ptr().add(c),
             _mm256_add_ps(
                 old_dbeta,
                 dy,
             ),
         );
 
-        // dxhat = dy * gamma
         let dxhat =
             _mm256_mul_ps(
                 dy,
                 g,
             );
 
-        // dx =
-        //     inv_std *
-        //     (
-        //         dxhat
-        //         - mean(dxhat)
-        //         - xhat * mean(dxhat * xhat)
-        //     )
         let centered_grad =
             _mm256_sub_ps(
                 _mm256_sub_ps(
@@ -1561,18 +1421,12 @@ unsafe fn layer_norm_backward_group_avx2(
             );
 
         _mm256_storeu_ps(
-            output_grad
-                .as_mut_ptr()
-                .add(c),
+            output_grad.as_mut_ptr().add(c),
             dx,
         );
 
         c += 8;
     }
-
-    // ------------------------------------------------------------
-    // Scalar tail.
-    // ------------------------------------------------------------
 
     while c < channels {
         let x =
@@ -1588,19 +1442,15 @@ unsafe fn layer_norm_backward_group_avx2(
             (x - mean)
                 * inv_std;
 
-        // dgamma
         weight_grads[c] +=
             dy * xhat;
 
-        // dbeta
         bias_grads[c] +=
             dy;
 
-        // dxhat
         let dxhat =
             dy * g;
 
-        // dx
         output_grad[c] =
             inv_std
                 * (
@@ -1621,36 +1471,21 @@ pub fn layer_norm_backward(
     channels: usize,
     means: &[f32],
     inv_stds: &[f32],
-    gamma_handles: &[TensorHandle],
-    beta_handles: &[TensorHandle],
+    gamma: &[f32],
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
-    debug_assert!(
-        batch_size > 0
-    );
-
-    debug_assert!(
-        channels > 0
-    );
-
-    debug_assert_eq!(
-        input.len(),
-        grad.len()
-    );
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
+    debug_assert!(batch_size > 0);
+    debug_assert!(channels > 0);
+    debug_assert_eq!(input.len(), grad.len());
+    debug_assert_eq!(gamma.len(), channels);
 
     debug_assert_eq!(
         input.len() % batch_size,
         0
-    );
-
-    debug_assert_eq!(
-        gamma_handles.len(),
-        channels
-    );
-
-    debug_assert_eq!(
-        beta_handles.len(),
-        channels
     );
 
     let sequence_size =
@@ -1677,36 +1512,17 @@ pub fn layer_norm_backward(
         group_count
     );
 
-    workspace.weights.resize(
-        channels,
-        0.0,
-    );
-
-    crate::handle_data_slice(
-        gamma_handles,
-        &mut workspace.weights,
-    );
-
     workspace.weight_grads.resize(
         channels,
         0.0,
     );
-
-    workspace.weight_grads.fill(
-        0.0
-    );
+    workspace.weight_grads.fill(0.0);
 
     workspace.bias_grads.resize(
         channels,
         0.0,
     );
-
-    workspace.bias_grads.fill(
-        0.0
-    );
-
-    let gamma =
-        &workspace.weights;
+    workspace.bias_grads.fill(0.0);
 
     let mut input_grads =
         vec![0.0f32; input.len()];
@@ -1756,27 +1572,13 @@ pub fn layer_norm_backward(
             }
         }
 
-        // --------------------------------------------------------
-        // Scalar fallback.
-        //
-        // dxhat = dy * gamma
-        //
-        // dx =
-        //     inv_std *
-        //     (
-        //         dxhat
-        //         - mean(dxhat)
-        //         - xhat * mean(dxhat * xhat)
-        //     )
-        // --------------------------------------------------------
-
         let channels_f32 =
             channels as f32;
 
-        let mut grad_gamma_sum =
+        let mut grad_sum =
             0.0f32;
 
-        let mut grad_gamma_xhat_sum =
+        let mut grad_xhat_sum =
             0.0f32;
 
         for c in 0..channels {
@@ -1793,19 +1595,19 @@ pub fn layer_norm_backward(
             let dxhat =
                 dy * gamma[c];
 
-            grad_gamma_sum +=
+            grad_sum +=
                 dxhat;
 
-            grad_gamma_xhat_sum +=
+            grad_xhat_sum +=
                 dxhat * xhat;
         }
 
         let mean_dyg =
-            grad_gamma_sum
+            grad_sum
                 / channels_f32;
 
         let mean_dyg_xhat =
-            grad_gamma_xhat_sum
+            grad_xhat_sum
                 / channels_f32;
 
         for c in 0..channels {
@@ -1819,19 +1621,15 @@ pub fn layer_norm_backward(
                 (x - mean)
                     * inv_std;
 
-            // dgamma
             workspace.weight_grads[c] +=
                 dy * xhat;
 
-            // dbeta
             workspace.bias_grads[c] +=
                 dy;
 
-            // dxhat
             let dxhat =
                 dy * gamma[c];
 
-            // dx
             output_grad_group[c] =
                 inv_std
                     * (
@@ -1843,15 +1641,17 @@ pub fn layer_norm_backward(
         }
     }
 
-    crate::add_handle_grad_slices_2(
-        gamma_handles,
-        &workspace.weight_grads,
-        beta_handles,
-        &workspace.bias_grads,
-    );
-
-    input_grads
+    (
+        input_grads,
+        workspace.weight_grads.clone(),
+        workspace.bias_grads.clone(),
+    )
 }
+
+
+// ============================================================================
+// Weight tying backward
+// ============================================================================
 
 pub fn weight_tying_backward(
     input: &[f32],
@@ -1859,9 +1659,13 @@ pub fn weight_tying_backward(
     batch_size: usize,
     embedding_dim: usize,
     vocab_size: usize,
-    embeddings: &crate::embeddings::Embeddings,
+    embeddings: &Embeddings,
+    params: &ParameterStore,
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+) {
     assert_eq!(
         input.len(),
         batch_size * embedding_dim,
@@ -1874,8 +1678,11 @@ pub fn weight_tying_backward(
         "Invalid WeightTying gradient size"
     );
 
+    let embedding_range =
+        embeddings.parameter_range();
+
     let weights =
-        embeddings.flat_values();
+        params.values(embedding_range);
 
     debug_assert_eq!(
         weights.len(),
@@ -1886,6 +1693,7 @@ pub fn weight_tying_backward(
         vocab_size * embedding_dim,
         0.0,
     );
+
     workspace.embedding_grads.fill(0.0);
 
     unsafe {
@@ -1907,13 +1715,9 @@ pub fn weight_tying_backward(
         );
     }
 
-    embeddings.accumulate_flat_grads(
-        &workspace.embedding_grads
-    );
-
     let mut input_grads =
         vec![
-            0.0;
+            0.0f32;
             batch_size * embedding_dim
         ];
 
@@ -1928,7 +1732,7 @@ pub fn weight_tying_backward(
             1.0,
             grad,
             vocab_size as i32,
-            &weights,
+            weights,
             embedding_dim as i32,
             0.0,
             &mut input_grads,
@@ -1936,8 +1740,16 @@ pub fn weight_tying_backward(
         );
     }
 
-    input_grads
+    (
+        input_grads,
+        workspace.embedding_grads.clone(),
+    )
 }
+
+
+// ============================================================================
+// GlobalMixer helpers
+// ============================================================================
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -1947,7 +1759,7 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
     batch_size: usize,
     positions: usize,
     global_dim: usize,
-) { unsafe {
+) {
     let rows =
         batch_size * positions;
 
@@ -1955,7 +1767,6 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
         let base =
             row * global_dim;
 
-        // sum(probs * dR)
         let mut dot0 =
             _mm256_setzero_ps();
 
@@ -1968,25 +1779,25 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
             let p0 =
                 _mm256_loadu_ps(
                     probs.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             let dg0 =
                 _mm256_loadu_ps(
                     score_grads.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             let p1 =
                 _mm256_loadu_ps(
                     probs.as_ptr()
-                        .add(base + g + 8),
+                        .add(base + g + 8)
                 );
 
             let dg1 =
                 _mm256_loadu_ps(
                     score_grads.as_ptr()
-                        .add(base + g + 8),
+                        .add(base + g + 8)
                 );
 
             dot0 =
@@ -2010,13 +1821,13 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
             let p =
                 _mm256_loadu_ps(
                     probs.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             let dg =
                 _mm256_loadu_ps(
                     score_grads.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             dot0 =
@@ -2079,13 +1890,13 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
             let p =
                 _mm256_loadu_ps(
                     probs.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             let dg =
                 _mm256_loadu_ps(
                     score_grads.as_ptr()
-                        .add(base + g),
+                        .add(base + g)
                 );
 
             let result =
@@ -2117,7 +1928,7 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
             g += 1;
         }
     }
-}}
+}
 
 #[inline]
 fn global_mixer_read_softmax_backward_scalar(
@@ -2236,9 +2047,10 @@ fn global_mixer_positional_backward(
     }
 }
 
-// ============================================================
+
+// ============================================================================
 // GlobalMixer backward
-// ============================================================
+// ============================================================================
 
 pub fn global_mixer_backward(
     input: &[f32],
@@ -2250,73 +2062,56 @@ pub fn global_mixer_backward(
     positions: usize,
     channels: usize,
     global_dim: usize,
-    write_weight_handles: &[TensorHandle],
-    write_bias_handles: &[TensorHandle],
-    read_weight_handles: &[TensorHandle],
-    read_bias_handles: &[TensorHandle],
-    write_positional_weight_handles: &[TensorHandle],
-    read_positional_weight_handles: &[TensorHandle],
+    write_weights: &[f32],
+    read_weights: &[f32],
     workspace: &mut BackwardWorkspace,
-) -> Vec<f32> {
-    let rows = batch_size * positions;
+) -> (
+    Vec<f32>,
+    GlobalMixerGradients,
+) {
+    let rows =
+        batch_size * positions;
 
-    let position_features = global_mixer_position_features(positions);
+    let position_features =
+        global_mixer_position_features(
+            positions
+        );
 
     debug_assert_eq!(
         input.len(),
-        rows * channels,
+        rows * channels
     );
 
     debug_assert_eq!(
         grad.len(),
-        rows * channels,
+        rows * channels
     );
 
     debug_assert_eq!(
         write_probs.len(),
-        rows * global_dim,
+        rows * global_dim
     );
 
     debug_assert_eq!(
         read_probs.len(),
-        rows * global_dim,
+        rows * global_dim
     );
 
     debug_assert_eq!(
         global_vectors.len(),
-        batch_size *
-            global_dim *
-            channels,
+        batch_size
+            * global_dim
+            * channels
     );
 
     debug_assert_eq!(
-        write_weight_handles.len(),
-        global_dim * channels,
+        write_weights.len(),
+        global_dim * channels
     );
 
     debug_assert_eq!(
-        read_weight_handles.len(),
-        global_dim * channels,
-    );
-
-    debug_assert_eq!(
-        write_bias_handles.len(),
-        global_dim,
-    );
-
-    debug_assert_eq!(
-        read_bias_handles.len(),
-        global_dim,
-    );
-
-    debug_assert_eq!(
-        write_positional_weight_handles.len(),
-        global_dim * GLOBAL_MIXER_POS_FEATURES,
-    );
-
-    debug_assert_eq!(
-        read_positional_weight_handles.len(),
-        global_dim * GLOBAL_MIXER_POS_FEATURES,
+        read_weights.len(),
+        global_dim * channels
     );
 
     #[cfg(target_arch = "x86_64")]
@@ -2327,43 +2122,21 @@ pub fn global_mixer_backward(
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
 
-    // ------------------------------------------------------------
-    // Important:
-    //
-    // grad initially contains dY.
-    //
-    // Since:
-    //
-    //     Y = X + Message
-    //
-    // it already contains the residual dX.
-    //
-    // We therefore accumulate every mixer contribution directly
-    // into grad and avoid making another full-size copy.
-    //
-    // Also, dGlobal and dR MUST be computed before grad is mutated
-    // by dX_read/dX_write.
-    // ------------------------------------------------------------
+    let mut mixer_grads =
+        GlobalMixerGradients::default();
 
-    // ============================================================
+    // ========================================================================
     // 1. dGlobal = R^T dY
-    //
-    // dGlobal[b,g,c] =
-    //     sum_p R[b,p,g] * dY[b,p,c]
-    //
-    // Small per-batch matrix -> SIMD/direct loops.
-    // ============================================================
+    // ========================================================================
 
     workspace.mixer_global_grads.resize(
-        batch_size *
-            global_dim *
-            channels,
+        batch_size
+            * global_dim
+            * channels,
         0.0,
     );
 
-    workspace
-        .mixer_global_grads
-        .fill(0.0);
+    workspace.mixer_global_grads.fill(0.0);
 
     for b in 0..batch_size {
         let grad_base =
@@ -2377,8 +2150,8 @@ pub fn global_mixer_backward(
 
         for g in 0..global_dim {
             let dst_base =
-                global_base +
-                    g * channels;
+                global_base
+                    + g * channels;
 
             let mut c = 0usize;
 
@@ -2401,7 +2174,7 @@ pub fn global_mixer_backward(
                                         probs_base
                                             + p * global_dim
                                             + g
-                                        ],
+                                        ]
                                 );
 
                             let r1 =
@@ -2411,7 +2184,7 @@ pub fn global_mixer_backward(
                                             + (p + 1)
                                             * global_dim
                                             + g
-                                        ],
+                                        ]
                                 );
 
                             let dy0 =
@@ -2420,8 +2193,8 @@ pub fn global_mixer_backward(
                                         .add(
                                             grad_base
                                                 + p * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             let dy1 =
@@ -2431,8 +2204,8 @@ pub fn global_mixer_backward(
                                             grad_base
                                                 + (p + 1)
                                                 * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             acc0 =
@@ -2459,7 +2232,7 @@ pub fn global_mixer_backward(
                                         probs_base
                                             + p * global_dim
                                             + g
-                                        ],
+                                        ]
                                 );
 
                             let dy =
@@ -2468,8 +2241,8 @@ pub fn global_mixer_backward(
                                         .add(
                                             grad_base
                                                 + p * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             acc0 =
@@ -2528,23 +2301,16 @@ pub fn global_mixer_backward(
         }
     }
 
-    // ============================================================
-    // 2. dR = dY * Global^T
-    //
-    // dR[b,p,g] =
-    //     sum_c dY[b,p,c] * Global[b,g,c]
-    //
-    // Small dot products -> AVX2.
-    // ============================================================
+    // ========================================================================
+    // 2. dR = dY Global^T
+    // ========================================================================
 
     workspace.mixer_score_grads.resize(
         rows * global_dim,
         0.0,
     );
 
-    workspace
-        .mixer_score_grads
-        .fill(0.0);
+    workspace.mixer_score_grads.fill(0.0);
 
     for b in 0..batch_size {
         let grad_base =
@@ -2558,17 +2324,17 @@ pub fn global_mixer_backward(
 
         for p in 0..positions {
             let grad_row =
-                grad_base +
-                    p * channels;
+                grad_base
+                    + p * channels;
 
             let score_row =
-                score_base +
-                    p * global_dim;
+                score_base
+                    + p * global_dim;
 
             for g in 0..global_dim {
                 let global_row =
-                    global_base +
-                        g * channels;
+                    global_base
+                        + g * channels;
 
                 let mut sum =
                     0.0f32;
@@ -2590,7 +2356,7 @@ pub fn global_mixer_backward(
                                     grad.as_ptr()
                                         .add(
                                             grad_row + c
-                                        ),
+                                        )
                                 );
 
                             let gv0 =
@@ -2599,7 +2365,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c
-                                        ),
+                                        )
                                 );
 
                             let dy1 =
@@ -2607,7 +2373,7 @@ pub fn global_mixer_backward(
                                     grad.as_ptr()
                                         .add(
                                             grad_row + c + 8
-                                        ),
+                                        )
                                 );
 
                             let gv1 =
@@ -2616,7 +2382,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c + 8
-                                        ),
+                                        )
                                 );
 
                             acc0 =
@@ -2642,7 +2408,7 @@ pub fn global_mixer_backward(
                                     grad.as_ptr()
                                         .add(
                                             grad_row + c
-                                        ),
+                                        )
                                 );
 
                             let gv =
@@ -2651,7 +2417,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c
-                                        ),
+                                        )
                                 );
 
                             acc0 =
@@ -2729,11 +2495,9 @@ pub fn global_mixer_backward(
         }
     }
 
-    // ============================================================
+    // ========================================================================
     // 3. Read softmax backward
-    //
-    // R = softmax_global(read_scores)
-    // ============================================================
+    // ========================================================================
 
     if use_avx2 {
         #[cfg(target_arch = "x86_64")]
@@ -2756,23 +2520,15 @@ pub fn global_mixer_backward(
         );
     }
 
-    // ============================================================
-    // 3b. Positional read gradients
-    //
-    // dQ_read[g,k] =
-    //     sum_p dScore[p,g] * Feature[p,k]
-    //
-    // The positional features are deterministic, so there is
-    // no gradient path into the input tensor.
-    // ============================================================
+    // ========================================================================
+    // 4. Read positional gradients
+    // ========================================================================
 
-    workspace
-        .mixer_pos_grads_read
-        .resize(
-            global_dim
-                * GLOBAL_MIXER_POS_FEATURES,
-            0.0,
-        );
+    workspace.mixer_pos_grads_read.resize(
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES,
+        0.0,
+    );
 
     global_mixer_positional_backward(
         &workspace.mixer_score_grads,
@@ -2780,33 +2536,24 @@ pub fn global_mixer_backward(
         batch_size,
         positions,
         global_dim,
-        &mut workspace
-            .mixer_pos_grads_read,
+        &mut workspace.mixer_pos_grads_read,
     );
 
-    crate::add_handle_grad_slices(
-        read_positional_weight_handles,
-        &workspace.mixer_pos_grads_read,
-    );
+    mixer_grads.read_positional_weights =
+        workspace
+            .mixer_pos_grads_read
+            .clone();
 
-    // ============================================================
-    // 4. dW_read = dS_read^T X
-    //
-    //     [G,R] * [R,C] -> [G,C]
-    //
-    // W_read is stored as [G,C].
-    //
-    // THIS is the corrected orientation that fixes the old bug.
-    // ============================================================
+    // ========================================================================
+    // 5. Read weight gradient
+    // ========================================================================
 
     workspace.weight_grads.resize(
         global_dim * channels,
         0.0,
     );
 
-    workspace
-        .weight_grads
-        .fill(0.0);
+    workspace.weight_grads.fill(0.0);
 
     unsafe {
         cblas::sgemm(
@@ -2827,102 +2574,44 @@ pub fn global_mixer_backward(
         );
     }
 
-    // ============================================================
-    // 5. db_read
-    // ============================================================
+    mixer_grads.read_weights =
+        workspace.weight_grads.clone();
+
+    // ========================================================================
+    // 6. Read bias gradient
+    // ========================================================================
 
     workspace.bias_grads.resize(
         global_dim,
         0.0,
     );
 
-    workspace
-        .bias_grads
-        .fill(0.0);
+    workspace.bias_grads.fill(0.0);
 
     for row in 0..rows {
         let base =
             row * global_dim;
 
-        if use_avx2 {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let mut g = 0usize;
-
-                while g + 8 <= global_dim {
-                    let old =
-                        _mm256_loadu_ps(
-                            workspace
-                                .bias_grads
-                                .as_ptr()
-                                .add(g),
-                        );
-
-                    let value =
-                        _mm256_loadu_ps(
-                            workspace
-                                .mixer_score_grads
-                                .as_ptr()
-                                .add(base + g),
-                        );
-
-                    _mm256_storeu_ps(
-                        workspace
-                            .bias_grads
-                            .as_mut_ptr()
-                            .add(g),
-                        _mm256_add_ps(
-                            old,
-                            value,
-                        ),
-                    );
-
-                    g += 8;
-                }
-
-                while g < global_dim {
-                    workspace.bias_grads[g] +=
-                        workspace.mixer_score_grads[
-                            base + g
-                            ];
-
-                    g += 1;
-                }
-            }
-        } else {
-            for g in 0..global_dim {
-                workspace.bias_grads[g] +=
-                    workspace.mixer_score_grads[
-                        base + g
-                        ];
-            }
-        }
+        add_f32_slice_simd(
+            &mut workspace.bias_grads,
+            &workspace.mixer_score_grads[
+                base..base + global_dim
+                ],
+        );
     }
 
-    crate::add_handle_grad_slices_2(
-        read_weight_handles,
-        &workspace.weight_grads,
-        read_bias_handles,
-        &workspace.bias_grads,
-    );
+    mixer_grads.read_biases =
+        workspace.bias_grads.clone();
 
-    // ============================================================
-    // 6. dX_read = dS_read W_read
+    // ========================================================================
+    // 7. dX_read
     //
-    //     [R,G] * [G,C] -> [R,C]
-    //
-    // Accumulate into grad because grad already contains dX_residual.
-    // ============================================================
+    // Add it after all original dY-dependent quantities above have already
+    // been computed.
+    // ========================================================================
 
-    workspace.weights.resize(
-        global_dim * channels,
-        0.0,
-    );
-
-    crate::handle_data_slice(
-        read_weight_handles,
-        &mut workspace.weights,
-    );
+    let mut read_input_grads =
+        vec![0.0f32; rows * channels];
 
     unsafe {
         cblas::sgemm(
@@ -2935,25 +2624,22 @@ pub fn global_mixer_backward(
             1.0,
             &workspace.mixer_score_grads,
             global_dim as i32,
-            &workspace.weights,
+            read_weights,
             channels as i32,
-            1.0,
-            &mut grad,
+            0.0,
+            &mut read_input_grads,
             channels as i32,
         );
     }
 
-    // ============================================================
-    // 7. dA = X dGlobal^T
-    //
-    // dA[b,p,g] =
-    //     sum_c X[b,p,c] * dGlobal[b,g,c]
-    //
-    // Small dot products -> AVX2.
-    //
-    // We can now safely use input_grads/grad because dGlobal and dR
-    // have already consumed the original dY.
-    // ============================================================
+    add_f32_slice_simd(
+        &mut grad,
+        &read_input_grads,
+    );
+
+    // ========================================================================
+    // 8. dA = X dGlobal^T
+    // ========================================================================
 
     for b in 0..batch_size {
         let input_base =
@@ -2967,17 +2653,17 @@ pub fn global_mixer_backward(
 
         for p in 0..positions {
             let input_row =
-                input_base +
-                    p * channels;
+                input_base
+                    + p * channels;
 
             let score_row =
-                score_base +
-                    p * global_dim;
+                score_base
+                    + p * global_dim;
 
             for g in 0..global_dim {
                 let global_row =
-                    global_base +
-                        g * channels;
+                    global_base
+                        + g * channels;
 
                 let mut sum =
                     0.0f32;
@@ -2999,7 +2685,7 @@ pub fn global_mixer_backward(
                                     input.as_ptr()
                                         .add(
                                             input_row + c
-                                        ),
+                                        )
                                 );
 
                             let dg0 =
@@ -3009,7 +2695,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c
-                                        ),
+                                        )
                                 );
 
                             let x1 =
@@ -3017,7 +2703,7 @@ pub fn global_mixer_backward(
                                     input.as_ptr()
                                         .add(
                                             input_row + c + 8
-                                        ),
+                                        )
                                 );
 
                             let dg1 =
@@ -3027,7 +2713,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c + 8
-                                        ),
+                                        )
                                 );
 
                             acc0 =
@@ -3053,7 +2739,7 @@ pub fn global_mixer_backward(
                                     input.as_ptr()
                                         .add(
                                             input_row + c
-                                        ),
+                                        )
                                 );
 
                             let dg =
@@ -3063,7 +2749,7 @@ pub fn global_mixer_backward(
                                         .as_ptr()
                                         .add(
                                             global_row + c
-                                        ),
+                                        )
                                 );
 
                             acc0 =
@@ -3142,15 +2828,9 @@ pub fn global_mixer_backward(
         }
     }
 
-    // ============================================================
-    // 8. Write softmax backward
-    //
-    // A = softmax_positions(write_scores)
-    //
-    // The reduction is over positions for each g, which is
-    // strided in memory. Keep it scalar rather than introducing
-    // a transpose just for SIMD.
-    // ============================================================
+    // ========================================================================
+    // 9. Write softmax backward
+    // ========================================================================
 
     for b in 0..batch_size {
         let score_base =
@@ -3162,9 +2842,9 @@ pub fn global_mixer_backward(
 
             for p in 0..positions {
                 let idx =
-                    score_base +
-                        p * global_dim +
-                        g;
+                    score_base
+                        + p * global_dim
+                        + g;
 
                 dot +=
                     write_probs[idx]
@@ -3174,9 +2854,9 @@ pub fn global_mixer_backward(
 
             for p in 0..positions {
                 let idx =
-                    score_base +
-                        p * global_dim +
-                        g;
+                    score_base
+                        + p * global_dim
+                        + g;
 
                 workspace.mixer_score_grads[idx] =
                     write_probs[idx]
@@ -3189,17 +2869,15 @@ pub fn global_mixer_backward(
         }
     }
 
-    // ============================================================
-    // 8b. Positional write gradients
-    // ============================================================
+    // ========================================================================
+    // 10. Write positional gradients
+    // ========================================================================
 
-    workspace
-        .mixer_pos_grads_write
-        .resize(
-            global_dim
-                * GLOBAL_MIXER_POS_FEATURES,
-            0.0,
-        );
+    workspace.mixer_pos_grads_write.resize(
+        global_dim
+            * GLOBAL_MIXER_POS_FEATURES,
+        0.0,
+    );
 
     global_mixer_positional_backward(
         &workspace.mixer_score_grads,
@@ -3207,23 +2885,17 @@ pub fn global_mixer_backward(
         batch_size,
         positions,
         global_dim,
-        &mut workspace
-            .mixer_pos_grads_write,
+        &mut workspace.mixer_pos_grads_write,
     );
 
-    crate::add_handle_grad_slices(
-        write_positional_weight_handles,
-        &workspace
-            .mixer_pos_grads_write,
-    );
+    mixer_grads.write_positional_weights =
+        workspace
+            .mixer_pos_grads_write
+            .clone();
 
-    // ============================================================
-    // 9. dW_write = dS_write^T X
-    //
-    //     [G,R] * [R,C] -> [G,C]
-    //
-    // Correct [G,C] output layout.
-    // ============================================================
+    // ========================================================================
+    // 11. Write weight gradient
+    // ========================================================================
 
     workspace.weight_grads.fill(0.0);
 
@@ -3246,9 +2918,12 @@ pub fn global_mixer_backward(
         );
     }
 
-    // ============================================================
-    // 10. db_write
-    // ============================================================
+    mixer_grads.write_weights =
+        workspace.weight_grads.clone();
+
+    // ========================================================================
+    // 12. Write bias gradient
+    // ========================================================================
 
     workspace.bias_grads.fill(0.0);
 
@@ -3256,84 +2931,23 @@ pub fn global_mixer_backward(
         let base =
             row * global_dim;
 
-        if use_avx2 {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let mut g = 0usize;
-
-                while g + 8 <= global_dim {
-                    let old =
-                        _mm256_loadu_ps(
-                            workspace
-                                .bias_grads
-                                .as_ptr()
-                                .add(g),
-                        );
-
-                    let value =
-                        _mm256_loadu_ps(
-                            workspace
-                                .mixer_score_grads
-                                .as_ptr()
-                                .add(base + g),
-                        );
-
-                    _mm256_storeu_ps(
-                        workspace
-                            .bias_grads
-                            .as_mut_ptr()
-                            .add(g),
-                        _mm256_add_ps(
-                            old,
-                            value,
-                        ),
-                    );
-
-                    g += 8;
-                }
-
-                while g < global_dim {
-                    workspace.bias_grads[g] +=
-                        workspace.mixer_score_grads[
-                            base + g
-                            ];
-
-                    g += 1;
-                }
-            }
-        } else {
-            for g in 0..global_dim {
-                workspace.bias_grads[g] +=
-                    workspace.mixer_score_grads[
-                        base + g
-                        ];
-            }
-        }
+        add_f32_slice_simd(
+            &mut workspace.bias_grads,
+            &workspace.mixer_score_grads[
+                base..base + global_dim
+                ],
+        );
     }
 
-    crate::add_handle_grad_slices_2(
-        write_weight_handles,
-        &workspace.weight_grads,
-        write_bias_handles,
-        &workspace.bias_grads,
-    );
+    mixer_grads.write_biases =
+        workspace.bias_grads.clone();
 
-    // ============================================================
-    // 11. Load W_write
-    // ============================================================
+    // ========================================================================
+    // 13. dX_write
+    // ========================================================================
 
-    crate::handle_data_slice(
-        write_weight_handles,
-        &mut workspace.weights,
-    );
-
-    // ============================================================
-    // 12. dX_write = dS_write W_write
-    //
-    //     [R,G] * [G,C] -> [R,C]
-    //
-    // Accumulate into existing grad.
-    // ============================================================
+    let mut write_input_grads =
+        vec![0.0f32; rows * channels];
 
     unsafe {
         cblas::sgemm(
@@ -3346,26 +2960,22 @@ pub fn global_mixer_backward(
             1.0,
             &workspace.mixer_score_grads,
             global_dim as i32,
-            &workspace.weights,
+            write_weights,
             channels as i32,
-            1.0,
-            &mut grad,
+            0.0,
+            &mut write_input_grads,
             channels as i32,
         );
     }
 
-    // ============================================================
-    // 13. dX_global = A dGlobal
-    //
-    // For each batch:
-    //
-    //     [P,G] * [G,C] -> [P,C]
-    //
-    // This is essentially a small matrix-vector accumulation with
-    // very favorable contiguous channel accesses, so use the old
-    // handwritten AVX2 approach rather than launching another
-    // collection of tiny GEMMs.
-    // ============================================================
+    add_f32_slice_simd(
+        &mut grad,
+        &write_input_grads,
+    );
+
+    // ========================================================================
+    // 14. dX_global = A dGlobal
+    // ========================================================================
 
     for b in 0..batch_size {
         let grad_base =
@@ -3379,12 +2989,12 @@ pub fn global_mixer_backward(
 
         for p in 0..positions {
             let dst_base =
-                grad_base +
-                    p * channels;
+                grad_base
+                    + p * channels;
 
             let probs_row =
-                probs_base +
-                    p * global_dim;
+                probs_base
+                    + p * global_dim;
 
             let mut c = 0usize;
 
@@ -3405,14 +3015,14 @@ pub fn global_mixer_backward(
                                 _mm256_set1_ps(
                                     write_probs[
                                         probs_row + g
-                                        ],
+                                        ]
                                 );
 
                             let a1 =
                                 _mm256_set1_ps(
                                     write_probs[
                                         probs_row + g + 1
-                                        ],
+                                        ]
                                 );
 
                             let gv0 =
@@ -3422,8 +3032,8 @@ pub fn global_mixer_backward(
                                         .add(
                                             global_base
                                                 + g * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             let gv1 =
@@ -3434,8 +3044,8 @@ pub fn global_mixer_backward(
                                             global_base
                                                 + (g + 1)
                                                 * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             acc0 =
@@ -3460,7 +3070,7 @@ pub fn global_mixer_backward(
                                 _mm256_set1_ps(
                                     write_probs[
                                         probs_row + g
-                                        ],
+                                        ]
                                 );
 
                             let gv =
@@ -3470,8 +3080,8 @@ pub fn global_mixer_backward(
                                         .add(
                                             global_base
                                                 + g * channels
-                                                + c,
-                                        ),
+                                                + c
+                                        )
                                 );
 
                             acc0 =
@@ -3489,7 +3099,7 @@ pub fn global_mixer_backward(
                                 grad.as_ptr()
                                     .add(
                                         dst_base + c
-                                    ),
+                                    )
                             );
 
                         _mm256_storeu_ps(
@@ -3535,11 +3145,34 @@ pub fn global_mixer_backward(
         }
     }
 
-    grad
+    (
+        grad,
+        mixer_grads,
+    )
 }
 
+
+#[derive(Default)]
+pub struct GlobalMixerGradients {
+    pub write_weights: Vec<f32>,
+    pub write_biases: Vec<f32>,
+
+    pub read_weights: Vec<f32>,
+    pub read_biases: Vec<f32>,
+
+    pub write_positional_weights: Vec<f32>,
+    pub read_positional_weights: Vec<f32>,
+}
+
+
+// ============================================================================
+// Main backward dispatcher
+// ============================================================================
+
 pub fn backward_layers_batch(
-    layers: &[BatchLayerCache],
+    model_layers: &[Layer],
+    caches: &[BatchLayerCache],
+    params: &mut ParameterStore,
     grad: Vec<f32>,
     batch_size: usize,
 ) -> Vec<f32> {
@@ -3548,7 +3181,9 @@ pub fn backward_layers_batch(
             cell.borrow_mut();
 
         backward_layers_batch_inner(
-            layers,
+            model_layers,
+            caches,
+            params,
             grad,
             batch_size,
             &mut workspace,
@@ -3557,14 +3192,27 @@ pub fn backward_layers_batch(
 }
 
 fn backward_layers_batch_inner(
-    layers: &[BatchLayerCache],
+    model_layers: &[Layer],
+    caches: &[BatchLayerCache],
+    params: &mut ParameterStore,
     mut grad: Vec<f32>,
     batch_size: usize,
     workspace: &mut BackwardWorkspace,
 ) -> Vec<f32> {
-    for layer in layers.iter().rev() {
+    debug_assert_eq!(
+        model_layers.len(),
+        caches.len(),
+    );
+
+    for (layer, cache) in
+        model_layers.iter()
+            .zip(caches.iter())
+            .rev()
+    {
         grad = backward_layer_batch(
             layer,
+            cache,
+            params,
             grad,
             batch_size,
             workspace,
@@ -3574,23 +3222,45 @@ fn backward_layers_batch_inner(
     grad
 }
 
+
+// ============================================================================
+// Per-layer backward
+// ============================================================================
+
 fn backward_layer_batch(
-    layer: &BatchLayerCache,
+    layer: &Layer,
+    cache: &BatchLayerCache,
+    params: &mut ParameterStore,
     mut grad: Vec<f32>,
     batch_size: usize,
     workspace: &mut BackwardWorkspace,
 ) -> Vec<f32> {
-    match layer {
-        BatchLayerCache::Dense {
-            input_size,
-            output_size,
-            input,
-            activation_output,
-            weights,
-            weight_handles,
-            bias_handles,
-            activation,
-        } => {
+    match (layer, cache) {
+
+        // ====================================================================
+        // Dense
+        // ====================================================================
+
+        (
+            Layer::Dense(layer),
+            BatchLayerCache::Dense {
+                input_size,
+                output_size,
+                input,
+                activation_output,
+                activation,
+            },
+        ) => {
+            debug_assert_eq!(
+                *input_size,
+                layer.input_size
+            );
+
+            debug_assert_eq!(
+                *output_size,
+                layer.output_size
+            );
+
             if let Some(output) =
                 activation_output
             {
@@ -3607,10 +3277,14 @@ fn backward_layer_batch(
                 }
             }
 
+            let weights =
+                params.values(layer.weights);
+
             workspace.weight_grads.resize(
-                output_size * input_size,
+                *output_size * *input_size,
                 0.0,
             );
+
             workspace.weight_grads.fill(0.0);
 
             unsafe {
@@ -3636,21 +3310,24 @@ fn backward_layer_batch(
                 *output_size,
                 0.0,
             );
+
             workspace.bias_grads.fill(0.0);
 
             for b in 0..batch_size {
                 let base =
                     b * *output_size;
 
-                for o in 0..*output_size {
-                    workspace.bias_grads[o] +=
-                        grad[base + o];
-                }
+                add_f32_slice_simd(
+                    &mut workspace.bias_grads,
+                    &grad[
+                        base..base + *output_size
+                        ],
+                );
             }
 
             let mut input_grads =
                 vec![
-                    0.0;
+                    0.0f32;
                     batch_size * *input_size
                 ];
 
@@ -3673,62 +3350,96 @@ fn backward_layer_batch(
                 );
             }
 
-            crate::add_handle_grad_slices(
-                weight_handles,
+            accumulate_parameter_grads(
+                params,
+                layer.weights,
                 &workspace.weight_grads,
             );
 
-            crate::add_handle_grad_slices(
-                bias_handles,
+            accumulate_parameter_grads(
+                params,
+                layer.biases,
                 &workspace.bias_grads,
             );
 
             input_grads
         }
 
-        BatchLayerCache::Conv1D {
-            input,
-            output,
-            input_length,
-            output_length,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            weight_handles,
-            bias_handles,
-            activation,
-        } => {
-            conv1d_backward(
+        // ====================================================================
+        // Conv1D
+        // ====================================================================
+
+        (
+            Layer::Conv1D(layer),
+            BatchLayerCache::Conv1D {
                 input,
                 output,
-                &mut grad,
-                batch_size,
-                *input_length,
-                *output_length,
-                *in_channels,
-                *out_channels,
-                *kernel_size,
-                *stride,
-                *padding,
-                *causal,
-                weight_handles,
-                bias_handles,
+                input_length,
+                output_length,
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                causal,
                 activation,
-                workspace,
-            )
+            },
+        ) => {
+            let weights =
+                params.values(layer.weights);
+
+            let input_grads =
+                conv1d_backward(
+                    input,
+                    output,
+                    &mut grad,
+                    batch_size,
+                    *input_length,
+                    *output_length,
+                    *in_channels,
+                    *out_channels,
+                    *kernel_size,
+                    *stride,
+                    *padding,
+                    *causal,
+                    weights,
+                    activation,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.weights,
+                &workspace.weight_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.biases,
+                &workspace.bias_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::Residual {
-            inner,
-        } => {
-            let skip_grad = grad.clone();
+        // ====================================================================
+        // Residual
+        // ====================================================================
+
+        (
+            Layer::Residual(inner_layers),
+            BatchLayerCache::Residual {
+                inner,
+            },
+        ) => {
+            let skip_grad =
+                grad.clone();
 
             let mut result =
                 backward_layers_batch_inner(
+                    &*inner_layers.layers,
                     inner,
+                    params,
                     grad,
                     batch_size,
                     workspace,
@@ -3739,208 +3450,439 @@ fn backward_layer_batch(
                 skip_grad.len()
             );
 
-            for i in 0..result.len() {
-                result[i] +=
-                    skip_grad[i];
-            }
+            add_f32_slice_simd(
+                &mut result,
+                &skip_grad,
+            );
 
             result
         }
 
-        BatchLayerCache::DepthwiseConv1D {
-            input,
-            output,
-            input_length,
-            output_length,
-            in_channels,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            weight_handles,
-            bias_handles,
-            activation,
-        } => {
-            depthwise_conv1d_backward(
+        // ====================================================================
+        // Depthwise Conv1D
+        // ====================================================================
+
+        (
+            Layer::DepthwiseConv1D(layer),
+            BatchLayerCache::DepthwiseConv1D {
                 input,
                 output,
-                &mut grad,
-                batch_size,
-                *input_length,
-                *output_length,
-                *in_channels,
-                *kernel_size,
-                *stride,
-                *padding,
-                *causal,
-                weight_handles,
-                bias_handles,
+                input_length,
+                output_length,
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                causal,
                 activation,
-                workspace,
-            )
+            },
+        ) => {
+            let weights =
+                params.values(layer.weights);
+
+            let (
+                input_grads,
+                weight_grads,
+                bias_grads,
+            ) =
+                depthwise_conv1d_backward(
+                    input,
+                    output,
+                    &mut grad,
+                    batch_size,
+                    *input_length,
+                    *output_length,
+                    *in_channels,
+                    *kernel_size,
+                    *stride,
+                    *padding,
+                    *causal,
+                    weights,
+                    activation,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.weights,
+                &weight_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.biases,
+                &bias_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::GroupedConv1D {
-            input,
-            output,
-            input_length,
-            output_length,
-            in_channels,
-            out_channels,
-            groups,
-            kernel_size,
-            stride,
-            padding,
-            causal,
-            weight_handles,
-            bias_handles,
-            activation,
-        } => {
-            grouped_conv1d_backward(
+        // ====================================================================
+        // Grouped Conv1D
+        // ====================================================================
+
+        (
+            Layer::GroupedConv1D(layer),
+            BatchLayerCache::GroupedConv1D {
                 input,
                 output,
-                &mut grad,
-                batch_size,
-                *input_length,
-                *output_length,
-                *in_channels,
-                *out_channels,
-                *groups,
-                *kernel_size,
-                *stride,
-                *padding,
-                *causal,
-                weight_handles,
-                bias_handles,
+                input_length,
+                output_length,
+                in_channels,
+                out_channels,
+                groups,
+                kernel_size,
+                stride,
+                padding,
+                causal,
                 activation,
-            )
+            },
+        ) => {
+            let weights =
+                params.values(layer.weights);
+
+            let (
+                input_grads,
+                weight_grads,
+                bias_grads,
+            ) =
+                grouped_conv1d_backward(
+                    input,
+                    output,
+                    &mut grad,
+                    batch_size,
+                    *input_length,
+                    *output_length,
+                    *in_channels,
+                    *out_channels,
+                    *groups,
+                    *kernel_size,
+                    *stride,
+                    *padding,
+                    *causal,
+                    weights,
+                    activation,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.weights,
+                &weight_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.biases,
+                &bias_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::LowRankPointwise {
-            input,
-            hidden,
-            output,
-            rows,
-            in_channels,
-            rank,
-            out_channels,
-            first_weights,
-            second_weights,
-            first_weight_handles,
-            first_bias_handles,
-            second_weight_handles,
-            second_bias_handles,
-            activation,
-        } => {
-            low_rank_pointwise_backward(
+        // ====================================================================
+        // Low-rank pointwise
+        // ====================================================================
+
+        (
+            Layer::LowRankPointwise(layer),
+            BatchLayerCache::LowRankPointwise {
                 input,
                 hidden,
                 output,
-                &mut grad,
-                *rows,
-                *in_channels,
-                *rank,
-                *out_channels,
-                first_weights,
-                second_weights,
-                first_weight_handles,
-                first_bias_handles,
-                second_weight_handles,
-                second_bias_handles,
+                rows,
+                in_channels,
+                rank,
+                out_channels,
                 activation,
-                workspace,
-            )
+                ..
+            },
+        ) => {
+            let first_weights =
+                params.values(
+                    layer.first_weights
+                );
+
+            let second_weights =
+                params.values(
+                    layer.second_weights
+                );
+
+            let (
+                input_grads,
+                first_weight_grads,
+                first_bias_grads,
+                second_weight_grads,
+                second_bias_grads,
+            ) =
+                low_rank_pointwise_backward(
+                    input,
+                    hidden,
+                    output,
+                    &mut grad,
+                    *rows,
+                    *in_channels,
+                    *rank,
+                    *out_channels,
+                    first_weights,
+                    second_weights,
+                    activation,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.first_weights,
+                &first_weight_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.first_biases,
+                &first_bias_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.second_weights,
+                &second_weight_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.second_biases,
+                &second_bias_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::ChannelScale {
-            input,
-            channels,
-            scale_handles,
-            bias_handles,
-        } => {
-            channel_scale_backward(
+        // ====================================================================
+        // ChannelScale
+        // ====================================================================
+
+        (
+            Layer::ChannelScale(layer),
+            BatchLayerCache::ChannelScale {
                 input,
-                &mut grad,
-                batch_size,
-                *channels,
-                scale_handles,
-                bias_handles,
-                workspace,
-            )
+                channels,
+            },
+        ) => {
+            let scales =
+                params.values(
+                    layer.scales
+                );
+
+            let (
+                input_grads,
+                scale_grads,
+                bias_grads,
+            ) =
+                channel_scale_backward(
+                    input,
+                    &grad,
+                    batch_size,
+                    *channels,
+                    scales,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.scales,
+                &scale_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.biases,
+                &bias_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::LayerNorm {
-            input,
-            means,
-            inv_stds,
-            channels,
-            gamma_handles,
-            beta_handles,
-        } => {
-            layer_norm_backward(
+        // ====================================================================
+        // LayerNorm
+        // ====================================================================
+
+        (
+            Layer::LayerNorm(layer),
+            BatchLayerCache::LayerNorm {
                 input,
-                &grad,
-                batch_size,
-                *channels,
                 means,
                 inv_stds,
-                gamma_handles,
-                beta_handles,
-                workspace,
-            )
+                channels,
+            },
+        ) => {
+            let gamma =
+                params.values(
+                    layer.gamma
+                );
+
+            let (
+                input_grads,
+                gamma_grads,
+                beta_grads,
+            ) =
+                layer_norm_backward(
+                    input,
+                    &grad,
+                    batch_size,
+                    *channels,
+                    means,
+                    inv_stds,
+                    gamma,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.gamma,
+                &gamma_grads,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.beta,
+                &beta_grads,
+            );
+
+            input_grads
         }
 
-        BatchLayerCache::WeightTying {
-            input,
-            embeddings,
-            batch_size,
-            embedding_dim,
-            vocab_size,
-        } => {
-            weight_tying_backward(
+        // ====================================================================
+        // Weight tying
+        // ====================================================================
+
+        (
+            Layer::WeightTying(layer),
+            BatchLayerCache::WeightTying {
                 input,
-                &grad,
-                *batch_size,
-                *embedding_dim,
-                *vocab_size,
                 embeddings,
-                workspace,
-            )
+                batch_size: cached_batch_size,
+                embedding_dim,
+                vocab_size,
+            },
+        ) => {
+            debug_assert_eq!(
+                *cached_batch_size,
+                batch_size
+            );
+
+            let (
+                input_grads,
+                embedding_grads,
+            ) =
+                weight_tying_backward(
+                    input,
+                    &grad,
+                    *cached_batch_size,
+                    *embedding_dim,
+                    *vocab_size,
+                    embeddings,
+                    params,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                embeddings.parameter_range(),
+                &embedding_grads,
+            );
+
+            let _ = layer;
+
+            input_grads
         }
 
-        BatchLayerCache::GlobalMixer {
-            input,
-            write_probs,
-            global_vectors,
-            read_probs,
-            positions,
-            channels,
-            global_dim,
-            write_weight_handles,
-            write_bias_handles,
-            read_weight_handles,
-            read_bias_handles,
-            write_positional_weight_handles,
-            read_positional_weight_handles,
-        } => {
-            global_mixer_backward(
+        // ====================================================================
+        // GlobalMixer
+        // ====================================================================
+
+        (
+            Layer::GlobalMixer(layer),
+            BatchLayerCache::GlobalMixer {
                 input,
                 write_probs,
                 global_vectors,
                 read_probs,
-                grad,
-                batch_size,
-                *positions,
-                *channels,
-                *global_dim,
-                write_weight_handles,
-                write_bias_handles,
-                read_weight_handles,
-                read_bias_handles,
-                write_positional_weight_handles,
-                read_positional_weight_handles,
-                workspace,
-            )
+                positions,
+                channels,
+                global_dim,
+            },
+        ) => {
+            let write_weights =
+                params.values(
+                    layer.write_weights
+                );
+
+            let read_weights =
+                params.values(
+                    layer.read_weights
+                );
+
+            let (
+                input_grads,
+                mixer_grads,
+            ) =
+                global_mixer_backward(
+                    input,
+                    write_probs,
+                    global_vectors,
+                    read_probs,
+                    grad,
+                    batch_size,
+                    *positions,
+                    *channels,
+                    *global_dim,
+                    write_weights,
+                    read_weights,
+                    workspace,
+                );
+
+            accumulate_parameter_grads(
+                params,
+                layer.write_weights,
+                &mixer_grads.write_weights,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.write_biases,
+                &mixer_grads.write_biases,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.read_weights,
+                &mixer_grads.read_weights,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.read_biases,
+                &mixer_grads.read_biases,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.write_positional_weights,
+                &mixer_grads.write_positional_weights,
+            );
+
+            accumulate_parameter_grads(
+                params,
+                layer.read_positional_weights,
+                &mixer_grads.read_positional_weights,
+            );
+
+            input_grads
+        }
+
+        _ => {
+            panic!(
+                "Layer/cache mismatch during backward pass"
+            );
         }
     }
 }

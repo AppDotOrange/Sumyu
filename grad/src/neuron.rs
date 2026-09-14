@@ -1,25 +1,66 @@
 use std::sync::Arc;
-use rayon::ThreadPool;
-use rand_distr::{Distribution, Normal as NormalDist};
-use serde::{Deserialize, Serialize};
-use crate::{Tensor, TensorHandle, embeddings::Embeddings};
-pub use crate::{backwards::*, forwards::*};
 
-#[derive(Clone, Serialize, Deserialize, Copy)]
+use rand_distr::{
+    Distribution,
+    Normal as NormalDist,
+};
+use rayon::ThreadPool;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+
+use crate::{
+    embeddings::Embeddings,
+    parameters::{
+        ParamRange,
+        ParameterStore,
+    },
+};
+
+pub use crate::{
+    backwards::*,
+    forwards::*,
+};
+
+#[derive(
+    Clone,
+    Serialize,
+    Deserialize,
+    Copy,
+)]
 pub enum Activation {
     None,
-    LeakyReLU { slope: f32 },
+    LeakyReLU {
+        slope: f32,
+    },
 }
+
 impl Activation {
     #[inline]
-    pub(crate) fn apply(&self, x: f32) -> f32 {
+    pub(crate) fn apply(
+        &self,
+        x: f32,
+    ) -> f32 {
         match self {
             Self::None => x,
-            Self::LeakyReLU { slope } => if x <= 0.0 { x * slope } else { x },
+
+            Self::LeakyReLU { slope } => {
+                if x <= 0.0 {
+                    x * slope
+                } else {
+                    x
+                }
+            }
         }
     }
+
     #[inline]
-    pub fn backward(&self, x: f32, grad: &mut f32) {
+    pub fn backward(
+        &self,
+        x: f32,
+        grad: &mut f32,
+    ) {
         if let Self::LeakyReLU { slope } = self {
             if x <= 0.0 {
                 *grad *= *slope;
@@ -27,12 +68,20 @@ impl Activation {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+
+#[derive(
+    Serialize,
+    Deserialize,
+)]
 pub struct SavedMLP {
-    version: u32,
-    layers: Vec<SavedLayer>,
+    pub version: u32,
+    pub layers: Vec<SavedLayer>,
 }
-#[derive(Serialize, Deserialize)]
+
+#[derive(
+    Serialize,
+    Deserialize,
+)]
 pub enum SavedLayer {
     Dense {
         input_size: usize,
@@ -41,6 +90,7 @@ pub enum SavedLayer {
         weights: Vec<f32>,
         biases: Vec<f32>,
     },
+
     Conv1D {
         in_channels: usize,
         out_channels: usize,
@@ -53,11 +103,13 @@ pub enum SavedLayer {
         weights: Vec<f32>,
         biases: Vec<f32>,
     },
+
     Residual {
         input_size: usize,
         output_size: usize,
         layers: Vec<SavedLayer>,
     },
+
     DepthwiseConv1D {
         in_channels: usize,
         kernel_size: usize,
@@ -69,6 +121,7 @@ pub enum SavedLayer {
         weights: Vec<f32>,
         biases: Vec<f32>,
     },
+
     GroupedConv1D {
         in_channels: usize,
         out_channels: usize,
@@ -82,6 +135,7 @@ pub enum SavedLayer {
         weights: Vec<f32>,
         biases: Vec<f32>,
     },
+
     LowRankPointwise {
         in_channels: usize,
         rank: usize,
@@ -92,21 +146,25 @@ pub enum SavedLayer {
         second_weights: Vec<f32>,
         second_biases: Vec<f32>,
     },
+
     ChannelScale {
         channels: usize,
         scales: Vec<f32>,
         biases: Vec<f32>,
     },
+
     WeightTying {
         embedding_dim: usize,
         vocab_size: usize,
     },
+
     LayerNorm {
         channels: usize,
         epsilon: f32,
         gamma: Vec<f32>,
         beta: Vec<f32>,
     },
+
     GlobalMixer {
         channels: usize,
         global_dim: usize,
@@ -117,8 +175,6 @@ pub enum SavedLayer {
         read_weights: Vec<f32>,
         read_biases: Vec<f32>,
 
-        // Added in save format v3.
-        // `serde(default)` keeps older v1/v2 models loadable.
         #[serde(default)]
         write_positional_weights: Vec<f32>,
 
@@ -126,12 +182,14 @@ pub enum SavedLayer {
         read_positional_weights: Vec<f32>,
     },
 }
+
 #[derive(Clone)]
 pub enum LayerSpec {
     Dense {
         output_size: usize,
         activation: Activation,
     },
+
     Conv1D {
         in_channels: usize,
         out_channels: usize,
@@ -141,9 +199,11 @@ pub enum LayerSpec {
         causal: bool,
         activation: Activation,
     },
+
     Residual {
         layers: Vec<LayerSpec>,
     },
+
     DepthwiseConv1D {
         in_channels: usize,
         kernel_size: usize,
@@ -152,6 +212,7 @@ pub enum LayerSpec {
         causal: bool,
         activation: Activation,
     },
+
     GroupedConv1D {
         in_channels: usize,
         out_channels: usize,
@@ -162,20 +223,25 @@ pub enum LayerSpec {
         causal: bool,
         activation: Activation,
     },
+
     LowRankPointwise {
         in_channels: usize,
         rank: usize,
         out_channels: usize,
         activation: Activation,
     },
+
     ChannelScale {
         channels: usize,
     },
+
     WeightTying,
+
     LayerNorm {
         channels: usize,
         epsilon: f32,
     },
+
     GlobalMixer {
         channels: usize,
         global_dim: usize,
@@ -195,9 +261,6 @@ pub enum BatchLayerCache {
         output_size: usize,
         input: Vec<f32>,
         activation_output: Option<Vec<f32>>,
-        weights: Vec<f32>,
-        weight_handles: Arc<[TensorHandle]>,
-        bias_handles: Arc<[TensorHandle]>,
         activation: Activation,
     },
 
@@ -212,8 +275,6 @@ pub enum BatchLayerCache {
         stride: usize,
         padding: usize,
         causal: bool,
-        weight_handles: Arc<[TensorHandle]>,
-        bias_handles: Arc<[TensorHandle]>,
         activation: Activation,
     },
 
@@ -231,8 +292,6 @@ pub enum BatchLayerCache {
         stride: usize,
         padding: usize,
         causal: bool,
-        weight_handles: Arc<[TensorHandle]>,
-        bias_handles: Arc<[TensorHandle]>,
         activation: Activation,
     },
 
@@ -248,8 +307,6 @@ pub enum BatchLayerCache {
         stride: usize,
         padding: usize,
         causal: bool,
-        weight_handles: Arc<[TensorHandle]>,
-        bias_handles: Arc<[TensorHandle]>,
         activation: Activation,
     },
 
@@ -266,18 +323,14 @@ pub enum BatchLayerCache {
         first_weights: Vec<f32>,
         second_weights: Vec<f32>,
 
-        first_weight_handles: Arc<[TensorHandle]>,
-        first_bias_handles: Arc<[TensorHandle]>,
-        second_weight_handles: Arc<[TensorHandle]>,
-        second_bias_handles: Arc<[TensorHandle]>,
         activation: Activation,
     },
+
     ChannelScale {
         input: Vec<f32>,
         channels: usize,
-        scale_handles: Arc<[TensorHandle]>,
-        bias_handles: Arc<[TensorHandle]>,
     },
+
     WeightTying {
         input: Vec<f32>,
         embeddings: Arc<Embeddings>,
@@ -285,14 +338,14 @@ pub enum BatchLayerCache {
         embedding_dim: usize,
         vocab_size: usize,
     },
+
     LayerNorm {
         input: Vec<f32>,
         means: Vec<f32>,
         inv_stds: Vec<f32>,
         channels: usize,
-        gamma_handles: Arc<[TensorHandle]>,
-        beta_handles: Arc<[TensorHandle]>,
     },
+
     GlobalMixer {
         input: Vec<f32>,
 
@@ -303,64 +356,71 @@ pub enum BatchLayerCache {
         positions: usize,
         channels: usize,
         global_dim: usize,
-
-        write_weight_handles: Arc<[TensorHandle]>,
-        write_bias_handles: Arc<[TensorHandle]>,
-
-        read_weight_handles: Arc<[TensorHandle]>,
-        read_bias_handles: Arc<[TensorHandle]>,
-
-        write_positional_weight_handles: Arc<[TensorHandle]>,
-        read_positional_weight_handles: Arc<[TensorHandle]>,
     },
 }
 
 #[derive(Clone)]
 pub struct DenseLayer {
-    pub(crate) weights: Vec<Tensor>,
-    pub(crate) biases: Vec<Tensor>,
-    pub(crate) fused_weights: Arc<[TensorHandle]>,
-    pub(crate) fused_biases: Arc<[TensorHandle]>,
+    pub(crate) input_size: usize,
+    pub(crate) output_size: usize,
+
+    pub(crate) weights: ParamRange,
+    pub(crate) biases: ParamRange,
+
     pub(crate) activation: Activation,
 }
 
 impl DenseLayer {
-    fn new(num_inputs: usize, num_outputs: usize, activation: Activation) -> Self {
-        let mut rng = rand::rng();
-        let std_dev = (2.0 / num_inputs as f32).sqrt();
+    fn new(
+        params: &mut ParameterStore,
+        num_inputs: usize,
+        num_outputs: usize,
+        activation: Activation,
+    ) -> Self {
+        let mut rng =
+            rand::rng();
+
+        let std_dev =
+            (2.0 / num_inputs as f32).sqrt();
+
         let normal =
-            NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
+            NormalDist::new(
+                0.0,
+                std_dev,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
 
-        let weights = (0..num_inputs * num_outputs)
-            .map(|_| Tensor::new(normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let weights =
+            params.alloc_many(
+                (0..num_inputs * num_outputs)
+                    .map(|_| {
+                        normal.sample(&mut rng)
+                    }),
+            );
 
-        let biases = (0..num_outputs)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
-
-        let fused_weights = weights.iter().map(|x| x.handle).collect();
-        let fused_biases = biases.iter().map(|x| x.handle).collect();
+        let biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    num_outputs,
+                ),
+            );
 
         Self {
+            input_size: num_inputs,
+            output_size: num_outputs,
             weights,
             biases,
-            fused_weights,
-            fused_biases,
             activation,
         }
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.weights.clone();
-        params.extend_from_slice(&self.biases);
-        params
-    }
-
     fn spec(&self) -> LayerSpec {
         LayerSpec::Dense {
-            output_size: self.fused_biases.len(),
-            activation: self.activation.clone(),
+            output_size: self.output_size,
+            activation: self.activation,
         }
     }
 }
@@ -374,14 +434,14 @@ pub struct Conv1DLayer {
     pub(crate) padding: usize,
     pub(crate) causal: bool,
     pub(crate) activation: Activation,
-    weights: Vec<Tensor>,
-    biases: Vec<Tensor>,
-    pub weight_handles: Arc<[TensorHandle]>,
-    pub(crate) bias_handles: Arc<[TensorHandle]>,
+
+    pub(crate) weights: ParamRange,
+    pub(crate) biases: ParamRange,
 }
 
 impl Conv1DLayer {
     pub fn new(
+        params: &mut ParameterStore,
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -395,21 +455,39 @@ impl Conv1DLayer {
         assert!(kernel_size > 0);
         assert!(stride > 0);
 
-        let fan_in = in_channels * kernel_size;
-        let std_dev = (2.0 / fan_in as f32).sqrt();
-        let normal = NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
-        let mut rng = rand::rng();
+        let fan_in =
+            in_channels * kernel_size;
 
-        let weights = (0..out_channels * fan_in)
-            .map(|_| Tensor::new(normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let std_dev =
+            (2.0 / fan_in as f32).sqrt();
 
-        let biases = (0..out_channels)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
+        let normal =
+            NormalDist::new(
+                0.0,
+                std_dev,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
 
-        let weight_handles = weights.iter().map(|x| x.handle).collect();
-        let bias_handles = biases.iter().map(|x| x.handle).collect();
+        let mut rng =
+            rand::rng();
+
+        let weights =
+            params.alloc_many(
+                (0..out_channels * fan_in)
+                    .map(|_| {
+                        normal.sample(&mut rng)
+                    }),
+            );
+
+        let biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    out_channels,
+                ),
+            );
 
         Self {
             in_channels,
@@ -421,28 +499,35 @@ impl Conv1DLayer {
             activation,
             weights,
             biases,
-            weight_handles,
-            bias_handles,
         }
     }
 
     #[inline]
-    pub fn output_length(&self, input_length: usize) -> usize {
+    pub fn output_length(
+        &self,
+        input_length: usize,
+    ) -> usize {
         if self.causal {
-            // Causal convolution pads only on the left by kernel_size - 1.
-            // Output positions occur at 0, stride, 2*stride, ...
             assert!(input_length > 0);
-            (input_length - 1) / self.stride + 1
-        } else {
-            assert!(input_length + 2 * self.padding >= self.kernel_size);
-            (input_length + 2 * self.padding - self.kernel_size) / self.stride + 1
-        }
-    }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.weights.clone();
-        params.extend_from_slice(&self.biases);
-        params
+            (input_length - 1)
+                / self.stride
+                + 1
+        } else {
+            assert!(
+                input_length
+                    + 2 * self.padding
+                    >= self.kernel_size
+            );
+
+            (
+                input_length
+                    + 2 * self.padding
+                    - self.kernel_size
+            )
+                / self.stride
+                + 1
+        }
     }
 
     fn spec(&self) -> LayerSpec {
@@ -453,7 +538,7 @@ impl Conv1DLayer {
             stride: self.stride,
             padding: self.padding,
             causal: self.causal,
-            activation: self.activation.clone(),
+            activation: self.activation,
         }
     }
 }
@@ -467,15 +552,13 @@ pub struct DepthwiseConv1DLayer {
     pub(crate) causal: bool,
     pub(crate) activation: Activation,
 
-    weights: Vec<Tensor>,
-    biases: Vec<Tensor>,
-
-    pub(crate) weight_handles: Arc<[TensorHandle]>,
-    pub(crate) bias_handles: Arc<[TensorHandle]>,
+    pub(crate) weights: ParamRange,
+    pub(crate) biases: ParamRange,
 }
 
 impl DepthwiseConv1DLayer {
     pub fn new(
+        params: &mut ParameterStore,
         in_channels: usize,
         kernel_size: usize,
         stride: usize,
@@ -487,22 +570,39 @@ impl DepthwiseConv1DLayer {
         assert!(kernel_size > 0);
         assert!(stride > 0);
 
-        let fan_in = kernel_size;
-        let std_dev = (2.0 / fan_in as f32).sqrt();
+        let fan_in =
+            kernel_size;
+
+        let std_dev =
+            (2.0 / fan_in as f32).sqrt();
+
         let normal =
-            NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
-        let mut rng = rand::rng();
+            NormalDist::new(
+                0.0,
+                std_dev,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
 
-        let weights = (0..in_channels * kernel_size)
-            .map(|_| Tensor::new(normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let mut rng =
+            rand::rng();
 
-        let biases = (0..in_channels)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
+        let weights =
+            params.alloc_many(
+                (0..in_channels * kernel_size)
+                    .map(|_| {
+                        normal.sample(&mut rng)
+                    }),
+            );
 
-        let weight_handles = weights.iter().map(|x| x.handle).collect();
-        let bias_handles = biases.iter().map(|x| x.handle).collect();
+        let biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    in_channels,
+                ),
+            );
 
         Self {
             in_channels,
@@ -513,28 +613,35 @@ impl DepthwiseConv1DLayer {
             activation,
             weights,
             biases,
-            weight_handles,
-            bias_handles,
         }
     }
 
     #[inline]
-    pub fn output_length(&self, input_length: usize) -> usize {
+    pub fn output_length(
+        &self,
+        input_length: usize,
+    ) -> usize {
         if self.causal {
             assert!(input_length > 0);
-            (input_length - 1) / self.stride + 1
+
+            (input_length - 1)
+                / self.stride
+                + 1
         } else {
-            assert!(input_length + 2 * self.padding >= self.kernel_size);
-            (input_length + 2 * self.padding - self.kernel_size)
+            assert!(
+                input_length
+                    + 2 * self.padding
+                    >= self.kernel_size
+            );
+
+            (
+                input_length
+                    + 2 * self.padding
+                    - self.kernel_size
+            )
                 / self.stride
                 + 1
         }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.weights.clone();
-        params.extend_from_slice(&self.biases);
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -544,7 +651,7 @@ impl DepthwiseConv1DLayer {
             stride: self.stride,
             padding: self.padding,
             causal: self.causal,
-            activation: self.activation.clone(),
+            activation: self.activation,
         }
     }
 }
@@ -560,15 +667,13 @@ pub struct GroupedConv1DLayer {
     pub(crate) causal: bool,
     pub(crate) activation: Activation,
 
-    weights: Vec<Tensor>,
-    biases: Vec<Tensor>,
-
-    pub weight_handles: Arc<[TensorHandle]>,
-    pub bias_handles: Arc<[TensorHandle]>,
+    pub(crate) weights: ParamRange,
+    pub(crate) biases: ParamRange,
 }
 
 impl GroupedConv1DLayer {
     pub fn new(
+        params: &mut ParameterStore,
         in_channels: usize,
         out_channels: usize,
         groups: usize,
@@ -596,26 +701,42 @@ impl GroupedConv1DLayer {
             "out_channels must be divisible by groups"
         );
 
-        let group_in = in_channels / groups;
-        let fan_in = group_in * kernel_size;
+        let group_in =
+            in_channels / groups;
 
-        let std_dev = (2.0 / fan_in as f32).sqrt();
+        let fan_in =
+            group_in * kernel_size;
+
+        let std_dev =
+            (2.0 / fan_in as f32).sqrt();
+
         let normal =
-            NormalDist::new(0.0, std_dev).expect("Invalid standard deviation");
-        let mut rng = rand::rng();
+            NormalDist::new(
+                0.0,
+                std_dev,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
 
-        // Layout is:
-        // [out_channel][kernel][group_input_channel]
-        let weights = (0..out_channels * fan_in)
-            .map(|_| Tensor::new(normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let mut rng =
+            rand::rng();
 
-        let biases = (0..out_channels)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
+        let weights =
+            params.alloc_many(
+                (0..out_channels * fan_in)
+                    .map(|_| {
+                        normal.sample(&mut rng)
+                    }),
+            );
 
-        let weight_handles = weights.iter().map(|x| x.handle).collect();
-        let bias_handles = biases.iter().map(|x| x.handle).collect();
+        let biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    out_channels,
+                ),
+            );
 
         Self {
             in_channels,
@@ -628,28 +749,35 @@ impl GroupedConv1DLayer {
             activation,
             weights,
             biases,
-            weight_handles,
-            bias_handles,
         }
     }
 
     #[inline]
-    pub(crate) fn output_length(&self, input_length: usize) -> usize {
+    pub(crate) fn output_length(
+        &self,
+        input_length: usize,
+    ) -> usize {
         if self.causal {
             assert!(input_length > 0);
-            (input_length - 1) / self.stride + 1
+
+            (input_length - 1)
+                / self.stride
+                + 1
         } else {
-            assert!(input_length + 2 * self.padding >= self.kernel_size);
-            (input_length + 2 * self.padding - self.kernel_size)
+            assert!(
+                input_length
+                    + 2 * self.padding
+                    >= self.kernel_size
+            );
+
+            (
+                input_length
+                    + 2 * self.padding
+                    - self.kernel_size
+            )
                 / self.stride
                 + 1
         }
-    }
-
-    pub fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.weights.clone();
-        params.extend_from_slice(&self.biases);
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -661,7 +789,7 @@ impl GroupedConv1DLayer {
             stride: self.stride,
             padding: self.padding,
             causal: self.causal,
-            activation: self.activation.clone(),
+            activation: self.activation,
         }
     }
 }
@@ -673,20 +801,16 @@ pub struct LowRankPointwiseLayer {
     pub(crate) out_channels: usize,
     pub(crate) activation: Activation,
 
-    first_weights: Vec<Tensor>,
-    first_biases: Vec<Tensor>,
+    pub(crate) first_weights: ParamRange,
+    pub(crate) first_biases: ParamRange,
 
-    second_weights: Vec<Tensor>,
-    second_biases: Vec<Tensor>,
-
-    pub(crate) first_weight_handles: Arc<[TensorHandle]>,
-    pub(crate) first_bias_handles: Arc<[TensorHandle]>,
-    pub(crate) second_weight_handles: Arc<[TensorHandle]>,
-    pub(crate) second_bias_handles: Arc<[TensorHandle]>,
+    pub(crate) second_weights: ParamRange,
+    pub(crate) second_biases: ParamRange,
 }
 
 impl LowRankPointwiseLayer {
     fn new(
+        params: &mut ParameterStore,
         in_channels: usize,
         rank: usize,
         out_channels: usize,
@@ -696,43 +820,68 @@ impl LowRankPointwiseLayer {
         assert!(rank > 0);
         assert!(out_channels > 0);
 
-        let mut rng = rand::rng();
+        let mut rng =
+            rand::rng();
 
-        let first_std = (2.0 / in_channels as f32).sqrt();
-        let second_std = (2.0 / rank as f32).sqrt();
+        let first_std =
+            (2.0 / in_channels as f32).sqrt();
+
+        let second_std =
+            (2.0 / rank as f32).sqrt();
 
         let first_normal =
-            NormalDist::new(0.0, first_std).expect("Invalid standard deviation");
+            NormalDist::new(
+                0.0,
+                first_std,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
+
         let second_normal =
-            NormalDist::new(0.0, second_std).expect("Invalid standard deviation");
+            NormalDist::new(
+                0.0,
+                second_std,
+            )
+                .expect(
+                    "Invalid standard deviation"
+                );
 
-        let first_weights = (0..rank * in_channels)
-            .map(|_| Tensor::new(first_normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let first_weights =
+            params.alloc_many(
+                (0..rank * in_channels)
+                    .map(|_| {
+                        first_normal.sample(
+                            &mut rng
+                        )
+                    }),
+            );
 
-        let first_biases = (0..rank)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
+        let first_biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    rank,
+                ),
+            );
 
-        let second_weights = (0..out_channels * rank)
-            .map(|_| Tensor::new(second_normal.sample(&mut rng)))
-            .collect::<Vec<_>>();
+        let second_weights =
+            params.alloc_many(
+                (0..out_channels * rank)
+                    .map(|_| {
+                        second_normal.sample(
+                            &mut rng
+                        )
+                    }),
+            );
 
-        let second_biases = (0..out_channels)
-            .map(|_| Tensor::new(0.1))
-            .collect::<Vec<_>>();
-
-        let first_weight_handles =
-            first_weights.iter().map(|x| x.handle).collect();
-
-        let first_bias_handles =
-            first_biases.iter().map(|x| x.handle).collect();
-
-        let second_weight_handles =
-            second_weights.iter().map(|x| x.handle).collect();
-
-        let second_bias_handles =
-            second_biases.iter().map(|x| x.handle).collect();
+        let second_biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.1f32,
+                    out_channels,
+                ),
+            );
 
         Self {
             in_channels,
@@ -742,25 +891,10 @@ impl LowRankPointwiseLayer {
 
             first_weights,
             first_biases,
+
             second_weights,
             second_biases,
-
-            first_weight_handles,
-            first_bias_handles,
-            second_weight_handles,
-            second_bias_handles,
         }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = Vec::new();
-
-        params.extend_from_slice(&self.first_weights);
-        params.extend_from_slice(&self.first_biases);
-        params.extend_from_slice(&self.second_weights);
-        params.extend_from_slice(&self.second_biases);
-
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -768,7 +902,7 @@ impl LowRankPointwiseLayer {
             in_channels: self.in_channels,
             rank: self.rank,
             out_channels: self.out_channels,
-            activation: self.activation.clone(),
+            activation: self.activation,
         }
     }
 }
@@ -776,40 +910,38 @@ impl LowRankPointwiseLayer {
 #[derive(Clone)]
 pub struct ChannelScaleLayer {
     pub(crate) channels: usize,
-    scales: Vec<Tensor>,
-    biases: Vec<Tensor>,
-    pub(crate) scale_handles: Arc<[TensorHandle]>,
-    pub(crate) bias_handles: Arc<[TensorHandle]>,
+    pub(crate) scales: ParamRange,
+    pub(crate) biases: ParamRange,
 }
 
 impl ChannelScaleLayer {
-    fn new(channels: usize) -> Self {
+    fn new(
+        params: &mut ParameterStore,
+        channels: usize,
+    ) -> Self {
         assert!(channels > 0);
 
-        let scales = (0..channels)
-            .map(|_| Tensor::new(1.0))
-            .collect::<Vec<_>>();
+        let scales =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    1.0f32,
+                    channels,
+                ),
+            );
 
-        let biases = (0..channels)
-            .map(|_| Tensor::new(0.0))
-            .collect::<Vec<_>>();
-
-        let scale_handles = scales.iter().map(|x| x.handle).collect();
-        let bias_handles = biases.iter().map(|x| x.handle).collect();
+        let biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    channels,
+                ),
+            );
 
         Self {
             channels,
             scales,
             biases,
-            scale_handles,
-            bias_handles,
         }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = self.scales.clone();
-        params.extend_from_slice(&self.biases);
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -825,7 +957,9 @@ pub struct WeightTyingLayer {
 }
 
 impl WeightTyingLayer {
-    fn new(embeddings: Arc<Embeddings>) -> Self {
+    fn new(
+        embeddings: Arc<Embeddings>,
+    ) -> Self {
         assert!(
             embeddings.embedding_dim() > 0,
             "Weight tying requires a non-zero embedding dimension"
@@ -836,15 +970,7 @@ impl WeightTyingLayer {
             "Weight tying requires a non-zero vocabulary size"
         );
 
-        Self {
-            embeddings,
-        }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        // The embedding parameters are owned by Embeddings.
-        // Returning them here would double-count the parameters.
-        Vec::new()
+        Self { embeddings }
     }
 
     fn spec(&self) -> LayerSpec {
@@ -856,7 +982,7 @@ impl WeightTyingLayer {
 pub struct ResidualLayer {
     pub(crate) layers: Vec<Layer>,
     pub(crate) input_size: usize,
-    output_size: usize,
+    pub(crate) output_size: usize,
 }
 
 impl ResidualLayer {
@@ -866,7 +992,8 @@ impl ResidualLayer {
         output_size: usize,
     ) -> Self {
         assert_eq!(
-            input_size, output_size,
+            input_size,
+            output_size,
             "Residual input/output sizes must match"
         );
 
@@ -877,19 +1004,12 @@ impl ResidualLayer {
         }
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = Vec::new();
-
-        for layer in &self.layers {
-            params.extend(layer.parameters());
-        }
-
-        params
-    }
-
     fn spec(&self) -> LayerSpec {
         LayerSpec::Residual {
-            layers: self.layers.iter().map(|x| x.spec()).collect(),
+            layers: self.layers
+                .iter()
+                .map(|x| x.spec())
+                .collect(),
         }
     }
 }
@@ -899,15 +1019,13 @@ pub struct LayerNormLayer {
     pub(crate) channels: usize,
     pub(crate) epsilon: f32,
 
-    pub(crate) gamma: Vec<Tensor>,
-    pub(crate) beta: Vec<Tensor>,
-
-    pub(crate) gamma_handles: Arc<[TensorHandle]>,
-    pub(crate) beta_handles: Arc<[TensorHandle]>,
+    pub(crate) gamma: ParamRange,
+    pub(crate) beta: ParamRange,
 }
 
 impl LayerNormLayer {
     pub fn new(
+        params: &mut ParameterStore,
         channels: usize,
         epsilon: f32,
     ) -> Self {
@@ -921,45 +1039,28 @@ impl LayerNormLayer {
             "LayerNorm epsilon must be > 0",
         );
 
-        let gamma = (0..channels)
-            .map(|_| Tensor::new(1.0))
-            .collect::<Vec<_>>();
+        let gamma =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    1.0f32,
+                    channels,
+                ),
+            );
 
-        let beta = (0..channels)
-            .map(|_| Tensor::new(0.0))
-            .collect::<Vec<_>>();
-
-        let gamma_handles =
-            gamma
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-        let beta_handles =
-            beta
-                .iter()
-                .map(|x| x.handle)
-                .collect();
+        let beta =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    channels,
+                ),
+            );
 
         Self {
             channels,
             epsilon,
             gamma,
             beta,
-            gamma_handles,
-            beta_handles,
         }
-    }
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params =
-            self.gamma.clone();
-
-        params.extend_from_slice(
-            &self.beta
-        );
-
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -974,158 +1075,94 @@ impl LayerNormLayer {
 pub struct GlobalMixerLayer {
     pub(crate) channels: usize,
     pub(crate) global_dim: usize,
-    pub(crate) write_weights: Vec<Tensor>,
-    pub(crate) write_biases: Vec<Tensor>,
-    pub(crate) read_weights: Vec<Tensor>,
-    pub(crate) read_biases: Vec<Tensor>,
-    // Layout:
-    //
-    // [g0 f0, g0 f1, g0 f2, g0 f3,
-    //  g1 f0, g1 f1, g1 f2, g1 f3, ...]
-    //
-    // where:
-    //
-    // f0 = x
-    // f1 = x²
-    // f2 = sin(πx)
-    // f3 = cos(πx)
-    //
-    // These are initialized to zero so the initial mixer
-    // is mathematically identical to the old mixer.
-    pub(crate) write_positional_weights: Vec<Tensor>,
-    pub(crate) read_positional_weights: Vec<Tensor>,
-    pub(crate) write_weight_handles: Arc<[TensorHandle]>,
-    pub(crate) write_bias_handles: Arc<[TensorHandle]>,
-    pub(crate) read_weight_handles: Arc<[TensorHandle]>,
-    pub(crate) read_bias_handles: Arc<[TensorHandle]>,
-    pub(crate) write_positional_weight_handles: Arc<[TensorHandle]>,
-    pub(crate) read_positional_weight_handles: Arc<[TensorHandle]>,
+
+    pub(crate) write_weights: ParamRange,
+    pub(crate) write_biases: ParamRange,
+
+    pub(crate) read_weights: ParamRange,
+    pub(crate) read_biases: ParamRange,
+
+    pub(crate) write_positional_weights: ParamRange,
+    pub(crate) read_positional_weights: ParamRange,
 }
 
 impl GlobalMixerLayer {
-    fn new(channels: usize, global_dim: usize) -> Self {
+    fn new(
+        params: &mut ParameterStore,
+        channels: usize,
+        global_dim: usize,
+    ) -> Self {
         assert!(channels > 0);
         assert!(global_dim > 0);
 
-        let mut rng = rand::rng();
+        let mut rng =
+            rand::rng();
 
-        // Start substantially closer to an identity mapping.
-        //
-        // Previous:
-        //     1.0 / sqrt(channels)
-        //
-        // New:
-        //     0.1 / sqrt(channels)
-        //
-        // This keeps the write/read logits small, making both softmaxes
-        // close to uniform at initialization and greatly reducing the
-        // magnitude of the initial global message.
-        let scale = 0.1f32 / (channels as f32).sqrt();
+        let scale =
+            0.1f32
+                / (channels as f32).sqrt();
 
         let dist =
-            NormalDist::new(0.0, scale as f64).unwrap();
+            NormalDist::new(
+                0.0,
+                scale as f64,
+            )
+                .unwrap();
 
-        let mut write_weights =
-            Vec::with_capacity(channels * global_dim);
-
-        let mut read_weights =
-            Vec::with_capacity(channels * global_dim);
-
-        for _ in 0..channels * global_dim {
-            write_weights.push(
-                Tensor::new(
-                    dist.sample(&mut rng) as f32
-                )
+        let write_weights =
+            params.alloc_many(
+                (0..channels * global_dim)
+                    .map(|_| {
+                        dist.sample(&mut rng)
+                            as f32
+                    }),
             );
 
-            read_weights.push(
-                Tensor::new(
-                    dist.sample(&mut rng) as f32
-                )
-            );
-        }
-
-        // Zero biases keep the initial write/read logits centered.
-        let mut write_biases =
-            Vec::with_capacity(global_dim);
-
-        let mut read_biases =
-            Vec::with_capacity(global_dim);
-
-        for _ in 0..global_dim {
-            write_biases.push(
-                Tensor::new(0.0)
+        let read_weights =
+            params.alloc_many(
+                (0..channels * global_dim)
+                    .map(|_| {
+                        dist.sample(&mut rng)
+                            as f32
+                    }),
             );
 
-            read_biases.push(
-                Tensor::new(0.0)
+        let write_biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    global_dim,
+                ),
             );
-        }
+
+        let read_biases =
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    global_dim,
+                ),
+            );
 
         const POS_FEATURES: usize = 4;
 
         let positional_count =
             global_dim * POS_FEATURES;
 
-        // Zero initialization is intentional:
-        //
-        // pos_bias == 0
-        //
-        // so the new GlobalMixer starts exactly like
-        // the old one and learns positional routing from scratch.
         let write_positional_weights =
-            (0..positional_count)
-                .map(|_| Tensor::new(0.0))
-                .collect::<Vec<_>>();
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    positional_count,
+                ),
+            );
 
         let read_positional_weights =
-            (0..positional_count)
-                .map(|_| Tensor::new(0.0))
-                .collect::<Vec<_>>();
-
-        let write_positional_weight_handles:
-            Arc<[TensorHandle]> =
-            write_positional_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
-
-        let read_positional_weight_handles:
-            Arc<[TensorHandle]> =
-            read_positional_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
-
-        let write_weight_handles: Arc<[TensorHandle]> =
-            write_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
-
-        let write_bias_handles: Arc<[TensorHandle]> =
-            write_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
-
-        let read_weight_handles: Arc<[TensorHandle]> =
-            read_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
-
-        let read_bias_handles: Arc<[TensorHandle]> =
-            read_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect::<Vec<_>>()
-                .into();
+            params.alloc_many(
+                std::iter::repeat_n(
+                    0.0f32,
+                    positional_count,
+                ),
+            );
 
         Self {
             channels,
@@ -1139,36 +1176,7 @@ impl GlobalMixerLayer {
 
             write_positional_weights,
             read_positional_weights,
-
-            write_weight_handles,
-            write_bias_handles,
-
-            read_weight_handles,
-            read_bias_handles,
-
-            write_positional_weight_handles,
-            read_positional_weight_handles,
         }
-    }
-
-
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = Vec::with_capacity(
-            self.write_weights.len()
-                + self.write_biases.len()
-                + self.read_weights.len()
-                + self.read_biases.len()
-                + self.write_positional_weights.len()
-                + self.read_positional_weights.len(),
-        );
-        params.extend_from_slice(&self.write_weights);
-        params.extend_from_slice(&self.write_biases);
-        params.extend_from_slice(&self.read_weights);
-        params.extend_from_slice(&self.read_biases);
-        params.extend_from_slice(&self.write_positional_weights);
-        params.extend_from_slice(&self.read_positional_weights);
-
-        params
     }
 
     fn spec(&self) -> LayerSpec {
@@ -1196,31 +1204,35 @@ pub enum Layer {
 impl Layer {
     fn spec(&self) -> LayerSpec {
         match self {
-            Layer::Dense(layer) => layer.spec(),
-            Layer::Conv1D(layer) => layer.spec(),
-            Layer::Residual(layer) => layer.spec(),
-            Layer::DepthwiseConv1D(layer) => layer.spec(),
-            Layer::GroupedConv1D(layer) => layer.spec(),
-            Layer::LowRankPointwise(layer) => layer.spec(),
-            Layer::ChannelScale(layer) => layer.spec(),
-            Layer::LayerNorm(layer) => layer.spec(),
-            Layer::WeightTying(layer) => layer.spec(),
-            Layer::GlobalMixer(layer) => layer.spec(),
-        }
-    }
+            Layer::Dense(layer) =>
+                layer.spec(),
 
-    fn parameters(&self) -> Vec<Tensor> {
-        match self {
-            Layer::Dense(layer) => layer.parameters(),
-            Layer::Conv1D(layer) => layer.parameters(),
-            Layer::Residual(layer) => layer.parameters(),
-            Layer::DepthwiseConv1D(layer) => layer.parameters(),
-            Layer::GroupedConv1D(layer) => layer.parameters(),
-            Layer::LowRankPointwise(layer) => layer.parameters(),
-            Layer::ChannelScale(layer) => layer.parameters(),
-            Layer::LayerNorm(layer) => layer.parameters(),
-            Layer::WeightTying(layer) => layer.parameters(),
-            Layer::GlobalMixer(layer) => layer.parameters(),
+            Layer::Conv1D(layer) =>
+                layer.spec(),
+
+            Layer::Residual(layer) =>
+                layer.spec(),
+
+            Layer::DepthwiseConv1D(layer) =>
+                layer.spec(),
+
+            Layer::GroupedConv1D(layer) =>
+                layer.spec(),
+
+            Layer::LowRankPointwise(layer) =>
+                layer.spec(),
+
+            Layer::ChannelScale(layer) =>
+                layer.spec(),
+
+            Layer::LayerNorm(layer) =>
+                layer.spec(),
+
+            Layer::WeightTying(layer) =>
+                layer.spec(),
+
+            Layer::GlobalMixer(layer) =>
+                layer.spec(),
         }
     }
 }
@@ -1229,273 +1241,360 @@ fn build_layers(
     current_size: usize,
     specs: &[LayerSpec],
     embeddings: Option<&Arc<Embeddings>>,
+    params: &mut ParameterStore,
 ) -> (Vec<Layer>, usize) {
-    let mut layers = Vec::with_capacity(specs.len());
-    let mut current_size = current_size;
+    let mut layers =
+        Vec::with_capacity(
+            specs.len()
+        );
+
+    let mut current_size =
+        current_size;
 
     for spec in specs {
-        let layer = match spec {
-            LayerSpec::Dense {
-                output_size,
-                activation,
-            } => Layer::Dense(DenseLayer::new(
-                current_size,
-                *output_size,
-                activation.clone(),
-            )),
+        let layer =
+            match spec {
+                LayerSpec::Dense {
+                    output_size,
+                    activation,
+                } => {
+                    Layer::Dense(
+                        DenseLayer::new(
+                            params,
+                            current_size,
+                            *output_size,
+                            *activation,
+                        )
+                    )
+                }
 
-            LayerSpec::Conv1D {
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                activation,
-            } => {
-                assert_eq!(current_size % in_channels, 0);
+                LayerSpec::Conv1D {
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    activation,
+                } => {
+                    assert_eq!(
+                        current_size
+                            % in_channels,
+                        0
+                    );
 
-                Layer::Conv1D(Conv1DLayer::new(
-                    *in_channels,
-                    *out_channels,
-                    *kernel_size,
-                    *stride,
-                    *padding,
-                    *causal,
-                    activation.clone(),
-                ))
-            }
+                    Layer::Conv1D(
+                        Conv1DLayer::new(
+                            params,
+                            *in_channels,
+                            *out_channels,
+                            *kernel_size,
+                            *stride,
+                            *padding,
+                            *causal,
+                            *activation,
+                        )
+                    )
+                }
 
-            LayerSpec::Residual { layers: inner_specs } => {
-                let residual_input_size = current_size;
+                LayerSpec::Residual {
+                    layers: inner_specs,
+                } => {
+                    let residual_input_size =
+                        current_size;
 
-                let (inner_layers, inner_output_size) =
-                    build_layers(
+                    let (
+                        inner_layers,
+                        inner_output_size,
+                    ) =
+                        build_layers(
+                            residual_input_size,
+                            inner_specs,
+                            embeddings,
+                            params,
+                        );
+
+                    assert_eq!(
                         residual_input_size,
-                        inner_specs,
-                        embeddings,
+                        inner_output_size,
+                        "Residual block changed tensor size"
                     );
 
-                assert_eq!(
-                    residual_input_size,
-                    inner_output_size,
-                    "Residual block changed tensor size"
-                );
+                    Layer::Residual(
+                        ResidualLayer::new(
+                            residual_input_size,
+                            inner_layers,
+                            inner_output_size,
+                        )
+                    )
+                }
 
-                Layer::Residual(ResidualLayer::new(
-                    residual_input_size,
-                    inner_layers,
-                    inner_output_size,
-                ))
-            }
-
-            LayerSpec::DepthwiseConv1D {
-                in_channels,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                activation,
-            } => {
-                assert_eq!(current_size % in_channels, 0);
-
-                Layer::DepthwiseConv1D(
-                    DepthwiseConv1DLayer::new(
-                        *in_channels,
-                        *kernel_size,
-                        *stride,
-                        *padding,
-                        *causal,
-                        activation.clone(),
-                    ),
-                )
-            }
-
-            LayerSpec::GroupedConv1D {
-                in_channels,
-                out_channels,
-                groups,
-                kernel_size,
-                stride,
-                padding,
-                causal,
-                activation,
-            } => {
-                assert_eq!(current_size % in_channels, 0);
-
-                Layer::GroupedConv1D(
-                    GroupedConv1DLayer::new(
-                        *in_channels,
-                        *out_channels,
-                        *groups,
-                        *kernel_size,
-                        *stride,
-                        *padding,
-                        *causal,
-                        activation.clone(),
-                    ),
-                )
-            }
-
-            LayerSpec::LowRankPointwise {
-                in_channels,
-                rank,
-                out_channels,
-                activation,
-            } => {
-                assert_eq!(current_size % in_channels, 0);
-
-                Layer::LowRankPointwise(
-                    LowRankPointwiseLayer::new(
-                        *in_channels,
-                        *rank,
-                        *out_channels,
-                        activation.clone(),
-                    ),
-                )
-            }
-
-            LayerSpec::ChannelScale { channels } => {
-                assert_eq!(current_size % channels, 0);
-
-                Layer::ChannelScale(
-                    ChannelScaleLayer::new(*channels),
-                )
-            }
-
-            LayerSpec::WeightTying => {
-                let embeddings =
-                    embeddings.expect(
-                        "WeightTying requires an Embeddings instance"
+                LayerSpec::DepthwiseConv1D {
+                    in_channels,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    activation,
+                } => {
+                    assert_eq!(
+                        current_size
+                            % in_channels,
+                        0
                     );
 
-                assert_eq!(
-                    current_size,
-                    embeddings.embedding_dim(),
-                    "WeightTying input size must equal embedding dimension"
-                );
-
-                Layer::WeightTying(
-                    WeightTyingLayer::new(
-                        Arc::clone(embeddings)
+                    Layer::DepthwiseConv1D(
+                        DepthwiseConv1DLayer::new(
+                            params,
+                            *in_channels,
+                            *kernel_size,
+                            *stride,
+                            *padding,
+                            *causal,
+                            *activation,
+                        )
                     )
-                )
-            }
-            LayerSpec::LayerNorm {
-                channels,
-                epsilon,
-            } => {
-                assert_eq!(current_size % channels,
-                           0,
-                           "LayerNorm channels ({}) must divide layer size ({})",
-                           channels,
-                           current_size);
+                }
 
-                Layer::LayerNorm(
-                    LayerNormLayer::new(
-                        *channels,
-                        *epsilon,
+                LayerSpec::GroupedConv1D {
+                    in_channels,
+                    out_channels,
+                    groups,
+                    kernel_size,
+                    stride,
+                    padding,
+                    causal,
+                    activation,
+                } => {
+                    assert_eq!(
+                        current_size
+                            % in_channels,
+                        0
+                    );
+
+                    Layer::GroupedConv1D(
+                        GroupedConv1DLayer::new(
+                            params,
+                            *in_channels,
+                            *out_channels,
+                            *groups,
+                            *kernel_size,
+                            *stride,
+                            *padding,
+                            *causal,
+                            *activation,
+                        )
                     )
-                )
-            }
-            LayerSpec::GlobalMixer {
-                channels,
-                global_dim,
-            } => {
-                assert!(
-                    *channels > 0,
-                    "GlobalMixer channels must be > 0"
-                );
+                }
 
-                assert!(
-                    *global_dim > 0,
-                    "GlobalMixer global_dim must be > 0"
-                );
+                LayerSpec::LowRankPointwise {
+                    in_channels,
+                    rank,
+                    out_channels,
+                    activation,
+                } => {
+                    assert_eq!(
+                        current_size
+                            % in_channels,
+                        0
+                    );
 
-                assert_eq!(
-                    current_size % *channels,
-                    0,
-                    "GlobalMixer channels ({}) must divide layer size ({})",
+                    Layer::LowRankPointwise(
+                        LowRankPointwiseLayer::new(
+                            params,
+                            *in_channels,
+                            *rank,
+                            *out_channels,
+                            *activation,
+                        )
+                    )
+                }
+
+                LayerSpec::ChannelScale {
                     channels,
-                    current_size
-                );
+                } => {
+                    assert_eq!(
+                        current_size
+                            % channels,
+                        0
+                    );
 
-                Layer::GlobalMixer(
-                    GlobalMixerLayer::new(
-                        *channels,
-                        *global_dim,
+                    Layer::ChannelScale(
+                        ChannelScaleLayer::new(
+                            params,
+                            *channels,
+                        )
                     )
-                )
-            }
-        };
+                }
 
-        current_size = layer_output_size(&layer, current_size);
+                LayerSpec::WeightTying => {
+                    let embeddings =
+                        embeddings.expect(
+                            "WeightTying requires an Embeddings instance"
+                        );
+
+                    assert_eq!(
+                        current_size,
+                        embeddings.embedding_dim(),
+                        "WeightTying input size must equal embedding dimension"
+                    );
+
+                    Layer::WeightTying(
+                        WeightTyingLayer::new(
+                            Arc::clone(
+                                embeddings
+                            )
+                        )
+                    )
+                }
+
+                LayerSpec::LayerNorm {
+                    channels,
+                    epsilon,
+                } => {
+                    assert_eq!(
+                        current_size
+                            % channels,
+                        0,
+                        "LayerNorm channels must divide layer size"
+                    );
+
+                    Layer::LayerNorm(
+                        LayerNormLayer::new(
+                            params,
+                            *channels,
+                            *epsilon,
+                        )
+                    )
+                }
+
+                LayerSpec::GlobalMixer {
+                    channels,
+                    global_dim,
+                } => {
+                    assert!(*channels > 0);
+                    assert!(*global_dim > 0);
+
+                    assert_eq!(
+                        current_size
+                            % channels,
+                        0,
+                        "GlobalMixer channels must divide layer size"
+                    );
+
+                    Layer::GlobalMixer(
+                        GlobalMixerLayer::new(
+                            params,
+                            *channels,
+                            *global_dim,
+                        )
+                    )
+                }
+            };
+
+        current_size =
+            layer_output_size(
+                &layer,
+                current_size,
+            );
+
         layers.push(layer);
     }
 
     (layers, current_size)
 }
 
-fn layer_output_size(layer: &Layer, current_size: usize) -> usize {
+fn layer_output_size(
+    layer: &Layer,
+    current_size: usize,
+) -> usize {
     match layer {
-        Layer::Dense(layer) => layer.biases.len(),
+        Layer::Dense(layer) =>
+            layer.output_size,
 
         Layer::Conv1D(layer) => {
-            let input_length = current_size / layer.in_channels;
-            layer.output_length(input_length) * layer.out_channels
+            let input_length =
+                current_size
+                    / layer.in_channels;
+
+            layer.output_length(
+                input_length
+            )
+                * layer.out_channels
         }
 
-        Layer::Residual(layer) => layer.output_size,
+        Layer::Residual(layer) =>
+            layer.output_size,
 
         Layer::DepthwiseConv1D(layer) => {
-            let input_length = current_size / layer.in_channels;
-            layer.output_length(input_length) * layer.in_channels
+            let input_length =
+                current_size
+                    / layer.in_channels;
+
+            layer.output_length(
+                input_length
+            )
+                * layer.in_channels
         }
 
         Layer::GroupedConv1D(layer) => {
-            let input_length = current_size / layer.in_channels;
-            layer.output_length(input_length) * layer.out_channels
+            let input_length =
+                current_size
+                    / layer.in_channels;
+
+            layer.output_length(
+                input_length
+            )
+                * layer.out_channels
         }
 
         Layer::LowRankPointwise(layer) => {
-            let length = current_size / layer.in_channels;
-            length * layer.out_channels
+            let length =
+                current_size
+                    / layer.in_channels;
+
+            length
+                * layer.out_channels
         }
 
         Layer::ChannelScale(layer) => {
-            assert_eq!(current_size % layer.channels, 0);
+            assert_eq!(
+                current_size
+                    % layer.channels,
+                0
+            );
+
             current_size
         }
 
         Layer::LayerNorm(layer) => {
             assert_eq!(
-                current_size % layer.channels,
-                0,
-                "LayerNorm channels must divide input size"
+                current_size
+                    % layer.channels,
+                0
             );
 
             current_size
         }
 
         Layer::GlobalMixer(layer) => {
-            let channels = layer.channels;
-
             assert_eq!(
-                current_size % channels,
-                0,
-                "GlobalMixer channels must divide input size"
+                current_size
+                    % layer.channels,
+                0
             );
 
             current_size
         }
 
-        Layer::WeightTying(layer) => {
-            layer.embeddings.vocab_size()
-        }
+        Layer::WeightTying(layer) =>
+            layer.embeddings.vocab_size(),
     }
 }
 
-fn build_thread_pool(num_threads: usize) -> Arc<ThreadPool> {
+fn build_thread_pool(
+    num_threads: usize,
+) -> Arc<ThreadPool> {
     assert!(
         num_threads > 0,
         "MLP thread count must be greater than zero"
@@ -1505,336 +1604,124 @@ fn build_thread_pool(num_threads: usize) -> Arc<ThreadPool> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
-            .expect("failed to build Rayon thread pool")
+            .expect(
+                "failed to build Rayon thread pool"
+            )
     )
 }
 
-#[derive(Clone)]
-pub struct MLP {
-    layers: Vec<Layer>,
-    thread_pool: Arc<ThreadPool>,
-}
-
-impl MLP {
-    pub fn new(num_inputs: usize, layer_sizes: &[usize]) -> Self {
-        let specs = layer_sizes
-            .iter()
-            .enumerate()
-            .map(|(i, &output_size)| LayerSpec::Dense {
-                output_size,
-                activation: if i + 1 == layer_sizes.len() {
-                    Activation::None
-                } else {
-                    Activation::LeakyReLU { slope: 0.01 }
-                },
-            })
-            .collect::<Vec<_>>();
-
-        Self::from_layers(num_inputs, &specs)
-    }
-
-    pub fn set_num_threads(&mut self, num_threads: usize) {
-        self.thread_pool =
-            build_thread_pool(num_threads);
-    }
-
-    pub fn from_layers(
-        num_inputs: usize,
-        specs: &[LayerSpec],
-    ) -> Self {
-        let (layers, _) =
-            build_layers(
-                num_inputs,
-                specs,
-                None,
-            );
-
-        Self {
-            layers,
-            thread_pool: build_thread_pool(1),
-        }
-    }
-
-    pub fn from_layers_with_embeddings(
-        num_inputs: usize,
-        specs: &[LayerSpec],
-        embeddings: Arc<Embeddings>,
-    ) -> Self {
-        let (layers, _) =
-            build_layers(
-                num_inputs,
-                specs,
-                Some(&embeddings),
-            );
-
-        Self {
-            layers,
-            thread_pool: build_thread_pool(1),
-        }
-    }
-
-    pub(crate) fn forward_batch(
-        &self,
-        input: &[f32],
-        batch_size: usize,
-        input_size: usize,
-    ) -> BatchForward {
-        debug_assert_eq!(
-            input.len(),
-            batch_size * input_size
-        );
-
-        let (output, output_size, layers) =
-            forward_layers_batch(
-                &self.layers,
-                input,
-                batch_size,
-                input_size,
-                &self.thread_pool,
-            );
-
-        BatchForward {
-            output,
-            batch_size,
-            output_size,
-            layers,
-        }
-    }
-
-    pub(crate) fn backward_batch(
-        &self,
-        forward: &BatchForward,
-        output_grads: &[f32],
-    ) -> Vec<f32> {
-        debug_assert_eq!(
-            output_grads.len(),
-            forward.batch_size * forward.output_size
-        );
-
-        backward_layers_batch(
-            &forward.layers,
-            output_grads.to_vec(),
-            forward.batch_size,
-        )
-    }
-
-    pub fn parameters(&self) -> Vec<Tensor> {
-        self.layers
-            .iter()
-            .flat_map(|layer| layer.parameters())
-            .collect()
-    }
-
-    pub fn save(&self) -> SavedMLP {
-        SavedMLP {
-            version: 3,
-            layers: self.layers
-                .iter()
-                .map(save_layer)
-                .collect(),
-        }
-    }
-
-    pub fn load(saved: &SavedMLP) -> Self {
-        assert!(
-            saved.version == 1
-                || saved.version == 2
-                || saved.version == 3,
-            "Unsupported MLP save version: {}",
-            saved.version
-        );
-
-        Self {
-            layers: saved
-                .layers
-                .iter()
-                .map(|layer| load_layer(layer, None))
-                .collect(),
-            thread_pool: build_thread_pool(1),
-        }
-    }
-
-    pub fn load_with_embeddings(
-        saved: &SavedMLP,
-        embeddings: Arc<Embeddings>,
-    ) -> Self {
-        assert!(
-            saved.version == 1
-                || saved.version == 2
-                || saved.version == 3,
-            "Unsupported MLP save version: {}",
-            saved.version
-        );
-
-        Self {
-            layers: saved
-                .layers
-                .iter()
-                .map(|layer| {
-                    load_layer(
-                        layer,
-                        Some(&embeddings),
-                    )
-                })
-                .collect(),
-            thread_pool: build_thread_pool(1),
-        }
-    }
-
-    pub fn parameter_count(&self) -> usize {
-        self.parameters().len()
-    }
-
-    pub fn layer_specs(&self) -> Vec<LayerSpec> {
-        self.layers
-            .iter()
-            .map(|layer| layer.spec())
-            .collect()
-    }
-}
-
-fn save_layer(layer: &Layer) -> SavedLayer {
+fn save_layer(
+    layer: &Layer,
+    params: &ParameterStore,
+) -> SavedLayer {
     match layer {
-        Layer::Dense(layer) => {
-            SavedLayer::Dense {
-                input_size: if layer.biases.is_empty() {
-                    0
-                } else {
-                    layer.weights.len() / layer.biases.len()
-                },
+        Layer::Dense(layer) => SavedLayer::Dense {
+            input_size: layer.input_size,
+            output_size: layer.output_size,
+            activation: layer.activation,
+            weights: params.values[layer.weights.start
+                ..layer.weights.start + layer.weights.len]
+                .to_vec(),
+            biases: params.values[layer.biases.start
+                ..layer.biases.start + layer.biases.len]
+                .to_vec(),
+        },
 
-                output_size: layer.biases.len(),
+        Layer::Conv1D(layer) => SavedLayer::Conv1D {
+            in_channels: layer.in_channels,
+            out_channels: layer.out_channels,
+            kernel_size: layer.kernel_size,
+            stride: layer.stride,
+            padding: layer.padding,
+            causal: layer.causal,
+            activation: layer.activation,
+            weights: params.values[layer.weights.start
+                ..layer.weights.start + layer.weights.len]
+                .to_vec(),
+            biases: params.values[layer.biases.start
+                ..layer.biases.start + layer.biases.len]
+                .to_vec(),
+        },
 
-                activation: layer.activation.clone(),
+        Layer::Residual(layer) => SavedLayer::Residual {
+            input_size: layer.input_size,
+            output_size: layer.output_size,
+            layers: layer.layers
+                .iter()
+                .map(|x| save_layer(x, params))
+                .collect(),
+        },
 
-                weights: layer
-                    .weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+        Layer::DepthwiseConv1D(layer) => SavedLayer::DepthwiseConv1D {
+            in_channels: layer.in_channels,
+            kernel_size: layer.kernel_size,
+            stride: layer.stride,
+            padding: layer.padding,
+            causal: layer.causal,
+            activation: layer.activation,
+            weights: params.values[layer.weights.start
+                ..layer.weights.start + layer.weights.len]
+                .to_vec(),
+            biases: params.values[layer.biases.start
+                ..layer.biases.start + layer.biases.len]
+                .to_vec(),
+        },
 
-                biases: layer
-                    .biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
-
-        Layer::Conv1D(layer) => {
-            SavedLayer::Conv1D {
-                in_channels: layer.in_channels,
-                out_channels: layer.out_channels,
-                kernel_size: layer.kernel_size,
-                stride: layer.stride,
-                padding: layer.padding,
-                causal: layer.causal,
-                activation: layer.activation.clone(),
-
-                weights: layer
-                    .weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                biases: layer
-                    .biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
-
-        Layer::Residual(layer) => {
-            SavedLayer::Residual {
-                input_size: layer.input_size,
-                output_size: layer.output_size,
-                layers: layer
-                    .layers
-                    .iter()
-                    .map(save_layer)
-                    .collect(),
-            }
-        }
-
-        Layer::DepthwiseConv1D(layer) => {
-            SavedLayer::DepthwiseConv1D {
-                in_channels: layer.in_channels,
-                kernel_size: layer.kernel_size,
-                stride: layer.stride,
-                padding: layer.padding,
-                causal: layer.causal,
-                activation: layer.activation.clone(),
-
-                weights: layer
-                    .weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                biases: layer
-                    .biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
-
-        Layer::GroupedConv1D(layer) => {
-            SavedLayer::GroupedConv1D {
-                in_channels: layer.in_channels,
-                out_channels: layer.out_channels,
-                groups: layer.groups,
-                kernel_size: layer.kernel_size,
-                stride: layer.stride,
-                padding: layer.padding,
-                causal: layer.causal,
-                activation: layer.activation.clone(),
-
-                weights: layer
-                    .weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                biases: layer
-                    .biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
+        Layer::GroupedConv1D(layer) => SavedLayer::GroupedConv1D {
+            in_channels: layer.in_channels,
+            out_channels: layer.out_channels,
+            groups: layer.groups,
+            kernel_size: layer.kernel_size,
+            stride: layer.stride,
+            padding: layer.padding,
+            causal: layer.causal,
+            activation: layer.activation,
+            weights: params.values[layer.weights.start
+                ..layer.weights.start + layer.weights.len]
+                .to_vec(),
+            biases: params.values[layer.biases.start
+                ..layer.biases.start + layer.biases.len]
+                .to_vec(),
+        },
 
         Layer::LowRankPointwise(layer) => {
             SavedLayer::LowRankPointwise {
                 in_channels: layer.in_channels,
                 rank: layer.rank,
                 out_channels: layer.out_channels,
-                activation: layer.activation.clone(),
+                activation: layer.activation,
 
-                first_weights: layer
-                    .first_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                first_weights:
+                params.values[
+                    layer.first_weights.start
+                        ..layer.first_weights.start
+                        + layer.first_weights.len
+                    ]
+                    .to_vec(),
 
-                first_biases: layer
-                    .first_biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                first_biases:
+                params.values[
+                    layer.first_biases.start
+                        ..layer.first_biases.start
+                        + layer.first_biases.len
+                    ]
+                    .to_vec(),
 
-                second_weights: layer
-                    .second_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                second_weights:
+                params.values[
+                    layer.second_weights.start
+                        ..layer.second_weights.start
+                        + layer.second_weights.len
+                    ]
+                    .to_vec(),
 
-                second_biases: layer
-                    .second_biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                second_biases:
+                params.values[
+                    layer.second_biases.start
+                        ..layer.second_biases.start
+                        + layer.second_biases.len
+                    ]
+                    .to_vec(),
             }
         }
 
@@ -1842,80 +1729,21 @@ fn save_layer(layer: &Layer) -> SavedLayer {
             SavedLayer::ChannelScale {
                 channels: layer.channels,
 
-                scales: layer
-                    .scales
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                scales:
+                params.values[
+                    layer.scales.start
+                        ..layer.scales.start
+                        + layer.scales.len
+                    ]
+                    .to_vec(),
 
-                biases: layer
-                    .biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
-
-        Layer::LayerNorm(layer) => {
-            SavedLayer::LayerNorm {
-                channels: layer.channels,
-
-                epsilon: layer.epsilon,
-
-                gamma: layer
-                    .gamma
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                beta: layer
-                    .beta
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-            }
-        }
-
-        Layer::GlobalMixer(layer) => {
-            SavedLayer::GlobalMixer {
-                channels: layer.channels,
-                global_dim: layer.global_dim,
-
-                write_weights: layer
-                    .write_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                write_biases: layer
-                    .write_biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                read_weights: layer
-                    .read_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                read_biases: layer
-                    .read_biases
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                write_positional_weights: layer
-                    .write_positional_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
-
-                read_positional_weights: layer
-                    .read_positional_weights
-                    .iter()
-                    .map(|x| x.data())
-                    .collect(),
+                biases:
+                params.values[
+                    layer.biases.start
+                        ..layer.biases.start
+                        + layer.biases.len
+                    ]
+                    .to_vec(),
             }
         }
 
@@ -1927,12 +1755,91 @@ fn save_layer(layer: &Layer) -> SavedLayer {
                 layer.embeddings.vocab_size(),
             }
         }
+
+        Layer::LayerNorm(layer) => {
+            SavedLayer::LayerNorm {
+                channels: layer.channels,
+                epsilon: layer.epsilon,
+
+                gamma:
+                params.values[
+                    layer.gamma.start
+                        ..layer.gamma.start
+                        + layer.gamma.len
+                    ]
+                    .to_vec(),
+
+                beta:
+                params.values[
+                    layer.beta.start
+                        ..layer.beta.start
+                        + layer.beta.len
+                    ]
+                    .to_vec(),
+            }
+        }
+
+        Layer::GlobalMixer(layer) => {
+            SavedLayer::GlobalMixer {
+                channels: layer.channels,
+                global_dim: layer.global_dim,
+
+                write_weights:
+                params.values[
+                    layer.write_weights.start
+                        ..layer.write_weights.start
+                        + layer.write_weights.len
+                    ]
+                    .to_vec(),
+
+                write_biases:
+                params.values[
+                    layer.write_biases.start
+                        ..layer.write_biases.start
+                        + layer.write_biases.len
+                    ]
+                    .to_vec(),
+
+                read_weights:
+                params.values[
+                    layer.read_weights.start
+                        ..layer.read_weights.start
+                        + layer.read_weights.len
+                    ]
+                    .to_vec(),
+
+                read_biases:
+                params.values[
+                    layer.read_biases.start
+                        ..layer.read_biases.start
+                        + layer.read_biases.len
+                    ]
+                    .to_vec(),
+
+                write_positional_weights:
+                params.values[
+                    layer.write_positional_weights.start
+                        ..layer.write_positional_weights.start
+                        + layer.write_positional_weights.len
+                    ]
+                    .to_vec(),
+
+                read_positional_weights:
+                params.values[
+                    layer.read_positional_weights.start
+                        ..layer.read_positional_weights.start
+                        + layer.read_positional_weights.len
+                    ]
+                    .to_vec(),
+            }
+        }
     }
 }
 
 fn load_layer(
     saved: &SavedLayer,
-    embeddings: Option<&Arc<Embeddings>>,
+    embeddings: &Arc<Embeddings>,
+    params: &mut ParameterStore,
 ) -> Layer {
     match saved {
         SavedLayer::Dense {
@@ -1944,42 +1851,29 @@ fn load_layer(
         } => {
             assert_eq!(
                 weights.len(),
-                input_size * output_size,
-                "Invalid Dense weight count"
+                input_size * output_size
             );
-
             assert_eq!(
                 biases.len(),
-                *output_size,
-                "Invalid Dense bias count"
+                *output_size
             );
 
-            let weights = weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
+            let weight_range =
+                params.alloc_many(
+                    weights.iter().copied()
+                );
 
-            let biases = biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let fused_weights = weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let fused_biases = biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
+            let bias_range =
+                params.alloc_many(
+                    biases.iter().copied()
+                );
 
             Layer::Dense(DenseLayer {
-                weights,
-                biases,
-                fused_weights,
-                fused_biases,
-                activation: activation.clone(),
+                input_size: *input_size,
+                output_size: *output_size,
+                weights: weight_range,
+                biases: bias_range,
+                activation: *activation,
             })
         }
 
@@ -1996,49 +1890,36 @@ fn load_layer(
         } => {
             assert_eq!(
                 weights.len(),
-                in_channels * out_channels * kernel_size,
-                "Invalid Conv1D weight count"
+                in_channels
+                    * out_channels
+                    * kernel_size
             );
-
             assert_eq!(
                 biases.len(),
-                *out_channels,
-                "Invalid Conv1D bias count"
+                *out_channels
             );
 
-            let weights = weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
+            Layer::Conv1D(
+                Conv1DLayer {
+                    in_channels: *in_channels,
+                    out_channels: *out_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    causal: *causal,
+                    activation: *activation,
 
-            let biases = biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
+                    weights:
+                    params.alloc_many(
+                        weights.iter().copied()
+                    ),
 
-            let weight_handles = weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let bias_handles = biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            Layer::Conv1D(Conv1DLayer {
-                in_channels: *in_channels,
-                out_channels: *out_channels,
-                kernel_size: *kernel_size,
-                stride: *stride,
-                padding: *padding,
-                causal: *causal,
-                activation: activation.clone(),
-                weights,
-                biases,
-                weight_handles,
-                bias_handles,
-            })
+                    biases:
+                    params.alloc_many(
+                        biases.iter().copied()
+                    ),
+                }
+            )
         }
 
         SavedLayer::Residual {
@@ -2046,21 +1927,22 @@ fn load_layer(
             output_size,
             layers,
         } => {
-            assert_eq!(
-                input_size,
-                output_size,
-                "Invalid saved residual layer: input/output sizes differ"
-            );
-
-            let inner_layers = layers
-                .iter()
-                .map(|layer| load_layer(layer, embeddings))
-                .collect::<Vec<_>>();
+            let inner =
+                layers
+                    .iter()
+                    .map(|x|
+                        load_layer(
+                            x,
+                            embeddings,
+                            params,
+                        )
+                    )
+                    .collect::<Vec<_>>();
 
             Layer::Residual(
                 ResidualLayer::new(
                     *input_size,
-                    inner_layers,
+                    inner,
                     *output_size,
                 )
             )
@@ -2078,35 +1960,12 @@ fn load_layer(
         } => {
             assert_eq!(
                 weights.len(),
-                in_channels * kernel_size,
-                "Invalid DepthwiseConv1D weight count"
+                in_channels * kernel_size
             );
-
             assert_eq!(
                 biases.len(),
-                *in_channels,
-                "Invalid DepthwiseConv1D bias count"
+                *in_channels
             );
-
-            let weights = weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let biases = biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let weight_handles = weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let bias_handles = biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
 
             Layer::DepthwiseConv1D(
                 DepthwiseConv1DLayer {
@@ -2115,11 +1974,17 @@ fn load_layer(
                     stride: *stride,
                     padding: *padding,
                     causal: *causal,
-                    activation: activation.clone(),
-                    weights,
-                    biases,
-                    weight_handles,
-                    bias_handles,
+                    activation: *activation,
+
+                    weights:
+                    params.alloc_many(
+                        weights.iter().copied()
+                    ),
+
+                    biases:
+                    params.alloc_many(
+                        biases.iter().copied()
+                    ),
                 }
             )
         }
@@ -2136,51 +2001,20 @@ fn load_layer(
             weights,
             biases,
         } => {
-            assert_eq!(
-                in_channels % groups,
-                0,
-                "in_channels must be divisible by groups"
-            );
-
-            assert_eq!(
-                out_channels % groups,
-                0,
-                "out_channels must be divisible by groups"
-            );
-
-            let group_in = in_channels / groups;
+            let group_in =
+                in_channels / groups;
 
             assert_eq!(
                 weights.len(),
-                out_channels * group_in * kernel_size,
-                "Invalid GroupedConv1D weight count"
+                out_channels
+                    * group_in
+                    * kernel_size
             );
 
             assert_eq!(
                 biases.len(),
-                *out_channels,
-                "Invalid GroupedConv1D bias count"
+                *out_channels
             );
-
-            let weights = weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let biases = biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let weight_handles = weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let bias_handles = biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
 
             Layer::GroupedConv1D(
                 GroupedConv1DLayer {
@@ -2191,11 +2025,17 @@ fn load_layer(
                     stride: *stride,
                     padding: *padding,
                     causal: *causal,
-                    activation: activation.clone(),
-                    weights,
-                    biases,
-                    weight_handles,
-                    bias_handles,
+                    activation: *activation,
+
+                    weights:
+                    params.alloc_many(
+                        weights.iter().copied()
+                    ),
+
+                    biases:
+                    params.alloc_many(
+                        biases.iter().copied()
+                    ),
                 }
             )
         }
@@ -2212,73 +2052,59 @@ fn load_layer(
         } => {
             assert_eq!(
                 first_weights.len(),
-                rank * in_channels,
-                "Invalid LowRankPointwise first weight count"
+                rank * in_channels
             );
             assert_eq!(
                 first_biases.len(),
-                *rank,
-                "Invalid LowRankPointwise first bias count"
+                *rank
             );
             assert_eq!(
                 second_weights.len(),
-                out_channels * rank,
-                "Invalid LowRankPointwise second weight count"
+                out_channels * rank
             );
             assert_eq!(
                 second_biases.len(),
-                *out_channels,
-                "Invalid LowRankPointwise second bias count"
+                *out_channels
             );
-            let first_weights = first_weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let first_biases = first_biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let second_weights = second_weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let second_biases = second_biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let first_weight_handles = first_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-            let first_bias_handles = first_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-            let second_weight_handles = second_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-            let second_bias_handles = second_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
+
             Layer::LowRankPointwise(
                 LowRankPointwiseLayer {
                     in_channels: *in_channels,
                     rank: *rank,
                     out_channels: *out_channels,
-                    activation: activation.clone(),
-                    first_weights,
-                    first_biases,
-                    second_weights,
-                    second_biases,
-                    first_weight_handles,
-                    first_bias_handles,
-                    second_weight_handles,
-                    second_bias_handles,
+                    activation: *activation,
+
+                    first_weights:
+                    params.alloc_many(
+                        first_weights
+                            .iter()
+                            .copied()
+                    ),
+
+                    first_biases:
+                    params.alloc_many(
+                        first_biases
+                            .iter()
+                            .copied()
+                    ),
+
+                    second_weights:
+                    params.alloc_many(
+                        second_weights
+                            .iter()
+                            .copied()
+                    ),
+
+                    second_biases:
+                    params.alloc_many(
+                        second_biases
+                            .iter()
+                            .copied()
+                    ),
                 }
             )
         }
+
         SavedLayer::ChannelScale {
             channels,
             scales,
@@ -2286,38 +2112,47 @@ fn load_layer(
         } => {
             assert_eq!(
                 scales.len(),
-                *channels,
-                "Invalid ChannelScale scale count"
+                *channels
             );
             assert_eq!(
                 biases.len(),
-                *channels,
-                "Invalid ChannelScale bias count"
+                *channels
             );
-            let scales = scales
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let biases = biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-            let scale_handles = scales
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-            let bias_handles = biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
+
             Layer::ChannelScale(
                 ChannelScaleLayer {
                     channels: *channels,
-                    scales,
-                    biases,
-                    scale_handles,
-                    bias_handles,
+
+                    scales:
+                    params.alloc_many(
+                        scales.iter().copied()
+                    ),
+
+                    biases:
+                    params.alloc_many(
+                        biases.iter().copied()
+                    ),
                 }
+            )
+        }
+
+        SavedLayer::WeightTying {
+            embedding_dim,
+            vocab_size,
+        } => {
+            assert_eq!(
+                *embedding_dim,
+                embeddings.embedding_dim()
+            );
+            assert_eq!(
+                *vocab_size,
+                embeddings.vocab_size()
+            );
+
+            Layer::WeightTying(
+                WeightTyingLayer::new(
+                    Arc::clone(embeddings)
+                )
             )
         }
 
@@ -2329,48 +2164,27 @@ fn load_layer(
         } => {
             assert_eq!(
                 gamma.len(),
-                *channels,
-                "Invalid LayerNorm gamma count"
+                *channels
             );
-
             assert_eq!(
                 beta.len(),
-                *channels,
-                "Invalid LayerNorm beta count"
+                *channels
             );
-
-            let gamma =
-                gamma
-                    .iter()
-                    .map(|&x| Tensor::new(x))
-                    .collect::<Vec<_>>();
-
-            let beta =
-                beta
-                    .iter()
-                    .map(|&x| Tensor::new(x))
-                    .collect::<Vec<_>>();
-
-            let gamma_handles =
-                gamma
-                    .iter()
-                    .map(|x| x.handle)
-                    .collect();
-
-            let beta_handles =
-                beta
-                    .iter()
-                    .map(|x| x.handle)
-                    .collect();
 
             Layer::LayerNorm(
                 LayerNormLayer {
                     channels: *channels,
                     epsilon: *epsilon,
-                    gamma,
-                    beta,
-                    gamma_handles,
-                    beta_handles,
+
+                    gamma:
+                    params.alloc_many(
+                        gamma.iter().copied()
+                    ),
+
+                    beta:
+                    params.alloc_many(
+                        beta.iter().copied()
+                    ),
                 }
             )
         }
@@ -2385,187 +2199,300 @@ fn load_layer(
             write_positional_weights,
             read_positional_weights,
         } => {
-            assert!(
-                *channels > 0,
-                "Invalid GlobalMixer channel count"
-            );
-
-            assert!(
-                *global_dim > 0,
-                "Invalid GlobalMixer global dimension"
-            );
-
             assert_eq!(
                 write_weights.len(),
-                channels * global_dim,
-                "Invalid GlobalMixer write weight count"
+                channels * global_dim
             );
-
             assert_eq!(
                 write_biases.len(),
-                *global_dim,
-                "Invalid GlobalMixer write bias count"
+                *global_dim
             );
-
             assert_eq!(
                 read_weights.len(),
-                channels * global_dim,
-                "Invalid GlobalMixer read weight count"
+                channels * global_dim
             );
-
             assert_eq!(
                 read_biases.len(),
-                *global_dim,
-                "Invalid GlobalMixer read bias count"
+                *global_dim
             );
-
-            let write_weights = write_weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let write_biases = write_biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let read_weights = read_weights
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let read_biases = read_biases
-                .iter()
-                .map(|&x| Tensor::new(x))
-                .collect::<Vec<_>>();
-
-            let write_weight_handles = write_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let write_bias_handles = write_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let read_weight_handles = read_weights
-                .iter()
-                .map(|x| x.handle)
-                .collect();
-
-            let read_bias_handles = read_biases
-                .iter()
-                .map(|x| x.handle)
-                .collect();
 
             const POS_FEATURES: usize = 4;
 
-            let positional_count =
-                global_dim * POS_FEATURES;
+            assert_eq!(
+                write_positional_weights.len(),
+                global_dim * POS_FEATURES
+            );
 
-            let write_positional_weights =
-                if write_positional_weights.is_empty() {
-                    vec![0.0f32; positional_count]
-                } else {
-                    assert_eq!(
-                        write_positional_weights.len(),
-                        positional_count,
-                        "Invalid GlobalMixer write positional weight count"
-                    );
-
-                    write_positional_weights.clone()
-                };
-
-            let read_positional_weights =
-                if read_positional_weights.is_empty() {
-                    vec![0.0f32; positional_count]
-                } else {
-                    assert_eq!(
-                        read_positional_weights.len(),
-                        positional_count,
-                        "Invalid GlobalMixer read positional weight count"
-                    );
-
-                    read_positional_weights.clone()
-                };
-
-            let write_positional_weights =
-                write_positional_weights
-                    .iter()
-                    .map(|&x| Tensor::new(x))
-                    .collect::<Vec<_>>();
-
-            let read_positional_weights =
-                read_positional_weights
-                    .iter()
-                    .map(|&x| Tensor::new(x))
-                    .collect::<Vec<_>>();
-
-            let write_positional_weight_handles =
-                write_positional_weights
-                    .iter()
-                    .map(|x| x.handle)
-                    .collect();
-
-            let read_positional_weight_handles =
-                read_positional_weights
-                    .iter()
-                    .map(|x| x.handle)
-                    .collect();
+            assert_eq!(
+                read_positional_weights.len(),
+                global_dim * POS_FEATURES
+            );
 
             Layer::GlobalMixer(
                 GlobalMixerLayer {
                     channels: *channels,
                     global_dim: *global_dim,
 
-                    write_weights,
-                    write_biases,
+                    write_weights:
+                    params.alloc_many(
+                        write_weights
+                            .iter()
+                            .copied()
+                    ),
 
-                    read_weights,
-                    read_biases,
+                    write_biases:
+                    params.alloc_many(
+                        write_biases
+                            .iter()
+                            .copied()
+                    ),
 
-                    write_positional_weights,
-                    read_positional_weights,
+                    read_weights:
+                    params.alloc_many(
+                        read_weights
+                            .iter()
+                            .copied()
+                    ),
 
-                    write_weight_handles,
-                    write_bias_handles,
+                    read_biases:
+                    params.alloc_many(
+                        read_biases
+                            .iter()
+                            .copied()
+                    ),
 
-                    read_weight_handles,
-                    read_bias_handles,
+                    write_positional_weights:
+                    params.alloc_many(
+                        write_positional_weights
+                            .iter()
+                            .copied()
+                    ),
 
-                    write_positional_weight_handles,
-                    read_positional_weight_handles,
+                    read_positional_weights:
+                    params.alloc_many(
+                        read_positional_weights
+                            .iter()
+                            .copied()
+                    ),
                 }
             )
         }
+    }
+}
 
-        SavedLayer::WeightTying {
-            embedding_dim,
-            vocab_size,
-        } => {
-            let embeddings =
-                embeddings.expect(
-                    "Loading WeightTying requires Embeddings"
+pub struct MLP {
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) params: ParameterStore,
+    thread_pool: Arc<ThreadPool>,
+}
+
+impl MLP {
+    pub fn new(
+        num_inputs: usize,
+        layer_sizes: &[usize],
+    ) -> Self {
+        let specs =
+            layer_sizes
+                .iter()
+                .enumerate()
+                .map(
+                    |(i, &output_size)| {
+                        LayerSpec::Dense {
+                            output_size,
+                            activation:
+                            if i + 1
+                                == layer_sizes.len()
+                            {
+                                Activation::None
+                            } else {
+                                Activation::LeakyReLU {
+                                    slope: 0.01,
+                                }
+                            },
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+
+        Self::from_layers(
+            num_inputs,
+            &specs,
+        )
+    }
+
+    pub fn set_num_threads(
+        &mut self,
+        num_threads: usize,
+    ) {
+        self.thread_pool =
+            build_thread_pool(
+                num_threads
+            );
+    }
+
+    pub fn from_layers(
+        num_inputs: usize,
+        specs: &[LayerSpec],
+    ) -> Self {
+        let mut params =
+            ParameterStore::new();
+
+        let (layers, _) =
+            build_layers(
+                num_inputs,
+                specs,
+                None,
+                &mut params,
+            );
+
+        Self {
+            layers,
+            params,
+            thread_pool:
+            build_thread_pool(1),
+        }
+    }
+
+    pub fn from_layers_with_embeddings(
+        num_inputs: usize,
+        specs: &[LayerSpec],
+        embeddings: Arc<Embeddings>,
+        mut params: ParameterStore,
+    ) -> Self {
+        let (layers, _) =
+            build_layers(
+                num_inputs,
+                specs,
+                Some(&embeddings),
+                &mut params,
+            );
+
+        Self {
+            layers,
+            params,
+            thread_pool:
+            build_thread_pool(1),
+        }
+    }
+
+    pub(crate) fn forward_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+        input_size: usize,
+    ) -> BatchForward {
+        debug_assert_eq!(
+            input.len(),
+            batch_size * input_size
+        );
+
+        let (
+            output,
+            output_size,
+            layers,
+        ) =
+            forward_layers_batch(
+                &self.layers,
+                &self.params,
+                input,
+                batch_size,
+                input_size,
+                &self.thread_pool,
+            );
+
+        BatchForward {
+            output,
+            batch_size,
+            output_size,
+            layers,
+        }
+    }
+
+    pub(crate) fn backward_batch(
+        &mut self,
+        forward: &BatchForward,
+        output_grads: &[f32],
+    ) -> Vec<f32> {
+        debug_assert_eq!(
+            output_grads.len(),
+            forward.batch_size
+                * forward.output_size
+        );
+
+        backward_layers_batch(
+            &self.layers,
+            &forward.layers,
+            &mut self.params,
+            output_grads.to_vec(),
+            forward.batch_size,
+        )
+    }
+
+    pub fn parameter_count(
+        &self,
+    ) -> usize {
+        self.params.parameter_count()
+    }
+
+    pub fn layer_specs(
+        &self,
+    ) -> Vec<LayerSpec> {
+        self.layers
+            .iter()
+            .map(|layer| layer.spec())
+            .collect()
+    }
+
+    pub fn save(&self) -> SavedMLP {
+        SavedMLP {
+            version: 3,
+            layers: self.layers
+                .iter()
+                .map(|layer| save_layer(layer, &self.params))
+                .collect(),
+        }
+    }
+
+    pub fn load_with_embeddings(
+        saved: &SavedMLP,
+        embeddings: Arc<Embeddings>,
+        mut params: ParameterStore,
+    ) -> Self {
+        assert_eq!(
+            saved.version,
+            3,
+            "Unsupported SavedMLP version"
+        );
+
+        let mut layers = Vec::with_capacity(
+            saved.layers.len()
+        );
+
+        let mut current_size =
+            embeddings.embedding_dim();
+
+        for saved_layer in &saved.layers {
+            let layer =
+                load_layer(
+                    saved_layer,
+                    &embeddings,
+                    &mut params,
                 );
 
-            assert_eq!(
-                embeddings.embedding_dim(),
-                *embedding_dim,
-                "Saved WeightTying embedding dimension does not match Embeddings"
-            );
+            current_size =
+                layer_output_size(
+                    &layer,
+                    current_size,
+                );
 
-            assert_eq!(
-                embeddings.vocab_size(),
-                *vocab_size,
-                "Saved WeightTying vocabulary size does not match Embeddings"
-            );
+            layers.push(layer);
+        }
 
-            Layer::WeightTying(
-                WeightTyingLayer::new(
-                    Arc::clone(embeddings)
-                )
-            )
+        Self {
+            layers,
+            params,
+            thread_pool:
+            build_thread_pool(1),
         }
     }
 }

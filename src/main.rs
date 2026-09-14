@@ -546,7 +546,7 @@ fn main() {
         lm.load_corpus(&tinychat);
         lm.train(
             Some(10),
-            None,
+            Some("tinychat4/MiniChatterV4_batch_1567_epoch_1.check"),
             Some("tinychat4/MiniChatterV4"),
             CheckpointFrequency::EveryBatch(500),
             None,

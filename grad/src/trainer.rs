@@ -1,11 +1,25 @@
-use std::time::{Duration, Instant};
+use std::io::{self, Write};
+use std::sync::{
+    atomic::{
+        AtomicBool,
+        Ordering,
+    },
+    Arc,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
+
 use rand::prelude::SliceRandom;
-use crate::neuron::{MLP};
-use crate::Tensor;
+
 use crate::batched::softmax_cross_entropy_batch;
 use crate::embeddings::Embeddings;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::io::{self, Write};
+use crate::neuron::MLP;
+
+// ============================================================================
+// Deterministic permutation sampler
+// ============================================================================
 
 const PERMUTATION_SAMPLER_VERSION: u32 = 1;
 const DEFAULT_SAMPLER_SEED: u64 = 1;
@@ -21,24 +35,38 @@ pub struct PermutationSampler {
 }
 
 impl PermutationSampler {
-    pub const VERSION: u32 = PERMUTATION_SAMPLER_VERSION;
-    pub const DEFAULT_SEED: u64 = DEFAULT_SAMPLER_SEED;
+    pub const VERSION: u32 =
+        PERMUTATION_SAMPLER_VERSION;
 
-    pub fn new(seed: u64, epoch: usize, len: usize) -> Self {
-        assert!(len > 0, "PermutationSampler length must be > 0");
+    pub const DEFAULT_SEED: u64 =
+        DEFAULT_SAMPLER_SEED;
 
-        let bits = if len <= 1 {
-            0
-        } else {
-            usize::BITS - (len - 1).leading_zeros()
-        };
-
-        let mask = Self::mask_for_bits(bits);
-
-        let key = Self::derive_epoch_key(
-            seed,
-            epoch as u64,
+    pub fn new(
+        seed: u64,
+        epoch: usize,
+        len: usize,
+    ) -> Self {
+        assert!(
+            len > 0,
+            "PermutationSampler length must be > 0"
         );
+
+        let bits =
+            if len <= 1 {
+                0
+            } else {
+                usize::BITS
+                    - (len - 1).leading_zeros()
+            };
+
+        let mask =
+            Self::mask_for_bits(bits);
+
+        let key =
+            Self::derive_epoch_key(
+                seed,
+                epoch as u64,
+            );
 
         Self {
             seed,
@@ -51,27 +79,45 @@ impl PermutationSampler {
     }
 
     #[inline]
-    fn mask_for_bits(bits: u32) -> u64 {
+    fn mask_for_bits(
+        bits: u32,
+    ) -> u64 {
         match bits {
             0 => 0,
             64 => u64::MAX,
-            _ => (1u64 << bits) - 1,
+            _ =>
+                (1u64 << bits) - 1,
         }
     }
 
     #[inline]
-    fn derive_epoch_key(seed: u64, epoch: u64) -> u64 {
-        // Cheap SplitMix-style key derivation.
-        // This does not need to be reversible; it only needs to
-        // deterministically derive a different key for each epoch.
+    fn derive_epoch_key(
+        seed: u64,
+        epoch: u64,
+    ) -> u64 {
         let mut x =
-            seed ^ epoch.wrapping_mul(0x9E3779B97F4A7C15);
+            seed
+                ^ epoch.wrapping_mul(
+                0x9E3779B97F4A7C15
+            );
 
-        x = x.wrapping_add(0x9E3779B97F4A7C15);
-        x = (x ^ (x >> 30))
-            .wrapping_mul(0xBF58476D1CE4E5B9);
-        x = (x ^ (x >> 27))
-            .wrapping_mul(0x94D049BB133111EB);
+        x =
+            x.wrapping_add(
+                0x9E3779B97F4A7C15
+            );
+
+        x =
+            (x ^ (x >> 30))
+                .wrapping_mul(
+                    0xBF58476D1CE4E5B9
+                );
+
+        x =
+            (x ^ (x >> 27))
+                .wrapping_mul(
+                    0x94D049BB133111EB
+                );
+
         x ^ (x >> 31)
     }
 
@@ -86,46 +132,47 @@ impl PermutationSampler {
             return 0;
         }
 
-        // Every operation here is bijective modulo 2^bits:
-        //
-        //   x + c                  => bijective
-        //   x ^= x >> n            => bijective
-        //   x *= odd_constant      => bijective
-        //   x ^= x << n            => bijective
-        //
-        // Mask after operations which can overflow the k-bit domain.
+        x =
+            x.wrapping_add(key)
+                & mask;
 
-        x = x.wrapping_add(key) & mask;
+        x ^=
+            x >> 17;
 
-        x ^= x >> 17;
+        x =
+            x.wrapping_mul(
+                0xD6E8FEB86659FD93
+            ) & mask;
 
-        x = x
-            .wrapping_mul(0xD6E8FEB86659FD93)
-            & mask;
+        x ^=
+            (x << 13) & mask;
 
-        x ^= (x << 13) & mask;
+        x =
+            x.wrapping_mul(
+                0xA5A3564E27F8863D
+            ) & mask;
 
-        x = x
-            .wrapping_mul(0xA5A3564E27F8863D)
-            & mask;
+        x ^=
+            x >> 11;
 
-        x ^= x >> 11;
+        x =
+            x.wrapping_add(
+                key.rotate_left(29)
+            ) & mask;
 
-        x = x
-            .wrapping_add(key.rotate_left(29))
-            & mask;
-
-        x ^= (x << 7) & mask;
+        x ^=
+            (x << 7) & mask;
 
         x
     }
 
     /// Returns the dataset index corresponding to `position`
     /// in this epoch's deterministic permutation.
-    ///
-    /// `position` must be in `0..self.len`.
     #[inline]
-    pub fn index(&self, position: usize) -> usize {
+    pub fn index(
+        &self,
+        position: usize,
+    ) -> usize {
         debug_assert!(
             position < self.len,
             "PermutationSampler position out of bounds"
@@ -135,43 +182,49 @@ impl PermutationSampler {
             return 0;
         }
 
-        let mut x = Self::permute_power_of_two(
-            position as u64,
-            self.bits,
-            self.mask,
-            self.key,
-        );
-
-        // Cycle walking converts the permutation of [0, 2^k)
-        // into a permutation of [0, len).
-        //
-        // Starting from a valid position means we remain inside
-        // that position's permutation cycle until we hit another
-        // valid value.
-        while x >= self.len as u64 {
-            x = Self::permute_power_of_two(
-                x,
+        let mut x =
+            Self::permute_power_of_two(
+                position as u64,
                 self.bits,
                 self.mask,
                 self.key,
             );
+
+        while x >= self.len as u64 {
+            x =
+                Self::permute_power_of_two(
+                    x,
+                    self.bits,
+                    self.mask,
+                    self.key,
+                );
         }
 
         x as usize
     }
 
-    pub fn seed(&self) -> u64 {
+    pub fn seed(
+        &self,
+    ) -> u64 {
         self.seed
     }
 
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(
+        &self,
+    ) -> u64 {
         self.epoch
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(
+        &self,
+    ) -> usize {
         self.len
     }
 }
+
+// ============================================================================
+// Variable context
+// ============================================================================
 
 #[inline]
 fn derive_context_len(
@@ -179,28 +232,53 @@ fn derive_context_len(
     epoch: usize,
     max_context_len: usize,
 ) -> usize {
-    debug_assert!(max_context_len > 0);
+    debug_assert!(
+        max_context_len > 0
+    );
 
-    // Deterministic per-sample/per-epoch mixing.
-    // This keeps checkpoint/resume exactly reproducible without
-    // storing another RNG state in the checkpoint.
     let mut x =
         (sample as u64)
             .wrapping_add(
                 (epoch as u64)
-                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_mul(
+                        0x9E3779B97F4A7C15
+                    )
             );
 
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xBF58476D1CE4E5B9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94D049BB133111EB);
-    x ^= x >> 31;
+    x ^=
+        x >> 30;
 
-    let min_context_len = max_context_len.min(8);
+    x =
+        x.wrapping_mul(
+            0xBF58476D1CE4E5B9
+        );
 
-    min_context_len + (x as usize % (max_context_len - min_context_len + 1))
+    x ^=
+        x >> 27;
+
+    x =
+        x.wrapping_mul(
+            0x94D049BB133111EB
+        );
+
+    x ^=
+        x >> 31;
+
+    let min_context_len =
+        max_context_len.min(8);
+
+    min_context_len
+        + (x as usize
+        % (
+        max_context_len
+            - min_context_len
+            + 1
+    ))
 }
+
+// ============================================================================
+// Training result / checkpoint types
+// ============================================================================
 
 pub enum TrainResult {
     Finished,
@@ -267,6 +345,10 @@ pub struct CheckpointState {
     pub(crate) adam_step: u64,
 }
 
+// ============================================================================
+// Trainer
+// ============================================================================
+
 pub struct Trainer {
     lr: f32,
     epochs: usize,
@@ -281,13 +363,10 @@ impl Trainer {
         batch_size: usize,
         max_batches_per_epoch: usize,
     ) -> Self {
-        let batch_size =
-            batch_size.max(1);
-
-        Trainer {
-            lr: lr / batch_size as f32,
+        Self {
+            lr,
             epochs,
-            batch_size,
+            batch_size: batch_size.max(1),
             max_batches_per_epoch,
         }
     }
@@ -297,79 +376,108 @@ impl Trainer {
         lr: f32,
     ) {
         self.lr =
-            lr / self.batch_size.max(1) as f32;
+            lr;
     }
 
-    pub fn reinit_epochs(&mut self, epochs: usize) {
-        self.epochs = epochs
+    pub fn reinit_epochs(
+        &mut self,
+        epochs: usize,
+    ) {
+        self.epochs =
+            epochs;
     }
 
     pub fn reinit_batch(
         &mut self,
         batch_size: usize,
     ) {
-        let user_lr =
-            self.lr
-                * self.batch_size.max(1) as f32;
-
         self.batch_size =
             batch_size.max(1);
-
-        self.lr =
-            user_lr
-                / self.batch_size as f32;
     }
 
-    pub fn reinit_batch_per_epoch(&mut self, max_batches_per_epoch: usize) {
-        self.max_batches_per_epoch = max_batches_per_epoch
+    pub fn reinit_batch_per_epoch(
+        &mut self,
+        max_batches_per_epoch: usize,
+    ) {
+        self.max_batches_per_epoch =
+            max_batches_per_epoch;
     }
+
+    // ========================================================================
+    // Simple dense MLP trainer
+    // ========================================================================
 
     pub fn train(
         &mut self,
         update_frequency: usize,
         mlp: &mut MLP,
-        dataset: &mut [(Vec<Tensor>, Vec<f32>)],
-        params: Vec<Tensor>,
+        dataset: &mut [(Vec<f32>, Vec<f32>)],
         threads: usize,
     ) -> TrainResult {
-        let param_count = params.len() as f32;
+        let running =
+            Arc::new(
+                AtomicBool::new(true)
+            );
 
-        let running = Arc::new(AtomicBool::new(true));
-        let r = running.clone();
+        let running_flag =
+            running.clone();
 
-        ctrlc::set_handler(move || {
-            println!("\nStopping after current batch...");
-            r.store(false, Ordering::SeqCst);
-        }).expect("Error setting Ctrl+C handler");
+        ctrlc::set_handler(
+            move || {
+                println!(
+                    "\nStopping after current batch..."
+                );
 
-        let mut rng = rand::rng();
+                running_flag.store(
+                    false,
+                    Ordering::SeqCst,
+                );
+            },
+        )
+            .expect(
+                "Error setting Ctrl+C handler"
+            );
 
-        let data_len = dataset.len();
+        let data_len =
+            dataset.len();
 
         if data_len == 0 {
-            println!("Dataset is empty!");
+            println!(
+                "Dataset is empty!"
+            );
+
             return TrainResult::Finished;
         }
 
         if self.batch_size > data_len {
-            println!("Batch size too high! Quitting...");
+            println!(
+                "Batch size too high! Quitting..."
+            );
+
             return TrainResult::Finished;
         }
 
-        if self.batch_size == 0 {
-            self.batch_size = data_len;
-        }
+        let input_size =
+            dataset[0].0.len();
 
-        let input_size = dataset[0].0.len();
-        let output_size = dataset[0].1.len();
+        let output_size =
+            dataset[0].1.len();
 
-        if input_size == 0 || output_size == 0 {
-            println!("Input/output vectors cannot be empty!");
+        if input_size == 0
+            || output_size == 0
+        {
+            println!(
+                "Input/output vectors cannot be empty!"
+            );
+
             return TrainResult::Finished;
         }
 
-        // All samples must have the same input/output dimensions.
-        for (input, target) in dataset.iter() {
+        for (
+            input,
+            target,
+        ) in dataset.iter()
+        {
             assert_eq!(
                 input.len(),
                 input_size,
@@ -383,169 +491,280 @@ impl Trainer {
             );
         }
 
-        mlp.set_num_threads(threads);
+        mlp.set_num_threads(
+            threads
+        );
 
-        let mut indices: Vec<usize> = (0..data_len).collect();
+        let mut indices:
+            Vec<usize> =
+            (0..data_len)
+                .collect();
 
-        let mut lr = self.lr;
-        let min_lr = 0.001 / self.batch_size as f32;
+        let mut lr =
+            self.lr;
 
-        let mut best_loss = f32::MAX;
-        let mut plateau_count = 0;
+        let mut best_loss =
+            f32::MAX;
 
-        for epoch in 1..self.epochs + 1 {
-            let now = Instant::now();
+        let mut plateau_count =
+            0usize;
 
-            indices.shuffle(&mut rng);
+        let parameter_count =
+            mlp.parameter_count();
 
-            let mut total_loss = 0.0f32;
-            let mut grad_sum = 0.0f32;
+        for epoch in
+            1..=self.epochs
+        {
+            let now =
+                Instant::now();
 
-            let mut count = 0usize;
-            let mut batches_done = 0usize;
+            let mut rng =
+                rand::rng();
+
+            indices.shuffle(
+                &mut rng
+            );
+
+            let mut total_loss =
+                0.0f32;
+
+            let mut grad_sum =
+                0.0f32;
+
+            let mut count =
+                0usize;
+
+            let mut batches_done =
+                0usize;
 
             while count < data_len {
-                if self.max_batches_per_epoch != 0
-                    && batches_done >= self.max_batches_per_epoch
+                if self.max_batches_per_epoch
+                    != 0
+                    && batches_done
+                    >= self.max_batches_per_epoch
                 {
                     break;
                 }
 
-                let remaining = data_len - count;
-                let current_batch = self.batch_size.min(remaining);
+                let remaining =
+                    data_len - count;
 
-                // ---------------------------------------------------------
-                // Pack inputs and targets into contiguous batch arrays.
-                // ---------------------------------------------------------
+                let current_batch =
+                    self.batch_size
+                        .min(remaining);
 
                 let mut batch_input =
-                    Vec::with_capacity(current_batch * input_size);
+                    Vec::with_capacity(
+                        current_batch
+                            * input_size
+                    );
 
                 let mut targets =
-                    Vec::with_capacity(current_batch * output_size);
+                    Vec::with_capacity(
+                        current_batch
+                            * output_size
+                    );
 
-                for batch_index in 0..current_batch {
-                    let sample = indices[count + batch_index];
+                for batch_index
+                in 0..current_batch
+                {
+                    let sample =
+                        indices[
+                            count
+                                + batch_index
+                            ];
 
-                    let (input, target) = &dataset[sample];
+                    let (
+                        input,
+                        target,
+                    ) =
+                        &dataset[
+                            sample
+                            ];
 
-                    for x in input {
-                        batch_input.push(x.data());
-                    }
+                    batch_input
+                        .extend_from_slice(
+                            input
+                        );
 
-                    targets.extend_from_slice(target);
+                    targets
+                        .extend_from_slice(
+                            target
+                        );
                 }
 
-                // ---------------------------------------------------------
-                // Batched forward — SGEMM
-                // ---------------------------------------------------------
-
-                let forward = mlp.forward_batch(
-                    &batch_input,
-                    current_batch,
-                    input_size,
-                );
+                let forward =
+                    mlp.forward_batch(
+                        &batch_input,
+                        current_batch,
+                        input_size,
+                    );
 
                 debug_assert_eq!(
                     forward.output_size,
                     output_size
                 );
 
-                // ---------------------------------------------------------
-                // MSE + output gradients
-                // ---------------------------------------------------------
-
                 let mut output_grads =
-                    vec![0.0f32; current_batch * output_size];
+                    vec![
+                        0.0f32;
+                        current_batch
+                            * output_size
+                    ];
 
-                let batch_loss = crate::batched::mse_batch(
-                    &forward.output,
-                    &targets,
-                    &mut output_grads,
-                    current_batch,
-                    output_size,
-                );
+                let batch_loss =
+                    crate::batched::mse_batch(
+                        &forward.output,
+                        &targets,
+                        &mut output_grads,
+                        current_batch,
+                        output_size,
+                    );
 
-                // mse_batch() returns the mean for this batch.
-                // Weight it by the number of samples so a smaller final
-                // batch doesn't get the same influence as a full batch.
-                total_loss += batch_loss * current_batch as f32;
-
-                // ---------------------------------------------------------
-                // Batched backward — SGEMM
-                // ---------------------------------------------------------
+                total_loss +=
+                    batch_loss
+                        * current_batch
+                        as f32;
 
                 mlp.backward_batch(
                     &forward,
                     &output_grads,
                 );
 
-                // ---------------------------------------------------------
-                // Update parameters
-                // ---------------------------------------------------------
+                let grads =
+                    &mlp.params.grads;
 
-                grad_sum += crate::zero_grad_and_update(
-                    &params,
-                    lr,
-                );
+                let mut batch_grad_sum =
+                    0.0f64;
 
-                count += current_batch;
-                batches_done += 1;
+                for &g in grads {
+                    if !g.is_finite() {
+                        println!(
+                            "Non-finite gradient detected. Stopping training."
+                        );
 
-                if !running.load(Ordering::SeqCst) {
-                    println!("Interrupted");
+                        mlp.params.zero_grads();
+
+                        return TrainResult::Finished;
+                    }
+
+                    batch_grad_sum +=
+                        g.abs() as f64;
+                }
+
+                grad_sum +=
+                    batch_grad_sum as f32;
+
+                {
+                    let (
+                        values,
+                        grads,
+                    ) = (
+                        &mut mlp.params.values,
+                        &mut mlp.params.grads,
+                    );
+
+                    for i in 0..values.len() {
+                        values[i] -=
+                            lr * grads[i];
+                    }
+                }
+
+                mlp.params.zero_grads();
+
+                count +=
+                    current_batch;
+
+                batches_done +=
+                    1;
+
+                if !running.load(
+                    Ordering::SeqCst
+                ) {
+                    println!(
+                        "Interrupted"
+                    );
+
                     return TrainResult::Interrupted;
                 }
             }
 
-            let samples = count as f32;
+            let samples =
+                count as f32;
 
             if samples == 0.0 {
                 continue;
             }
 
-            // Since each batch MSE was weighted by its sample count,
-            // this is the epoch-wide MSE.
-            let avg_loss = total_loss / samples;
+            let avg_loss =
+                total_loss
+                    / samples;
 
-            let grad_avg = grad_sum / samples;
+            let grad_avg =
+                grad_sum
+                    / samples;
 
-            // -------------------------------------------------------------
-            // Learning-rate plateau detection
-            // -------------------------------------------------------------
+            if avg_loss
+                < best_loss * 0.998
+            {
+                best_loss =
+                    avg_loss;
 
-            if avg_loss < best_loss * 0.998 {
-                best_loss = avg_loss;
-                plateau_count = 0;
+                plateau_count =
+                    0;
             } else {
-                plateau_count += 1;
+                plateau_count +=
+                    1;
             }
 
             if plateau_count >= 10 {
-                lr = (lr * 0.8).max(min_lr);
-                plateau_count = 0;
+                lr =
+                    (lr * 0.8)
+                        .max(
+                            0.001
+                        );
 
-                println!("LR reduced to {}", lr);
+                plateau_count =
+                    0;
+
+                println!(
+                    "LR reduced to {}",
+                    lr
+                );
             }
 
-            let elapsed = now.elapsed();
+            let elapsed =
+                now.elapsed();
 
-            // -------------------------------------------------------------
-            // Statistics
-            // -------------------------------------------------------------
+            if update_frequency > 0
+                && epoch
+                % update_frequency
+                == 0
+            {
+                let grad_per_param =
+                    if parameter_count > 0 {
+                        grad_avg
+                            / parameter_count
+                            as f32
+                    } else {
+                        0.0
+                    };
 
-            if epoch % update_frequency == 0 {
                 println!(
-                    "Epoch {} | Loss (MSE) = {:.6} | Grad sum (avg per param) = {:.8} | Time elapsed: {:.2?} sec.",
+                    "Epoch {} | Loss (MSE) = {:.6} | \
+                     Grad avg = {:.8} | Time elapsed: {:.2?}.",
                     epoch,
                     avg_loss,
-                    grad_avg / param_count,
+                    grad_per_param,
                     elapsed,
                 );
             }
 
             if grad_avg <= 1e-9 {
-                println!("Early stopping, network will not learn anymore!");
+                println!(
+                    "Early stopping, network will not learn anymore!"
+                );
+
                 return TrainResult::Finished;
             }
         }
@@ -571,31 +790,17 @@ impl Trainer {
         tokens: &[u16],
         context_len: usize,
         embeddings: &Embeddings,
-        params: Vec<Tensor>,
         sampler_seed: u64,
         threads: usize,
     ) -> TrainResult {
-        let param_count =
-            params.len() as f32;
-
-        // =============================================================
-        // Textbook Adam
-        //
-        //     m_t = beta1 * m + (1-beta1) * g
-        //     v_t = beta2 * v + (1-beta2) * g²
-        //
-        //     m_hat = m / (1-beta1^t)
-        //     v_hat = v / (1-beta2^t)
-        //
-        //     param -= lr * m_hat / (sqrt(v_hat) + eps)
-        //
-        // =============================================================
-
         const ADAM_BETA1: f32 = 0.9;
         const ADAM_BETA2: f32 = 0.999;
+        const ADAM_EPSILON: f32 = 1.0e-8;
+        const MAX_GRAD_NORM: f64 = 1.0;
+        const PAD_ID: u16 = 0;
 
         // =============================================================
-        // Ctrl+C handling
+        // Ctrl+C
         // =============================================================
 
         let interrupt_requested =
@@ -607,15 +812,14 @@ impl Trainer {
             interrupt_requested.clone();
 
         ctrlc::set_handler(move || {
-            let _ =
-                interrupt_flag.compare_exchange(
-                    false,
-                    true,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+            interrupt_flag.store(
+                true,
+                Ordering::SeqCst,
+            );
         })
-            .expect("Error setting Ctrl+C handler");
+            .expect(
+                "Error setting Ctrl+C handler"
+            );
 
         // =============================================================
         // Dataset validation
@@ -642,27 +846,33 @@ impl Trainer {
             return TrainResult::Finished;
         }
 
-        if self.batch_size == 0 {
-            self.batch_size = data_len;
-        }
+        mlp.set_num_threads(
+            threads
+        );
 
-        mlp.set_num_threads(threads);
+        let parameter_count =
+            mlp.parameter_count();
+
+        assert_eq!(
+            mlp.params.values.len(),
+            parameter_count
+        );
+
+        assert_eq!(
+            mlp.params.grads.len(),
+            parameter_count
+        );
+
+        let input_size =
+            context_len
+                * embeddings.embedding_dim();
 
         // =============================================================
-        // Basic training state
+        // Optimizer state
         // =============================================================
 
-        let parameter_boundary =
-            crate::tape_len();
-
-        // IMPORTANT:
-        //
-        // Adam uses the real user-supplied LR directly.
-        //
-        // Trainer::new() should therefore store `lr` directly rather
-        // than dividing it by batch size.
         let mut lr =
-            self.lr * self.batch_size as f32;
+            self.lr;
 
         let mut best_loss =
             f32::MAX;
@@ -670,56 +880,21 @@ impl Trainer {
         let mut plateau_count =
             0usize;
 
-        // =============================================================
-        // MLP input size
-        // =============================================================
-
-        let input_size =
-            context_len
-                * embeddings.embedding_dim();
-
-        // =============================================================
-        // Parameter boundary
-        // =============================================================
-
-        let mlp_parameter_count =
-            mlp.parameter_count();
-
-        assert!(
-            params.len() >= mlp_parameter_count,
-            "Parameter vector is smaller than MLP parameter count"
-        );
-
-        let mlp_parameter_start =
-            params.len()
-                - mlp_parameter_count;
-
-        // `mlp_parameter_start` is retained because it identifies the
-        // embedding/MLP boundary for diagnostics and gradient handling.
-        //
-        // Adam itself does NOT use separate optimizer logic for them.
-
-        // =============================================================
-        // Adam state
-        // =============================================================
-
         let mut adam_first_moments =
-            vec![0.0f32; params.len()];
+            vec![
+                0.0f32;
+                parameter_count
+            ];
 
         let mut adam_second_moments =
-            vec![0.0f32; params.len()];
+            vec![
+                0.0f32;
+                parameter_count
+            ];
 
         let mut adam_step =
             0u64;
 
-        // Keep beta powers incrementally so we do NOT calculate powi()
-        // every training batch.
-        //
-        // At step t:
-        //
-        //     beta1_power = beta1^t
-        //     beta2_power = beta2^t
-        //
         let mut beta1_power =
             1.0f32;
 
@@ -736,12 +911,22 @@ impl Trainer {
         ) =
             match resume.take() {
                 Some(state) => {
-                    println!(
-                        "Resuming from epoch {}, batch {} (sample {}/{}).",
-                        state.epoch,
-                        state.batch,
-                        state.sample,
+                    assert_eq!(
+                        state.sampler_version,
+                        PermutationSampler::VERSION,
+                        "Unsupported permutation sampler version in checkpoint"
+                    );
+
+                    assert_eq!(
+                        state.sampler_data_len,
                         data_len,
+                        "Dataset length differs from checkpoint"
+                    );
+
+                    assert_eq!(
+                        state.sampler_seed,
+                        sampler_seed,
+                        "Sampler seed differs from checkpoint"
                     );
 
                     lr =
@@ -753,14 +938,10 @@ impl Trainer {
                     plateau_count =
                         state.plateau_count;
 
-                    // -------------------------------------------------
-                    // Restore Adam state
-                    // -------------------------------------------------
-
                     if state.adam_first_moments.len()
-                        == params.len()
+                        == parameter_count
                         && state.adam_second_moments.len()
-                        == params.len()
+                        == parameter_count
                     {
                         adam_first_moments =
                             state.adam_first_moments.clone();
@@ -771,43 +952,28 @@ impl Trainer {
                         adam_step =
                             state.adam_step;
 
+                        if adam_step > 0 {
+                            beta1_power =
+                                ADAM_BETA1.powi(
+                                    adam_step as i32
+                                );
+
+                            beta2_power =
+                                ADAM_BETA2.powi(
+                                    adam_step as i32
+                                );
+                        }
+
                         println!(
                             "Restored Adam state: {} parameters, step {}.",
-                            adam_first_moments.len(),
+                            parameter_count,
                             adam_step,
                         );
-
-                        // Reconstruct beta powers once at resume.
-                        //
-                        // They quickly underflow to zero at large t,
-                        // which is harmless because the bias correction
-                        // approaches 1.
-                        beta1_power =
-                            ADAM_BETA1.powi(
-                                adam_step as i32
-                            );
-
-                        beta2_power =
-                            ADAM_BETA2.powi(
-                                adam_step as i32
-                            );
                     } else {
                         println!(
                             "Checkpoint has incompatible Adam state; \
-         starting Adam moments from zero."
+                         starting Adam moments from zero."
                         );
-
-                        adam_first_moments.fill(0.0);
-                        adam_second_moments.fill(0.0);
-
-                        adam_step =
-                            0;
-
-                        beta1_power =
-                            1.0;
-
-                        beta2_power =
-                            1.0;
                     }
 
                     if state.sample >= data_len {
@@ -823,127 +989,99 @@ impl Trainer {
                     }
                 }
 
-                None => {
-                    (
-                        1,
-                        None,
-                    )
-                }
-            };
-
-        // =============================================================
-        // Sampler state
-        // =============================================================
-
-        let sampler_seed =
-            match resume_state.as_ref() {
-                Some(state) => {
-                    assert_eq!(
-                        state.sampler_version,
-                        PermutationSampler::VERSION,
-                        "Unsupported permutation sampler version in checkpoint"
-                    );
-
-                    assert_eq!(
-                        state.sampler_data_len,
-                        data_len,
-                        "Dataset length differs from checkpoint. \
-                 Exact deterministic resume is impossible."
-                    );
-
-                    state.sampler_seed
-                }
-
-                None => sampler_seed,
+                None => (
+                    1,
+                    None,
+                ),
             };
 
         // =============================================================
         // Checkpoint helper
         // =============================================================
 
-        let mut make_checkpoint =
-            |kind: CheckpointKind,
-             epoch: usize,
-             batch: usize,
-             sample: usize,
-             sampler_seed: u64,
-             sampler_data_len: usize,
-             lr: f32,
-             best_loss: f32,
-             plateau_count: usize,
-             adam_first_moments: &[f32],
-             adam_second_moments: &[f32],
-             adam_step: u64| {
-                if let Some(savefn) =
-                    savefn.as_mut()
-                {
-                    savefn(
-                        CheckpointState {
-                            kind,
-                            epoch,
-                            batch,
-                            sample,
-
-                            sampler_seed,
-                            sampler_version:
-                            PermutationSampler::VERSION,
-                            sampler_data_len,
-
-                            lr,
-                            best_loss,
-                            plateau_count,
-
-                            adam_first_moments:
-                            adam_first_moments.to_vec(),
-
-                            adam_second_moments:
-                            adam_second_moments.to_vec(),
-
-                            adam_step,
-                        },
-                        mlp,
-                        embeddings,
-                    );
-                }
-            };
+        fn emit_checkpoint(
+            savefn: &mut Option<
+                &mut dyn FnMut(
+                    CheckpointState,
+                    &MLP,
+                    &Embeddings,
+                ),
+            >,
+            kind: CheckpointKind,
+            epoch: usize,
+            batch: usize,
+            sample: usize,
+            sampler_seed: u64,
+            sampler_data_len: usize,
+            lr: f32,
+            best_loss: f32,
+            plateau_count: usize,
+            adam_first_moments: &[f32],
+            adam_second_moments: &[f32],
+            adam_step: u64,
+            mlp: &MLP,
+            embeddings: &Embeddings,
+        ) {
+            if let Some(savefn) =
+                savefn.as_mut()
+            {
+                savefn(
+                    CheckpointState {
+                        kind,
+                        epoch,
+                        batch,
+                        sample,
+                        sampler_seed,
+                        sampler_version:
+                        PermutationSampler::VERSION,
+                        sampler_data_len,
+                        lr,
+                        best_loss,
+                        plateau_count,
+                        adam_first_moments:
+                        adam_first_moments.to_vec(),
+                        adam_second_moments:
+                        adam_second_moments.to_vec(),
+                        adam_step,
+                    },
+                    mlp,
+                    embeddings,
+                );
+            }
+        }
 
         // =============================================================
         // Reusable batch buffers
         // =============================================================
 
         let mut batch_ids =
-            Vec::with_capacity(
+            Vec::<u16>::with_capacity(
                 self.batch_size
                     * context_len
             );
 
         let mut targets =
-            Vec::with_capacity(
+            Vec::<u16>::with_capacity(
                 self.batch_size
             );
 
         let mut batch_input =
-            Vec::with_capacity(
+            Vec::<f32>::with_capacity(
                 self.batch_size
-                    * context_len
-                    * embeddings.embedding_dim()
+                    * input_size
             );
 
-        let mut output_grads = Vec::<f32>::new();
+        let mut output_grads =
+            Vec::<f32>::new();
 
         // =============================================================
-        // Process epochs
+        // Epochs
         // =============================================================
 
-        for epoch in
-            start_epoch..self.epochs + 1
-        {
-            let now = Instant::now();
-
-            let mut count: usize;
-            let mut batches_done: usize;
-            let mut grad_sum = 0.0f32;
-            let mut total_loss = 0.0f32;
+        for epoch
+        in start_epoch..=self.epochs {
+            let now =
+                Instant::now();
 
             let sampler =
                 PermutationSampler::new(
@@ -952,51 +1090,75 @@ impl Trainer {
                     data_len,
                 );
 
-            // ---------------------------------------------------------
-            // Restore position
-            // ---------------------------------------------------------
+            let (
+                mut count,
+                mut batches_done,
+            ) =
+                match resume_state.take() {
+                    Some(state) => {
+                        debug_assert_eq!(
+                            state.epoch,
+                            epoch
+                        );
 
-            if let Some(state) =
-                resume_state.take()
-            {
-                debug_assert_eq!(state.epoch, epoch);
+                        println!(
+                            "Continuing epoch {} from batch {}.",
+                            epoch,
+                            state.batch,
+                        );
 
-                count = state.sample;
-                batches_done = state.batch;
+                        (
+                            state.sample,
+                            state.batch,
+                        )
+                    }
 
-                println!(
-                    "Continuing epoch {} from batch {}.",
-                    epoch,
-                    batches_done,
-                );
-            } else {
-                count = 0;
-                batches_done = 0;
-            }
+                    None => (
+                        0,
+                        0,
+                    ),
+                };
 
-            let epoch_start_count = count;
+            let epoch_start_count =
+                count;
 
             let total_batches =
                 (
                     data_len
                         + self.batch_size
                         - 1
-                )
-                    / self.batch_size;
+                ) / self.batch_size;
 
-            // ---------------------------------------------------------
-            // Timing
-            // ---------------------------------------------------------
+            let mut total_loss =
+                0.0f32;
+
+            let mut grad_sum =
+                0.0f32;
+
             #[cfg(feature = "timing")]
-            {
-                let mut encode_time = Duration::ZERO;
-                let mut forward_time = Duration::ZERO;
-                let mut loss_time = Duration::ZERO;
-                let mut backward_time = Duration::ZERO;
-                let mut embedding_grad_time = Duration::ZERO;
-                let mut clear_tape_time = Duration::ZERO;
-                let mut update_time = Duration::ZERO;
-            }
+            let mut encode_time =
+                Duration::ZERO;
+
+            #[cfg(feature = "timing")]
+            let mut forward_time =
+                Duration::ZERO;
+
+            #[cfg(feature = "timing")]
+            let mut loss_time =
+                Duration::ZERO;
+
+            #[cfg(feature = "timing")]
+            let mut backward_time =
+                Duration::ZERO;
+
+            #[cfg(feature = "timing")]
+            let mut embedding_grad_time =
+                Duration::ZERO;
+
+            #[cfg(feature = "timing")]
+            let mut update_time =
+                Duration::ZERO;
+
             // =========================================================
             // Batches
             // =========================================================
@@ -1013,8 +1175,9 @@ impl Trainer {
                     data_len - count;
 
                 let current_batch =
-                    self.batch_size
-                        .min(remaining);
+                    self.batch_size.min(
+                        remaining
+                    );
 
                 // -----------------------------------------------------
                 // Build token batch
@@ -1023,11 +1186,8 @@ impl Trainer {
                 batch_ids.clear();
                 targets.clear();
 
-                const PAD_ID: u16 = 0;
-
-                for batch_index in
-                    0..current_batch
-                {
+                for batch_index
+                in 0..current_batch {
                     let sample =
                         sampler.index(
                             count
@@ -1049,8 +1209,6 @@ impl Trainer {
                         context_len
                             - actual_context_len;
 
-                    // Left-padding: actual context is always right-aligned,
-                    // exactly like generation.
                     batch_ids.extend(
                         std::iter::repeat_n(
                             PAD_ID,
@@ -1061,12 +1219,11 @@ impl Trainer {
                     batch_ids.extend_from_slice(
                         &tokens[
                             sample
-                                ..sample + actual_context_len
+                                ..sample
+                                + actual_context_len
                             ]
                     );
 
-                    // Predict the token immediately after the actual context,
-                    // rather than after the maximum context length.
                     targets.push(
                         tokens[
                             sample
@@ -1076,13 +1233,15 @@ impl Trainer {
                 }
 
                 // -----------------------------------------------------
-                // Embedding lookup
+                // Embeddings
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
-                let timer = Instant::now();
+                let timer =
+                    Instant::now();
 
                 embeddings.encode_batch_into(
+                    &mlp.params,
                     &batch_ids,
                     current_batch,
                     context_len,
@@ -1090,14 +1249,18 @@ impl Trainer {
                 );
 
                 #[cfg(feature = "timing")]
-                { encode_time += timer.elapsed() }
+                {
+                    encode_time +=
+                        timer.elapsed();
+                }
 
                 // -----------------------------------------------------
                 // Forward
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
-                let timer = Instant::now();
+                let timer =
+                    Instant::now();
 
                 let forward =
                     mlp.forward_batch(
@@ -1107,53 +1270,67 @@ impl Trainer {
                     );
 
                 #[cfg(feature = "timing")]
-                { forward_time += timer.elapsed() }
+                {
+                    forward_time +=
+                        timer.elapsed();
+                }
 
-                // -----------------------------------------------------
-                // Softmax cross entropy
-                //
-                // softmax_cross_entropy_batch() returns SUM CE.
-                // -----------------------------------------------------
+                let output_size =
+                    forward.output_size;
 
-                let output_size = forward.output_size;
+                let grad_len =
+                    current_batch
+                        * output_size;
 
-                let grad_len = current_batch * output_size;
-
-                if output_grads.len() != grad_len {
+                if output_grads.len()
+                    != grad_len
+                {
                     output_grads.resize(
                         grad_len,
                         0.0,
                     );
                 } else {
-                    output_grads.fill(0.0);
+                    output_grads.fill(
+                        0.0
+                    );
                 }
 
+                // -----------------------------------------------------
+                // Softmax cross entropy
+                // -----------------------------------------------------
+
                 #[cfg(feature = "timing")]
-                let timer = Instant::now();
+                let timer =
+                    Instant::now();
 
                 let batch_loss =
                     softmax_cross_entropy_batch(
                         &forward.output,
-                        &*targets,
+                        &targets,
                         &mut output_grads,
                         current_batch,
                         output_size,
                     );
-
-                if !batch_loss.is_finite() {
-                    println!("Non-finite batch loss detected. Stopping training before optimizer update.");
-                    crate::clear_tape_after(parameter_boundary);
-                    return TrainResult::Finished;
-                }
-
-                total_loss +=
-                    batch_loss;
 
                 #[cfg(feature = "timing")]
                 {
                     loss_time +=
                         timer.elapsed();
                 }
+
+                if !batch_loss.is_finite() {
+                    println!(
+                        "Non-finite batch loss detected. \
+                     Stopping training."
+                    );
+
+                    mlp.params.zero_grads();
+
+                    return TrainResult::Finished;
+                }
+
+                total_loss +=
+                    batch_loss;
 
                 // -----------------------------------------------------
                 // Backward
@@ -1184,6 +1361,7 @@ impl Trainer {
                     Instant::now();
 
                 embeddings.accumulate_batch_grads(
+                    &mut mlp.params,
                     &batch_ids,
                     &input_grads,
                     current_batch,
@@ -1196,126 +1374,70 @@ impl Trainer {
                         timer.elapsed();
                 }
 
-                // =====================================================
-                // GLOBAL GRADIENT NORM
-                //
-                // Gradients are NOT clipped element-by-element.
-                //
-                // If the total norm is <= MAX_GRAD_NORM:
-                //     gradient is completely unchanged.
-                //
-                // If the norm exceeds the limit:
-                //     the ENTIRE gradient vector is uniformly scaled.
-                //
-                // This preserves the gradient direction.
-                // =====================================================
+                // -----------------------------------------------------
+                // Gradient validation
+                // -----------------------------------------------------
 
-                const MAX_GRAD_NORM: f64 = 1.0;
-
-                // The backward pass accumulates SUM gradients over the batch.
-                // Adam should operate on the MEAN batch gradient.
                 let batch_normalization =
-                    1.0f32 / current_batch.max(1) as f32;
+                    1.0f32
+                        / current_batch
+                        .max(1) as f32;
 
-                // -----------------------------------------------------
-                // MLP gradient norm
-                // -----------------------------------------------------
-
-                let mut mlp_grad_sq_sum =
+                let mut grad_sq_sum =
                     0.0f64;
 
-                for param_index
-                in mlp_parameter_start..params.len()
+                let mut batch_grad_sum =
+                    0.0f64;
+
+                for &g in
+                    &mlp.params.grads
                 {
-                    let raw_g =
-                        params[param_index].grad();
-
-                    if !raw_g.is_finite() {
-                        println!("Non-finite MLP gradient detected before optimizer update. Stopping training.");
-
-                        crate::clear_tape_after(
-                            parameter_boundary
+                    if !g.is_finite() {
+                        println!(
+                            "Non-finite gradient detected. \
+                         Stopping training."
                         );
+
+                        mlp.params.zero_grads();
 
                         return TrainResult::Finished;
                     }
 
-                    // Measure the norm of the MEAN gradient,
-                    // not the summed batch gradient.
-                    let g =
-                        raw_g * batch_normalization;
+                    let mean_grad =
+                        g
+                            * batch_normalization;
 
                     let gf =
-                        g as f64;
+                        mean_grad as f64;
 
-                    mlp_grad_sq_sum +=
+                    grad_sq_sum +=
                         gf * gf;
+
+                    batch_grad_sum +=
+                        gf.abs();
                 }
 
-                let mlp_grad_norm =
-                    mlp_grad_sq_sum.sqrt();
+                let grad_norm =
+                    grad_sq_sum.sqrt();
 
-                let mlp_grad_scale =
-                    if mlp_grad_norm > MAX_GRAD_NORM {
+                let grad_scale =
+                    if grad_norm
+                        > MAX_GRAD_NORM
+                    {
                         (
                             MAX_GRAD_NORM
-                                / mlp_grad_norm
+                                / grad_norm
                         ) as f32
                     } else {
                         1.0
                     };
 
+                grad_sum +=
+                    batch_grad_sum as f32;
+
                 // -----------------------------------------------------
-                // Embedding gradient norm
-                // -----------------------------------------------------
-
-                let mut embedding_grad_sq_sum =
-                    0.0f64;
-
-                for param_index
-                in 0..mlp_parameter_start
-                {
-                    let raw_g =
-                        params[param_index].grad();
-
-                    if !raw_g.is_finite() {
-                        println!("Non-finite embedding gradient detected before optimizer update. Stopping training.");
-
-                        crate::clear_tape_after(
-                            parameter_boundary
-                        );
-
-                        return TrainResult::Finished;
-                    }
-
-                    // Measure the norm of the MEAN gradient,
-                    // not the summed batch gradient.
-                    let g =
-                        raw_g * batch_normalization;
-
-                    let gf =
-                        g as f64;
-
-                    embedding_grad_sq_sum +=
-                        gf * gf;
-                }
-
-                let embedding_grad_norm =
-                    embedding_grad_sq_sum.sqrt();
-
-                let embedding_grad_scale =
-                    if embedding_grad_norm > MAX_GRAD_NORM {
-                        (
-                            MAX_GRAD_NORM
-                                / embedding_grad_norm
-                        ) as f32
-                    } else {
-                        1.0
-                    };
-
-                // =====================================================
                 // Adam step
-                // =====================================================
+                // -----------------------------------------------------
 
                 adam_step +=
                     1;
@@ -1328,29 +1450,81 @@ impl Trainer {
 
                 let beta1_correction_inv =
                     1.0f32
-                        / (1.0f32
-                        - beta1_power);
+                        / (
+                        1.0f32
+                            - beta1_power
+                    );
 
                 let beta2_correction_inv =
                     1.0f32
-                        / (1.0f32
-                        - beta2_power);
-
-                // -----------------------------------------------------
-                // Clear backward tape before parameter update.
-                // -----------------------------------------------------
+                        / (
+                        1.0f32
+                            - beta2_power
+                    );
 
                 #[cfg(feature = "timing")]
                 let timer =
                     Instant::now();
 
-                crate::clear_tape_after(
-                    parameter_boundary
-                );
+                for i in
+                    0..parameter_count
+                {
+                    let gradient =
+                        mlp.params.grads[i]
+                            * batch_normalization
+                            * grad_scale;
+
+                    let m =
+                        &mut adam_first_moments[
+                            i
+                            ];
+
+                    let v =
+                        &mut adam_second_moments[
+                            i
+                            ];
+
+                    *m =
+                        ADAM_BETA1
+                            * *m
+                            + (
+                            1.0
+                                - ADAM_BETA1
+                        )
+                            * gradient;
+
+                    *v =
+                        ADAM_BETA2
+                            * *v
+                            + (
+                            1.0
+                                - ADAM_BETA2
+                        )
+                            * gradient
+                            * gradient;
+
+                    let m_hat =
+                        *m
+                            * beta1_correction_inv;
+
+                    let v_hat =
+                        *v
+                            * beta2_correction_inv;
+
+                    mlp.params.values[i] -=
+                        lr
+                            * m_hat
+                            / (
+                            v_hat.sqrt()
+                                + ADAM_EPSILON
+                        );
+                }
+
+                mlp.params.zero_grads();
 
                 #[cfg(feature = "timing")]
                 {
-                    clear_tape_time +=
+                    update_time +=
                         timer.elapsed();
                 }
 
@@ -1361,52 +1535,26 @@ impl Trainer {
                     1;
 
                 // -----------------------------------------------------
-                // Parameter update
-                // -----------------------------------------------------
-
-                #[cfg(feature = "timing")]
-                let timer =
-                    Instant::now();
-
-                grad_sum +=
-                    crate::zero_grad_and_update_adam(
-                        &params,
-                        lr,
-                        embeddings,
-                        &mut adam_first_moments,
-                        &mut adam_second_moments,
-                        beta1_correction_inv,
-                        beta2_correction_inv,
-                        mlp_parameter_start,
-                        mlp_grad_scale,
-                        embedding_grad_scale,
-                        batch_normalization,
-                    );
-
-                #[cfg(feature = "timing")]
-                {
-                    update_time +=
-                        timer.elapsed();
-                }
-
-                // =====================================================
                 // Batch checkpoint
-                // =====================================================
+                // -----------------------------------------------------
 
                 let should_checkpoint =
                     match checkpoint_frequency {
-                        CheckpointFrequency::EveryBatch(n) => {
-                            n > 0
+                        CheckpointFrequency::EveryBatch(
+                            frequency
+                        ) =>
+                            frequency > 0
                                 && batches_done
-                                % n
-                                == 0
-                        }
+                                % frequency
+                                == 0,
 
-                        _ => false,
+                        _ =>
+                            false,
                     };
 
                 if should_checkpoint {
-                    make_checkpoint(
+                    emit_checkpoint(
+                        &mut savefn,
                         CheckpointKind::Batch,
                         epoch,
                         batches_done,
@@ -1419,12 +1567,14 @@ impl Trainer {
                         &adam_first_moments,
                         &adam_second_moments,
                         adam_step,
+                        mlp,
+                        embeddings,
                     );
                 }
 
-                // =====================================================
-                // Progress
-                // =====================================================
+                // -----------------------------------------------------
+                // Batch progress
+                // -----------------------------------------------------
 
                 if let Some(
                     frequency
@@ -1440,14 +1590,16 @@ impl Trainer {
                             now.elapsed();
 
                         let processed_samples =
-                            count.saturating_sub(
-                                epoch_start_count
-                            );
+                            count
+                                .saturating_sub(
+                                    epoch_start_count
+                                );
 
                         let remaining_at_start =
-                            data_len.saturating_sub(
-                                epoch_start_count
-                            );
+                            data_len
+                                .saturating_sub(
+                                    epoch_start_count
+                                );
 
                         let progress =
                             if remaining_at_start
@@ -1462,7 +1614,8 @@ impl Trainer {
                             };
 
                         let running_loss =
-                            if processed_samples > 0
+                            if processed_samples
+                                > 0
                             {
                                 total_loss
                                     / processed_samples
@@ -1481,10 +1634,8 @@ impl Trainer {
                             if elapsed_secs
                                 > 0.0
                             {
-                                (
-                                    count
-                                        - epoch_start_count
-                                ) as f64
+                                processed_samples
+                                    as f64
                                     / elapsed_secs
                             } else {
                                 0.0
@@ -1509,20 +1660,18 @@ impl Trainer {
                                 Duration::ZERO
                             };
 
-                        // batch_loss is SUM CE, so divide by batch size
-                        // for the per-sample batch loss.
-                        let avgbatchloss =
+                        let batch_avg_loss =
                             batch_loss
                                 / current_batch
                                 as f32;
 
                         println!(
                             "Epoch {} | Batch {}/{} | {:>6.2}% | \
-                     Samples {}/{} | AvgLoss = {:.6} | \
-                     AvgPPL = {:.6}\n\
-                     Loss={:.6} | PPL= {:.6} | \
-                     {:.1} samples/s | Elapsed: {:.2?} | \
-                     ETA: {:.2?}",
+                         Samples {}/{} | AvgLoss = {:.6} | \
+                         AvgPPL = {:.6}\n\
+                         Loss = {:.6} | PPL = {:.6} | \
+                         {:.1} samples/s | \
+                         Elapsed: {:.2?} | ETA: {:.2?}",
                             epoch,
                             batches_done,
                             total_batches,
@@ -1531,8 +1680,8 @@ impl Trainer {
                             data_len,
                             running_loss,
                             running_ppl,
-                            avgbatchloss,
-                            avgbatchloss.exp(),
+                            batch_avg_loss,
+                            batch_avg_loss.exp(),
                             samples_per_sec,
                             elapsed,
                             eta,
@@ -1540,19 +1689,20 @@ impl Trainer {
                     }
                 }
 
-                // =====================================================
+                // -----------------------------------------------------
                 // Ctrl+C
-                // =====================================================
+                // -----------------------------------------------------
 
-                if interrupt_requested
-                    .load(Ordering::SeqCst)
-                {
+                if interrupt_requested.load(
+                    Ordering::SeqCst
+                ) {
                     println!();
                     println!(
                         "Ctrl+C received. Current batch has finished."
                     );
 
-                    make_checkpoint(
+                    emit_checkpoint(
+                        &mut savefn,
                         CheckpointKind::Batch,
                         epoch,
                         batches_done,
@@ -1565,6 +1715,8 @@ impl Trainer {
                         &adam_first_moments,
                         &adam_second_moments,
                         adam_step,
+                        mlp,
+                        embeddings,
                     );
 
                     loop {
@@ -1623,7 +1775,7 @@ impl Trainer {
                             Err(_) => {
                                 println!(
                                     "Could not read input. \
-                             Exiting training."
+                                 Exiting training."
                                 );
 
                                 return TrainResult::Interrupted;
@@ -1646,8 +1798,6 @@ impl Trainer {
                 continue;
             }
 
-            // softmax_cross_entropy_batch returns SUM CE, therefore this
-            // is the correct per-sample CE.
             let avg_loss =
                 total_loss
                     / samples;
@@ -1655,14 +1805,13 @@ impl Trainer {
             let perplexity =
                 avg_loss.exp();
 
-            // =========================================================
-            // Track best loss
-            //
-            // Kept for checkpoint/output compatibility.
-            //
-            // Adam itself does not perform the old custom layerwise
-            // LR adaptation.
-            // =========================================================
+            let grad_avg =
+                grad_sum
+                    / samples;
+
+            // ---------------------------------------------------------
+            // Best-loss tracking
+            // ---------------------------------------------------------
 
             if avg_loss
                 < best_loss
@@ -1677,23 +1826,26 @@ impl Trainer {
                     1;
             }
 
-            // =========================================================
+            // ---------------------------------------------------------
             // Epoch checkpoint
-            // =========================================================
+            // ---------------------------------------------------------
 
             let should_checkpoint =
                 match checkpoint_frequency {
-                    CheckpointFrequency::EveryEpoch(n) => {
-                        n > 0
-                            && epoch % n
-                            == 0
-                    }
+                    CheckpointFrequency::EveryEpoch(
+                        frequency
+                    ) =>
+                        frequency > 0
+                            && epoch % frequency
+                            == 0,
 
-                    _ => false,
+                    _ =>
+                        false,
                 };
 
             if should_checkpoint {
-                make_checkpoint(
+                emit_checkpoint(
+                    &mut savefn,
                     CheckpointKind::Epoch,
                     epoch,
                     batches_done,
@@ -1706,39 +1858,48 @@ impl Trainer {
                     &adam_first_moments,
                     &adam_second_moments,
                     adam_step,
+                    mlp,
+                    embeddings,
                 );
             }
 
-            // =========================================================
-            // Epoch statistics
-            // =========================================================
+            // ---------------------------------------------------------
+            // Epoch logging
+            // ---------------------------------------------------------
 
             let elapsed =
                 now.elapsed();
 
-            let grad_avg =
-                grad_sum
-                    / samples;
-
             if update_frequency > 0
-                && epoch % update_frequency
+                && epoch
+                % update_frequency
                 == 0
             {
+                let grad_per_param =
+                    if parameter_count > 0 {
+                        grad_avg
+                            / parameter_count
+                            as f32
+                    } else {
+                        0.0
+                    };
+
                 println!(
                     "Epoch {} | Loss (CE) = {:.6} | \
-             Grad sum (avg per param) = {:.8} | \
-             PPL = {:.6} | Time elapsed: {:.2?}.",
+                 Grad avg per param = {:.8} | \
+                 PPL = {:.6} | \
+                 Time elapsed: {:.2?}.",
                     epoch,
                     avg_loss,
-                    grad_avg
-                        / param_count,
+                    grad_per_param,
                     perplexity,
                     elapsed,
                 );
 
                 #[cfg(feature = "timing")]
                 {
-                    let elapsed_secs = elapsed.as_secs_f64();
+                    let elapsed_secs =
+                        elapsed.as_secs_f64();
 
                     let pct =
                         |duration: Duration| {
@@ -1783,13 +1944,7 @@ impl Trainer {
                     );
 
                     println!(
-                        "  Clear tape:      {:>10.3?} ({:>6.2}%)",
-                        clear_tape_time,
-                        pct(clear_tape_time)
-                    );
-
-                    println!(
-                        "  Update:           {:>10.3?} ({:>6.2}%)",
+                        "  Adam update:     {:>10.3?} ({:>6.2}%)",
                         update_time,
                         pct(update_time)
                     );
@@ -1797,7 +1952,10 @@ impl Trainer {
             }
 
             if grad_avg <= 1e-9 {
-                println!("Early stopping, network will not learn anymore!");
+                println!(
+                    "Early stopping, network will not learn anymore!"
+                );
+
                 return TrainResult::Finished;
             }
         }

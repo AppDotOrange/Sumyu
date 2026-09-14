@@ -81,63 +81,28 @@ fn build_spans(
         .collect()
 }
 
-
-/* ============================================================
- * Leaky ReLU
+/*
  * ============================================================
- *
- * The forward kernel uses:
- *
- *     if y <= 0.0 {
- *         y *= slope;
- *     }
- *
- * Therefore the backward derivative uses exactly the same
- * condition:
- *
- *     if y <= 0.0 {
- *         dy *= slope;
- *     }
- *
- * `activation` is the OUTPUT of the forward activation.
- *
- * For the normal case:
- *
- *     activation = None
- *
- * the compiler eliminates all activation logic when LEAKY=false.
+ * Leaky ReLU derivative
  * ============================================================
  */
 
 #[inline(always)]
 fn apply_leaky_scalar(
     value: f32,
-    activation: f32,
+    activation_output: f32,
     slope: f32,
 ) -> f32 {
-    if activation <= 0.0 {
+    if activation_output <= 0.0 {
         value * slope
     } else {
         value
     }
 }
 
-/* ============================================================
+/*
+ * ============================================================
  * dX
- *
- * One output position + one output-channel tile.
- *
- * dX[src,c] += Σ_oc dY[out,oc] * W[oc,k,c]
- *
- * W layout:
- *     [oc][k][ic]
- *
- * X / dX layout:
- *     [position][ic]
- *
- * LEAKY:
- *     dY is transformed exactly once when entering this kernel.
- *     The transformed values remain cached in `dy`.
  * ============================================================
  */
 
@@ -162,11 +127,6 @@ unsafe fn dinput<const OC: usize, const LEAKY: bool>(
     let kernel_width =
         kernel_size * in_channels;
 
-    /*
-     * dY is reused for every k and every IC vector.
-     *
-     * For LeakyReLU, apply the derivative exactly once here.
-     */
     let mut dy =
         [0.0f32; OC_TILE];
 
@@ -201,9 +161,6 @@ unsafe fn dinput<const OC: usize, const LEAKY: bool>(
         let weight_k_offset =
             k * in_channels;
 
-        /*
-         * Main SIMD body.
-         */
         let mut c = 0;
 
         while c < simd_end {
@@ -241,9 +198,6 @@ unsafe fn dinput<const OC: usize, const LEAKY: bool>(
             c += IC_SIMD;
         }
 
-        /*
-         * IC remainder.
-         */
         while c < in_channels {
             let mut value =
                 *dinput_row.add(c);
@@ -266,15 +220,9 @@ unsafe fn dinput<const OC: usize, const LEAKY: bool>(
     }
 }
 
-
-/* ============================================================
+/*
+ * ============================================================
  * dW
- *
- * One OC tile + one kernel position + one IC SIMD vector.
- *
- * dW[oc,k,c] += X[src,c] * dY[out,oc]
- *
- * Activation derivative is applied when dY is loaded.
  * ============================================================
  */
 
@@ -317,15 +265,6 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
         let mut c = 0;
 
         while c < simd_end {
-            /*
-             * One YMM accumulator per output channel.
-             *
-             * OC=8:
-             *
-             *     8 accumulators × 8 f32
-             *
-             * = 64 dW values accumulated before stores.
-             */
             let mut acc: [__m256; OC_TILE] =
                 [_mm256_setzero_ps(); OC_TILE];
 
@@ -362,8 +301,7 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
                     }
 
                     let src_position =
-                        (span.origin
-                            + k as isize)
+                        (span.origin + k as isize)
                             as usize;
 
                     let x =
@@ -412,9 +350,6 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
                 }
             }
 
-            /*
-             * One store per dW vector.
-             */
             for oc in 0..OC {
                 _mm256_storeu_ps(
                     weight_grad.add(
@@ -430,9 +365,6 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
             c += IC_SIMD;
         }
 
-        /*
-         * Scalar IC remainder.
-         */
         let mut c =
             simd_end;
 
@@ -473,8 +405,7 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
                     }
 
                     let src_position =
-                        (span.origin
-                            + k as isize)
+                        (span.origin + k as isize)
                             as usize;
 
                     let x =
@@ -532,19 +463,9 @@ unsafe fn dweight<const OC: usize, const LEAKY: bool>(
     }
 }
 
-
-/* ============================================================
+/*
+ * ============================================================
  * dB
- *
- * Output-channel dimension is contiguous.
- *
- * Linear:
- *     dB += dY
- *
- * Leaky:
- *     dB += dY * derivative(Y)
- *
- * The activation derivative is vectorized.
  * ============================================================
  */
 
@@ -700,8 +621,8 @@ unsafe fn dbias_tail<const LEAKY: bool>(
     }
 }
 
-
-/* ============================================================
+/*
+ * ============================================================
  * AVX2 backward
  * ============================================================
  */
@@ -761,12 +682,6 @@ unsafe fn backward_avx2<const LEAKY: bool>(
     let bias_grad_ptr =
         bias_grad.as_mut_ptr();
 
-    /*
-     * ========================================================
-     * dB
-     * ========================================================
-     */
-
     let full_oc =
         out_channels / OC_TILE;
 
@@ -774,15 +689,11 @@ unsafe fn backward_avx2<const LEAKY: bool>(
         dbias_block::<LEAKY>(
             grad_ptr,
             activation_ptr,
-
             bias_grad_ptr,
-
             batch_size,
             output_length,
             out_channels,
-
             block * OC_TILE,
-
             activation_slope,
         );
     }
@@ -794,54 +705,34 @@ unsafe fn backward_avx2<const LEAKY: bool>(
         dbias_tail::<LEAKY>(
             grad_ptr,
             activation_ptr,
-
             bias_grad_ptr,
-
             batch_size,
             output_length,
             out_channels,
-
             full_oc * OC_TILE,
             oc_tail,
-
             activation_slope,
         );
     }
-
-    /*
-     * ========================================================
-     * dW
-     * ========================================================
-     */
 
     for block in 0..full_oc {
         dweight::<OC_TILE, LEAKY>(
             input_ptr,
             grad_ptr,
             activation_ptr,
-
             weight_grad_ptr,
-
             batch_size,
             input_length,
             output_length,
-
             in_channels,
             out_channels,
-
             kernel_size,
-
             block * OC_TILE,
-
             &spans,
-
             activation_slope,
         );
     }
 
-    /*
-     * Output-channel tail.
-     */
     if oc_tail != 0 {
         let oc_base =
             full_oc * OC_TILE;
@@ -851,21 +742,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -873,21 +758,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -895,21 +774,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -917,21 +790,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -939,21 +806,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -961,21 +822,15 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
@@ -983,41 +838,21 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                 input_ptr,
                 grad_ptr,
                 activation_ptr,
-
                 weight_grad_ptr,
-
                 batch_size,
                 input_length,
                 output_length,
-
                 in_channels,
                 out_channels,
-
                 kernel_size,
                 oc_base,
-
                 &spans,
-
                 activation_slope,
             ),
 
             _ => unreachable!(),
         }
     }
-
-    /*
-     * ========================================================
-     * dX
-     * ========================================================
-     *
-     * Forward-like traversal:
-     *
-     * batch
-     *   output position
-     *     OC tile
-     *       valid K
-     *         SIMD IC
-     */
 
     for batch in 0..batch_size {
         let input_grad_batch =
@@ -1066,25 +901,19 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                     grad_row.add(
                         block * OC_TILE
                     ),
-
                     activation_row.add(
                         block * OC_TILE
                     ),
-
                     weights.as_ptr().add(
                         block
                             * OC_TILE
                             * kernel_size
                             * in_channels
                     ),
-
                     input_grad_batch,
-
                     in_channels,
                     kernel_size,
-
                     span,
-
                     activation_slope,
                 );
             }
@@ -1102,119 +931,84 @@ unsafe fn backward_avx2<const LEAKY: bool>(
                     1 => dinput::<1, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     2 => dinput::<2, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     3 => dinput::<3, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     4 => dinput::<4, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     5 => dinput::<5, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     6 => dinput::<6, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
                     7 => dinput::<7, LEAKY>(
                         grad_row.add(oc_base),
                         activation_row.add(oc_base),
-
                         weights.as_ptr()
                             .add(weights_base),
-
                         input_grad_batch,
-
                         in_channels,
                         kernel_size,
-
                         span,
-
                         activation_slope,
                     ),
 
@@ -1225,8 +1019,8 @@ unsafe fn backward_avx2<const LEAKY: bool>(
     }
 }
 
-
-/* ============================================================
+/*
+ * ============================================================
  * Scalar fallback
  * ============================================================
  */
@@ -1280,18 +1074,12 @@ fn backward_scalar(
                 let mut dy =
                     grad[grad_base + oc];
 
-                /*
-                 * Match forward exactly:
-                 *
-                 * if y <= 0.0 { y *= slope; }
-                 *
-                 * The derivative is therefore slope for
-                 * activated output <= 0.
-                 */
                 match activation_mode {
                     Activation::None => {}
 
-                    Activation::LeakyReLU { slope } => {
+                    Activation::LeakyReLU {
+                        slope,
+                    } => {
                         dy =
                             apply_leaky_scalar(
                                 dy,
@@ -1344,14 +1132,19 @@ fn backward_scalar(
     }
 }
 
-
-/* ============================================================
+/*
+ * ============================================================
  * Public entry point
  *
- * `grad` is dL/d(output_of_activation).
+ * Returns:
  *
- * `activation_output` is the output produced by the forward
- * Conv1D activation. It is only used for LeakyReLU.
+ *     input_grad
+ *     weight_grad
+ *     bias_grad
+ *
+ * No global state.
+ * No Tensor handles.
+ * No tape.
  * ============================================================
  */
 
@@ -1423,65 +1216,48 @@ pub fn backward_direct(
             && std::arch::is_x86_feature_detected!("fma")
         {
             match activation {
-                /*
-                 * IMPORTANT:
-                 *
-                 * The const generic means the compiler can completely
-                 * remove every activation-related operation from the
-                 * normal Conv1D path.
-                 */
                 Activation::None => unsafe {
                     backward_avx2::<false>(
                         input,
                         grad,
                         activation_output,
-
                         &mut input_grad,
                         &mut weight_grad,
                         &mut bias_grad,
-
                         batch_size,
                         input_length,
                         output_length,
-
                         in_channels,
                         out_channels,
-
                         kernel_size,
                         stride,
                         padding,
                         causal,
-
                         weights,
-
                         0.0,
                     );
                 },
 
-                Activation::LeakyReLU { slope } => unsafe {
+                Activation::LeakyReLU {
+                    slope,
+                } => unsafe {
                     backward_avx2::<true>(
                         input,
                         grad,
                         activation_output,
-
                         &mut input_grad,
                         &mut weight_grad,
                         &mut bias_grad,
-
                         batch_size,
                         input_length,
                         output_length,
-
                         in_channels,
                         out_channels,
-
                         kernel_size,
                         stride,
                         padding,
                         causal,
-
                         weights,
-
                         *slope,
                     );
                 },
@@ -1499,25 +1275,19 @@ pub fn backward_direct(
         input,
         grad,
         activation_output,
-
         &mut input_grad,
         &mut weight_grad,
         &mut bias_grad,
-
         batch_size,
         input_length,
         output_length,
-
         in_channels,
         out_channels,
-
         kernel_size,
         stride,
         padding,
         causal,
-
         weights,
-
         activation,
     );
 
