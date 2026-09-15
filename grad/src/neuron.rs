@@ -2495,4 +2495,8 @@ impl MLP {
             build_thread_pool(1),
         }
     }
+
+    pub fn parameters(&self) -> ParameterStore {
+        self.params.clone()
+    }
 }

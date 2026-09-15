@@ -11,7 +11,7 @@ impl ParamRange {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ParameterStore {
     pub values: Vec<f32>,
     pub grads: Vec<f32>,

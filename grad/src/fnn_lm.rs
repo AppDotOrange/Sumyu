@@ -225,40 +225,6 @@ pub struct LM {
 }
 
 impl LM {
-    fn make_dense_specs(
-        hidden_dim: &[usize],
-        vocab_size: usize,
-    ) -> Vec<LayerSpec> {
-        let mut specs =
-            Vec::with_capacity(
-                hidden_dim.len() + 1
-            );
-
-        for &output_size
-        in hidden_dim {
-            specs.push(
-                LayerSpec::Dense {
-                    output_size,
-                    activation:
-                    Activation::LeakyReLU {
-                        slope: 0.01,
-                    },
-                }
-            );
-        }
-
-        specs.push(
-            LayerSpec::Dense {
-                output_size:
-                vocab_size,
-                activation:
-                Activation::None,
-            }
-        );
-
-        specs
-    }
-
     pub fn new(
         context_len: u32,
         vocab: Vec<String>,
@@ -269,19 +235,16 @@ impl LM {
             context_len as usize
                 * embedding_dim;
 
-        let mut specs =
-            Vec::with_capacity(
-                hidden_dim.len() + 1
-            );
+        let mut specs = Vec::with_capacity(hidden_dim.len() + 1);
 
         for &size in hidden_dim {
             specs.push(
                 LayerSpec::Dense {
                     output_size: size,
                     activation:
-                    crate::neuron::Activation::LeakyReLU {
-                        slope: 0.01,
-                    },
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
                 }
             );
         }
@@ -2028,5 +1991,9 @@ impl LM {
                 model
             ),
         )
+    }
+    
+    pub fn find_clusters(&self, threshold: f32) {
+        self.embeddings.find_clusters(&self.mlp.parameters(), threshold, self.vocab.clone())
     }
 }

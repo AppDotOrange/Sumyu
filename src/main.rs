@@ -535,7 +535,7 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::tinychat_v4_hybrid(1e-3, 256, 1);
+        let config = helper::tinychat_v8_hybrid(1e-3, 256, 1);
         let description = "A large Sumyu Hybrid model trained on TinyChat.";
 
         //------------------------------------------------------------------------------------------
@@ -545,9 +545,9 @@ fn main() {
         lm.params();
         lm.load_corpus(&tinychat);
         lm.train(
-            Some(10),
-            Some("tinychat4/MiniChatterV4_batch_1567_epoch_1.check"),
-            Some("tinychat4/MiniChatterV4"),
+            Some(5),
+            None,
+            Some("tinychat8/MiniChatterV8"),
             CheckpointFrequency::EveryBatch(500),
             None,
             None,
@@ -555,7 +555,7 @@ fn main() {
             4,
         );
         lm.save(
-            "MiniChatterV4.sumyu",
+            "MiniChatterV8.sumyu",
             &description,
         );
     }
