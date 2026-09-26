@@ -21,12 +21,12 @@ impl ChatFNN {
             let mut user = "".to_string();
             io::stdin().read_line(&mut user).unwrap();
             context.push_str(&user);
-            context.push_str("<EOT>\n<BOT>");
+            context.push_str("<EOT><BOT>");
             print!("BOT: ");
             let _ = io::stdout().flush();
             let bot = &*self.lm.generate_gpt_chatter(context.clone(), max_gen_length, temperature, threads);
             context.push_str(bot);
-            context.push_str("<EOT>\n<USER>");
+            context.push_str("<EOT><USER>");
             println!()
         }
     }

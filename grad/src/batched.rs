@@ -411,3 +411,121 @@ pub fn dense_backward_bias(
         }
     }
 }
+
+/// Batched softmax cross entropy over multiple prediction positions.
+///
+/// Layout:
+///     logits  = (batch * positions) × classes
+///     targets = (batch * positions)
+///
+/// `ignore_index` masks target rows from the loss/gradient.
+/// IMPORTANT: this only masks the TARGET. It does NOT mask or
+/// remove the corresponding input embedding from the network.
+pub fn softmax_cross_entropy_positions(
+    logits: &[f32],
+    targets: &[u16],
+    grad_logits: &mut [f32],
+    batch: usize,
+    positions: usize,
+    classes: usize,
+    ignore_index: u16,
+) -> (f32, usize) {
+    debug_assert_eq!(
+        logits.len(),
+        batch * positions * classes
+    );
+
+    debug_assert_eq!(
+        targets.len(),
+        batch * positions
+    );
+
+    debug_assert_eq!(
+        grad_logits.len(),
+        batch * positions * classes
+    );
+
+    let rows =
+        batch * positions;
+
+    let mut total_loss =
+        0.0f32;
+
+    let mut valid_count =
+        0usize;
+
+    for row in 0..rows {
+        let target =
+            targets[row];
+
+        let base =
+            row * classes;
+
+        // Mask only the prediction target.
+        //
+        // The corresponding INPUT position still exists,
+        // and its embedding still participates in forward/
+        // backward normally.
+        if target == ignore_index {
+            grad_logits[
+                base..base + classes
+                ].fill(0.0);
+
+            continue;
+        }
+
+        let mut max_value =
+            f32::NEG_INFINITY;
+
+        for c in 0..classes {
+            max_value =
+                max_value.max(
+                    logits[base + c]
+                );
+        }
+
+        let mut sum_exp =
+            0.0f32;
+
+        for c in 0..classes {
+            let e =
+                (
+                    logits[base + c]
+                        - max_value
+                )
+                    .exp();
+
+            grad_logits[base + c] =
+                e;
+
+            sum_exp += e;
+        }
+
+        let target_index =
+            target as usize;
+
+        let target_prob =
+            (
+                grad_logits[
+                    base + target_index
+                    ] / sum_exp
+            )
+                .max(1e-7);
+
+        total_loss -=
+            target_prob.ln();
+
+        for c in 0..classes {
+            grad_logits[base + c] /=
+                sum_exp;
+        }
+
+        grad_logits[
+            base + target_index
+            ] -= 1.0;
+
+        valid_count += 1;
+    }
+
+    (total_loss, valid_count)
+}

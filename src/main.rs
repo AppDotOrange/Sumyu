@@ -17,7 +17,6 @@ fn main() {
     let recipe_full = "";
     let oasst1 = "";
     let fineweb = "";
-    let fineweb2 = "";
     let fineweb3 = "";
 
     //let _rust = fs::read_to_string("Datasets/rust.txt").expect("Can't read rust.txt!");
@@ -30,7 +29,7 @@ fn main() {
     //let fineweb2 = fs::read_to_string("Datasets/fineweb_v2.txt").expect("Can't read fineweb_v2.txt!");
     //let fineweb3 = fs::read_to_string("Datasets/fineweb_v3.txt").expect("Can't read fineweb_v3.txt!");
     let tinychat = fs::read_to_string("Datasets/tinychat.txt").expect("Can't read tinychat.txt!");
-    let test = 16;
+    let test = 17;
     if test == -3 {
         #[cfg(target_arch = "x86_64")]
         println!(
@@ -535,7 +534,7 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::tinychat_v8_hybrid(1e-3, 256, 1);
+        let config = helper::tinychat_v11_hybrid(1e-3, 512, 1);
         let description = "A large Sumyu Hybrid model trained on TinyChat.";
 
         //------------------------------------------------------------------------------------------
@@ -545,17 +544,54 @@ fn main() {
         lm.params();
         lm.load_corpus(&tinychat);
         lm.train(
-            Some(5),
-            None,
-            Some("tinychat8/MiniChatterV8"),
-            CheckpointFrequency::EveryBatch(500),
+            Some(1),
+            Some("tinychat11/MiniChatterV11_batch_2_epoch_1.check"),
+            Some("tinychat11/MiniChatterV11"),
+            CheckpointFrequency::EveryBatch(10),
             None,
             None,
             true,
             4,
         );
         lm.save(
-            "MiniChatterV8.sumyu",
+            "MiniChatterV11.sumyu",
+            &description,
+        );
+    } else if test == 17 {
+        //------------------------------------------------------------------------------------------
+        //     CONFIG
+        //------------------------------------------------------------------------------------------
+
+        let config = helper::tinychat_v14_hybrid(1e-3, 512, 1);
+        let description = "A large Sumyu Hybrid model trained on TinyChat.";
+
+        //------------------------------------------------------------------------------------------
+        //     DON'T TOUCH
+        //------------------------------------------------------------------------------------------
+        let mut lm = LM::from_hybrid_config(config);
+
+        lm.set_cosine_lr(
+            0,   // warmup steps
+            340_788, // one full epoch
+            0.1,     // finish at 10% of base LR
+        );
+
+        lm.params();
+        lm.load_dataset_file("Datasets/tinychat_sumyu.json");
+
+        lm.train(
+            Some(1),
+            None,
+            Some("tinychat14/MiniChatterV14"),
+            CheckpointFrequency::EveryBatch(10),
+            None,
+            None,
+            true,
+            4,
+        );
+
+        lm.save(
+            "MiniChatterV14.sumyu",
             &description,
         );
     }

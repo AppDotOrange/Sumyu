@@ -357,15 +357,11 @@ impl Trie {
     }
 
     #[inline]
-    pub(crate) fn tokenize_bytes_u16(
+    pub(crate) fn tokenize_bytes_u16_into(
         &self,
         bytes: &[u8],
-    ) -> Vec<u16> {
-        let mut result =
-            Vec::with_capacity(
-                bytes.len().saturating_div(2),
-            );
-
+        result: &mut Vec<u16>,
+    ) {
         let mut pos = 0usize;
 
         while pos < bytes.len() {
@@ -415,6 +411,22 @@ impl Trie {
                 pos += best_len;
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn tokenize_bytes_u16(
+        &self,
+        bytes: &[u8],
+    ) -> Vec<u16> {
+        let mut result =
+            Vec::with_capacity(
+                bytes.len().saturating_div(2),
+            );
+
+        self.tokenize_bytes_u16_into(
+            bytes,
+            &mut result,
+        );
 
         result
     }
@@ -1085,6 +1097,108 @@ impl<'a> IncrementalTokenizer<'a> {
             padded.extend(ids);
 
             ids = padded;
+        }
+
+        ids
+    }
+
+    pub(crate) fn current_ids_u16_unpadded(
+        &self,
+        context_len: usize,
+    ) -> Vec<u16> {
+        assert!(
+            context_len > 0,
+            "Context length must be greater than zero"
+        );
+
+        let pending_ids =
+            self.trie
+                .tokenize_bytes(
+                    &self.pending,
+                );
+
+        let total_len =
+            self.stable_tokens.len()
+                + pending_ids.len();
+
+        if total_len <= context_len {
+            let mut ids =
+                Vec::<u16>::with_capacity(
+                    total_len
+                );
+
+            ids.extend(
+                self.stable_tokens
+                    .iter()
+                    .map(
+                        |&x|
+                            x as u16
+                    ),
+            );
+
+            ids.extend(
+                pending_ids
+                    .into_iter()
+                    .map(
+                        |x|
+                            x as u16
+                    ),
+            );
+
+            return ids;
+        }
+
+        let keep_stable =
+            context_len
+                .saturating_sub(
+                    pending_ids.len()
+                );
+
+        let stable_start =
+            self.stable_tokens.len()
+                .saturating_sub(
+                    keep_stable
+                );
+
+        let mut ids =
+            Vec::<u16>::with_capacity(
+                context_len
+            );
+
+        ids.extend(
+            self.stable_tokens[
+                stable_start..
+                ]
+                .iter()
+                .map(
+                    |&x|
+                        x as u16
+                ),
+        );
+
+        if ids.len()
+            < context_len
+        {
+            let pending_keep =
+                context_len
+                    - ids.len();
+
+            let pending_start =
+                pending_ids.len()
+                    .saturating_sub(
+                        pending_keep
+                    );
+
+            ids.extend(
+                pending_ids[
+                    pending_start..
+                    ]
+                    .iter()
+                    .map(
+                        |&x|
+                            x as u16
+                    ),
+            );
         }
 
         ids

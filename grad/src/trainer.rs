@@ -1,20 +1,28 @@
+use std::borrow::Cow;
+use std::fmt;
 use std::io::{self, Write};
+use std::ops::Range;
+use std::path::Path;
+use serde_json;
+use serde::de::{
+    DeserializeSeed,
+    IgnoredAny,
+    MapAccess,
+    SeqAccess,
+    Visitor,
+};
 use std::sync::{
-    atomic::{
-        AtomicBool,
-        Ordering,
-    },
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{
     Duration,
     Instant,
 };
-
 use rand::prelude::SliceRandom;
-
-use crate::batched::softmax_cross_entropy_batch;
+use serde::Deserializer;
 use crate::embeddings::Embeddings;
+use crate::forwards::weight_tying_softmax_cross_entropy_tiled;
 use crate::neuron::MLP;
 
 // ============================================================================
@@ -345,12 +353,535 @@ pub struct CheckpointState {
     pub(crate) adam_step: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum LrSchedule {
+    /// No scheduling. LR stays at Trainer::lr.
+    Constant,
+
+    /// Linear warmup followed by cosine decay.
+    ///
+    /// `total_steps` includes warmup.
+    ///
+    /// Example:
+    ///     warmup_steps = 1000
+    ///     total_steps  = 340_788
+    ///     min_lr_ratio = 0.1
+    ///
+    /// means:
+    ///   step 1      -> ~0.1% of base LR
+    ///   step 1000   -> 100% of base LR
+    ///   step 340788 -> 10% of base LR
+    Cosine {
+        warmup_steps: u64,
+        total_steps: u64,
+        min_lr_ratio: f32,
+    },
+}
+
+// ============================================================================
+// Optional LM loss masking
+// ============================================================================
+
+/// Sorted, non-overlapping global token ranges whose target tokens
+/// are allowed to contribute to the LM loss.
+///
+/// Ranges are half-open: [start, end).
+///
+/// IMPORTANT:
+/// These ranges refer to TARGET token positions in `tokens`, not input
+/// positions. If tokens[100] is predicted from tokens[99], then selecting
+/// target position 100 means the prediction at input position 99 is trained.
+#[derive(Debug, Clone)]
+pub struct LmLossMask {
+    ranges: Vec<Range<usize>>,
+}
+
+impl LmLossMask {
+    pub fn new(
+        mut ranges: Vec<Range<usize>>,
+    ) -> Self {
+        ranges.retain(|range| {
+            range.start < range.end
+        });
+
+        ranges.sort_unstable_by_key(
+            |range| range.start
+        );
+
+        // Merge overlapping / adjacent ranges.
+        let mut merged =
+            Vec::<Range<usize>>::with_capacity(
+                ranges.len()
+            );
+
+        for range in ranges {
+            if let Some(last) =
+                merged.last_mut()
+            {
+                if range.start <= last.end {
+                    last.end =
+                        last.end.max(
+                            range.end
+                        );
+
+                    continue;
+                }
+            }
+
+            merged.push(range);
+        }
+
+        Self {
+            ranges: merged,
+        }
+    }
+
+    #[inline]
+    pub fn ranges(
+        &self,
+    ) -> &[Range<usize>] {
+        &self.ranges
+    }
+
+    /// Writes masked targets for one training sample.
+    ///
+    /// `sample` is the input-token starting position.
+    ///
+    /// The real target range is:
+    ///
+    ///     [sample + 1, sample + 1 + actual_context_len)
+    ///
+    /// Everything is initially IGNORE_TARGET, then only selected target
+    /// positions are copied from `tokens`.
+    #[inline]
+    fn write_targets(
+        &self,
+        targets: &mut Vec<u16>,
+        tokens: &[u16],
+        sample: usize,
+        actual_context_len: usize,
+        ignore_target: u16,
+    ) {
+        let target_start =
+            sample + 1;
+
+        let target_end =
+            target_start
+                + actual_context_len;
+
+        let output_start =
+            targets.len();
+
+        targets.resize(
+            output_start
+                + actual_context_len,
+            ignore_target,
+        );
+
+        // Find the first range that could overlap this target window.
+        //
+        // Because `ranges` is sorted and merged, every range before this
+        // point is guaranteed to end before the current window.
+        let mut left = 0usize;
+        let mut right =
+            self.ranges.len();
+
+        while left < right {
+            let mid =
+                left + (right - left) / 2;
+
+            if self.ranges[mid].end
+                <= target_start
+            {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        // Copy only selected target spans.
+        for range
+        in &self.ranges[left..]
+        {
+            if range.start
+                >= target_end
+            {
+                break;
+            }
+
+            let copy_start =
+                range.start
+                    .max(target_start);
+
+            let copy_end =
+                range.end
+                    .min(target_end);
+
+            if copy_start >= copy_end {
+                continue;
+            }
+
+            let source =
+                copy_start
+                    ..copy_end;
+
+            let destination_start =
+                output_start
+                    + (
+                    copy_start
+                        - target_start
+                );
+
+            let destination_end =
+                destination_start
+                    + source.len();
+
+            targets[
+                destination_start
+                    ..destination_end
+                ]
+                .copy_from_slice(
+                    &tokens[source]
+                );
+        }
+    }
+}
+
+// ============================================================================
+// Streaming JSON LM dataset
+// ============================================================================
+
+#[derive(Debug)]
+pub struct JsonLmDataset {
+    pub tokens: Vec<u16>,
+    pub loss_mask: LmLossMask,
+}
+
+struct JsonBuildState<F> {
+    tokens: Vec<u16>,
+    ranges: Vec<Range<usize>>,
+    train_on: Vec<String>,
+    tokenizer: F,
+}
+
+struct TurnsSeed<'a, F> {
+    state: &'a mut JsonBuildState<F>,
+}
+
+struct TurnSeed<'a, F> {
+    state: &'a mut JsonBuildState<F>,
+}
+
+impl<'de, F> DeserializeSeed<'de>
+for TurnsSeed<'_, F>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    type Value = ();
+
+    fn deserialize<D>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TurnsVisitor<'a, F> {
+            state: &'a mut JsonBuildState<F>,
+        }
+
+        impl<'de, 'a, F> Visitor<'de>
+        for TurnsVisitor<'a, F>
+        where
+            F: FnMut(&str, &mut Vec<u16>),
+        {
+            type Value = ();
+
+            fn expecting(
+                &self,
+                formatter: &mut fmt::Formatter,
+            ) -> fmt::Result {
+                formatter.write_str(
+                    "an array of turn objects"
+                )
+            }
+
+            fn visit_seq<A>(
+                self,
+                mut seq: A,
+            ) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq
+                    .next_element_seed(
+                        TurnSeed {
+                            state: self.state,
+                        }
+                    )?
+                    .is_some()
+                {}
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(
+            TurnsVisitor {
+                state: self.state,
+            }
+        )
+    }
+}
+
+impl<'de, F> DeserializeSeed<'de>
+for TurnSeed<'_, F>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    type Value = ();
+
+    fn deserialize<D>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TurnVisitor<'a, F> {
+            state: &'a mut JsonBuildState<F>,
+        }
+
+        impl<'de, 'a, F> Visitor<'de>
+        for TurnVisitor<'a, F>
+        where
+            F: FnMut(&str, &mut Vec<u16>),
+        {
+            type Value = ();
+
+            fn expecting(
+                &self,
+                formatter: &mut fmt::Formatter,
+            ) -> fmt::Result {
+                formatter.write_str(
+                    "a turn object"
+                )
+            }
+
+            fn visit_map<M>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut role:
+                    Option<Cow<'de, str>> = None;
+
+                let mut text:
+                    Option<Cow<'de, str>> = None;
+
+                while let Some(key) =
+                    map.next_key::<Cow<'de, str>>()?
+                {
+                    match key.as_ref() {
+                        "role" => {
+                            role =
+                                Some(
+                                    map.next_value::<Cow<'de, str>>()?
+                                );
+                        }
+
+                        "text" => {
+                            text =
+                                Some(
+                                    map.next_value::<Cow<'de, str>>()?
+                                );
+                        }
+
+                        _ => {
+                            let _: IgnoredAny =
+                                map.next_value()?;
+                        }
+                    }
+                }
+
+                let role =
+                    role.ok_or_else(|| {
+                        serde::de::Error::missing_field(
+                            "role"
+                        )
+                    })?;
+
+                let text =
+                    text.ok_or_else(|| {
+                        serde::de::Error::missing_field(
+                            "text"
+                        )
+                    })?;
+
+                let selected =
+                    self.state
+                        .train_on
+                        .iter()
+                        .any(|wanted|
+                            wanted.as_str()
+                                == role.as_ref()
+                        );
+
+                let start =
+                    self.state.tokens.len();
+
+                // IMPORTANT:
+                // Tokenize directly into the final dataset buffer.
+                // No temporary Vec<u16>, and no second copy.
+                (self.state.tokenizer)(
+                    text.as_ref(),
+                    &mut self.state.tokens,
+                );
+
+                let end =
+                    self.state.tokens.len();
+
+                if selected && start < end {
+                    self.state
+                        .ranges
+                        .push(start..end);
+                }
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_map(
+            TurnVisitor {
+                state: self.state,
+            }
+        )
+    }
+}
+
+struct DatasetJsonVisitor<F> {
+    state: JsonBuildState<F>,
+}
+
+impl<'de, F> Visitor<'de>
+for DatasetJsonVisitor<F>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    type Value = JsonLmDataset;
+
+    fn expecting(
+        &self,
+        formatter: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        formatter.write_str(
+            "a JSON LM dataset"
+        )
+    }
+
+    fn visit_map<A>(
+        mut self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while let Some(key) =
+            map.next_key::<Cow<'de, str>>()?
+        {
+            match key.as_ref() {
+                "train_on" => {
+                    self.state.train_on =
+                        map.next_value()?;
+                }
+
+                "turns" => {
+                    map.next_value_seed(
+                        TurnsSeed {
+                            state:
+                            &mut self.state,
+                        }
+                    )?;
+                }
+
+                _ => {
+                    let _: IgnoredAny =
+                        map.next_value()?;
+                }
+            }
+        }
+
+        let loss_mask =
+            LmLossMask::new(
+                std::mem::take(
+                    &mut self.state.ranges
+                )
+            );
+
+        Ok(JsonLmDataset {
+            tokens:
+            std::mem::take(
+                &mut self.state.tokens
+            ),
+
+            loss_mask,
+        })
+    }
+}
+
+pub fn load_masked_json_lm_dataset<F>(
+    path: impl AsRef<Path>,
+    initial_capacity: usize,
+    tokenizer: F,
+) -> Result<
+    JsonLmDataset,
+    Box<dyn std::error::Error>,
+>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    let json =
+        std::fs::read(path)?;
+
+    let state =
+        JsonBuildState {
+            tokens:
+            Vec::with_capacity(
+                initial_capacity
+            ),
+
+            ranges:
+            Vec::new(),
+
+            train_on:
+            Vec::new(),
+
+            tokenizer,
+        };
+
+    let mut deserializer =
+        serde_json::Deserializer::from_slice(
+            &json
+        );
+
+    Ok(
+        deserializer.deserialize_map(
+            DatasetJsonVisitor {
+                state,
+            }
+        )?
+    )
+}
+
 // ============================================================================
 // Trainer
 // ============================================================================
 
 pub struct Trainer {
     lr: f32,
+    lr_schedule: LrSchedule,
     epochs: usize,
     batch_size: usize,
     max_batches_per_epoch: usize,
@@ -365,10 +896,20 @@ impl Trainer {
     ) -> Self {
         Self {
             lr,
+            lr_schedule: LrSchedule::Constant,
+
             epochs,
             batch_size: batch_size.max(1),
             max_batches_per_epoch,
         }
+    }
+
+    pub fn reinit_lr_schedule(
+        &mut self,
+        schedule: LrSchedule,
+    ) {
+        self.lr_schedule =
+            schedule;
     }
 
     pub fn reinit_lr(
@@ -401,6 +942,96 @@ impl Trainer {
     ) {
         self.max_batches_per_epoch =
             max_batches_per_epoch;
+    }
+
+    #[inline]
+    fn lr_for_step(
+        &self,
+        step: u64,
+    ) -> f32 {
+        let base_lr =
+            self.lr.max(0.0);
+
+        match self.lr_schedule {
+            LrSchedule::Constant => {
+                base_lr
+            }
+
+            LrSchedule::Cosine {
+                warmup_steps,
+                total_steps,
+                min_lr_ratio,
+            } => {
+                let min_lr_ratio =
+                    min_lr_ratio
+                        .clamp(0.0, 1.0);
+
+                let min_lr =
+                    base_lr
+                        * min_lr_ratio;
+
+                // -----------------------------------------------------
+                // Warmup
+                // -----------------------------------------------------
+
+                if warmup_steps > 0
+                    && step <= warmup_steps
+                {
+                    return base_lr
+                        * (
+                        step as f32
+                            / warmup_steps
+                            as f32
+                    );
+                }
+
+                // -----------------------------------------------------
+                // Cosine decay
+                // -----------------------------------------------------
+
+                if total_steps
+                    <= warmup_steps
+                {
+                    return min_lr;
+                }
+
+                let decay_steps =
+                    total_steps
+                        - warmup_steps;
+
+                let decay_step =
+                    step
+                        .saturating_sub(
+                            warmup_steps
+                        );
+
+                let progress =
+                    (
+                        decay_step
+                            as f32
+                            / decay_steps
+                            as f32
+                    )
+                        .clamp(0.0, 1.0);
+
+                let cosine =
+                    0.5
+                        * (
+                        1.0
+                            + (
+                            std::f32::consts::PI
+                                * progress
+                        ).cos()
+                    );
+
+                min_lr
+                    + (
+                    base_lr
+                        - min_lr
+                )
+                    * cosine
+            }
+        }
     }
 
     // ========================================================================
@@ -438,22 +1069,15 @@ impl Trainer {
                 "Error setting Ctrl+C handler"
             );
 
-        let data_len =
-            dataset.len();
+        let data_len = dataset.len();
 
         if data_len == 0 {
-            println!(
-                "Dataset is empty!"
-            );
-
+            println!("Dataset is empty!");
             return TrainResult::Finished;
         }
 
         if self.batch_size > data_len {
-            println!(
-                "Batch size too high! Quitting..."
-            );
-
+            println!("Batch size too high! Quitting...");
             return TrainResult::Finished;
         }
 
@@ -790,6 +1414,7 @@ impl Trainer {
         tokens: &[u16],
         context_len: usize,
         embeddings: &Embeddings,
+        loss_mask: Option<&LmLossMask>,
         sampler_seed: u64,
         threads: usize,
     ) -> TrainResult {
@@ -797,7 +1422,7 @@ impl Trainer {
         const ADAM_BETA2: f32 = 0.999;
         const ADAM_EPSILON: f32 = 1.0e-8;
         const MAX_GRAD_NORM: f64 = 1.0;
-        const PAD_ID: u16 = 0;
+        const IGNORE_TARGET: u16 = u16::MAX;
 
         // =============================================================
         // Ctrl+C
@@ -829,6 +1454,25 @@ impl Trainer {
             tokens
                 .len()
                 .saturating_sub(context_len);
+
+        if let Some(mask) =
+            loss_mask
+        {
+            for range in mask.ranges() {
+                assert!(
+                    range.end <= tokens.len(),
+                    "LM loss-mask range {:?} exceeds token dataset length {}",
+                    range,
+                    tokens.len(),
+                );
+
+                assert!(
+                    range.start < range.end,
+                    "LM loss-mask range must be non-empty: {:?}",
+                    range,
+                );
+            }
+        }
 
         if data_len == 0 {
             println!(
@@ -863,9 +1507,8 @@ impl Trainer {
             parameter_count
         );
 
-        let input_size =
-            context_len
-                * embeddings.embedding_dim();
+        let embedding_dim =
+            embeddings.embedding_dim();
 
         // =============================================================
         // Optimizer state
@@ -1063,15 +1706,35 @@ impl Trainer {
         let mut targets =
             Vec::<u16>::with_capacity(
                 self.batch_size
+                    * context_len
             );
 
         let mut batch_input =
             Vec::<f32>::with_capacity(
                 self.batch_size
-                    * input_size
+                    * context_len
+                    * embedding_dim
             );
 
-        let mut output_grads =
+        let mut hidden_grads =
+            Vec::<f32>::new();
+
+        let mut embedding_output_grads =
+            Vec::<f32>::new();
+
+        let mut tied_row_max =
+            Vec::<f32>::new();
+
+        let mut tied_row_sum =
+            Vec::<f32>::new();
+
+        let mut tied_target_logits =
+            Vec::<f32>::new();
+
+        let mut tied_tile_logits =
+            Vec::<f32>::new();
+
+        let mut tied_tile_embedding_grads =
             Vec::<f32>::new();
 
         // =============================================================
@@ -1132,6 +1795,9 @@ impl Trainer {
             let mut total_loss =
                 0.0f32;
 
+            let mut total_valid_targets =
+                0usize;
+
             let mut grad_sum =
                 0.0f32;
 
@@ -1144,7 +1810,7 @@ impl Trainer {
                 Duration::ZERO;
 
             #[cfg(feature = "timing")]
-            let mut loss_time =
+            let mut tied_head_time =
                 Duration::ZERO;
 
             #[cfg(feature = "timing")]
@@ -1175,9 +1841,41 @@ impl Trainer {
                     data_len - count;
 
                 let current_batch =
-                    self.batch_size.min(
-                        remaining
-                    );
+                    self.batch_size
+                        .min(remaining);
+
+                // -----------------------------------------------------
+                // Choose ONE context length for the whole batch.
+                //
+                // This is the key change:
+                //
+                // batch 1 -> e.g. 37 tokens
+                // batch 2 -> e.g. 11 tokens
+                // batch 3 -> e.g. 128 tokens
+                //
+                // Every sample inside a batch has the same length, so
+                // the batch remains rectangular and no PAD token exists.
+                // -----------------------------------------------------
+
+                let batch_context_len =
+                    if variable_context {
+                        let first_sample =
+                            sampler.index(
+                                count
+                            );
+
+                        derive_context_len(
+                            first_sample,
+                            epoch,
+                            context_len,
+                        )
+                    } else {
+                        context_len
+                    };
+
+                let input_size =
+                    batch_context_len
+                        * embedding_dim;
 
                 // -----------------------------------------------------
                 // Build token batch
@@ -1187,49 +1885,60 @@ impl Trainer {
                 targets.clear();
 
                 for batch_index
-                in 0..current_batch {
+                in 0..current_batch
+                {
                     let sample =
                         sampler.index(
                             count
                                 + batch_index
                         );
 
-                    let actual_context_len =
-                        if variable_context {
-                            derive_context_len(
-                                sample,
-                                epoch,
-                                context_len,
-                            )
-                        } else {
-                            context_len
-                        };
-
-                    let pad_len =
-                        context_len
-                            - actual_context_len;
-
-                    batch_ids.extend(
-                        std::iter::repeat_n(
-                            PAD_ID,
-                            pad_len,
-                        )
-                    );
+                    // -------------------------------------------------
+                    // Inputs:
+                    //
+                    // [token0 token1 ... tokenN]
+                    //
+                    // No PAD.
+                    // -------------------------------------------------
 
                     batch_ids.extend_from_slice(
                         &tokens[
                             sample
                                 ..sample
-                                + actual_context_len
+                                + batch_context_len
                             ]
                     );
 
-                    targets.push(
-                        tokens[
-                            sample
-                                + actual_context_len
-                            ]
-                    );
+                    // -------------------------------------------------
+                    // Targets:
+                    //
+                    // [token1 token2 ... tokenN+1]
+                    //
+                    // Or IGNORE_TARGET for masked positions.
+                    // -------------------------------------------------
+
+                    match loss_mask {
+                        None => {
+                            targets.extend_from_slice(
+                                &tokens[
+                                    sample + 1
+                                        ..sample
+                                        + batch_context_len
+                                        + 1
+                                    ]
+                            );
+                        }
+
+                        Some(mask) => {
+                            mask.write_targets(
+                                &mut targets,
+                                tokens,
+                                sample,
+                                batch_context_len,
+                                IGNORE_TARGET,
+                            );
+                        }
+                    }
                 }
 
                 // -----------------------------------------------------
@@ -1244,7 +1953,7 @@ impl Trainer {
                     &mlp.params,
                     &batch_ids,
                     current_batch,
-                    context_len,
+                    batch_context_len,
                     &mut batch_input,
                 );
 
@@ -1255,7 +1964,7 @@ impl Trainer {
                 }
 
                 // -----------------------------------------------------
-                // Forward
+                // Forward: backbone only
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -1263,7 +1972,7 @@ impl Trainer {
                     Instant::now();
 
                 let forward =
-                    mlp.forward_batch(
+                    mlp.forward_lm_batch(
                         &batch_input,
                         current_batch,
                         input_size,
@@ -1275,65 +1984,236 @@ impl Trainer {
                         timer.elapsed();
                 }
 
-                let output_size =
-                    forward.output_size;
+                // -----------------------------------------------------
+                // Tiled tied vocabulary head
+                // -----------------------------------------------------
 
-                let grad_len =
+                let positions =
+                    batch_context_len;
+
+                let vocab_size =
+                    embeddings.vocab_size();
+
+                let rows =
                     current_batch
-                        * output_size;
+                        * positions;
 
-                if output_grads.len()
-                    != grad_len
-                {
-                    output_grads.resize(
-                        grad_len,
-                        0.0,
-                    );
-                } else {
-                    output_grads.fill(
-                        0.0
-                    );
-                }
+                debug_assert_eq!(
+                    batch_ids.len(),
+                    rows
+                );
 
-                // -----------------------------------------------------
-                // Softmax cross entropy
-                // -----------------------------------------------------
+                debug_assert_eq!(
+                    targets.len(),
+                    rows
+                );
+
+                debug_assert_eq!(
+                    forward.output.len(),
+                    rows * embedding_dim
+                );
+
+                debug_assert_eq!(
+                    forward.output_size,
+                    positions * embedding_dim,
+                    "LM backbone must end at positions × embedding_dim"
+                );
 
                 #[cfg(feature = "timing")]
                 let timer =
                     Instant::now();
 
-                let batch_loss =
-                    softmax_cross_entropy_batch(
+                let (
+                    batch_loss,
+                    valid_count,
+                ) =
+                    weight_tying_softmax_cross_entropy_tiled(
                         &forward.output,
                         &targets,
-                        &mut output_grads,
+
+                        &mut hidden_grads,
+                        &mut embedding_output_grads,
+
+                        &mut tied_row_max,
+                        &mut tied_row_sum,
+                        &mut tied_target_logits,
+
+                        &mut tied_tile_logits,
+                        &mut tied_tile_embedding_grads,
+
                         current_batch,
-                        output_size,
+                        positions,
+                        embedding_dim,
+                        vocab_size,
+
+                        mlp.params.values(
+                            embeddings.parameter_range()
+                        ),
+
+                        IGNORE_TARGET,
                     );
 
                 #[cfg(feature = "timing")]
                 {
-                    loss_time +=
+                    tied_head_time +=
                         timer.elapsed();
                 }
 
                 if !batch_loss.is_finite() {
-                    println!(
-                        "Non-finite batch loss detected. \
-                     Stopping training."
-                    );
+                    println!("Invalid batch loss. Stopping training.");
+                    mlp.params.zero_grads();
+                    return TrainResult::Finished;
+                }
 
+                // -----------------------------------------------------
+                // Empty masked batch
+                // -----------------------------------------------------
+
+                if valid_count == 0 {
                     mlp.params.zero_grads();
 
-                    return TrainResult::Finished;
+                    count +=
+                        current_batch;
+
+                    batches_done +=
+                        1;
+
+                    if let Some(frequency) =
+                        batch_update_frequency
+                    {
+                        if frequency > 0
+                            && batches_done
+                            % frequency
+                            == 0
+                        {
+                            println!(
+                                "Epoch {} | Batch {}/{} | \
+                 masked batch: 0 valid targets, skipped",
+                                epoch,
+                                batches_done,
+                                total_batches,
+                            );
+                        }
+                    }
+
+                    if interrupt_requested.load(
+                        Ordering::SeqCst
+                    ) {
+                        println!();
+                        println!("Ctrl+C received. Current batch has finished.");
+                        emit_checkpoint(
+                            &mut savefn,
+                            CheckpointKind::Batch,
+                            epoch,
+                            batches_done,
+                            count,
+                            sampler_seed,
+                            data_len,
+                            self.lr,
+                            best_loss,
+                            plateau_count,
+                            &adam_first_moments,
+                            &adam_second_moments,
+                            adam_step,
+                            mlp,
+                            embeddings,
+                        );
+
+                        loop {
+                            print!("Exit training? [y/N]: ");
+                            io::stdout().flush().ok();
+
+                            let mut input =
+                                String::new();
+
+                            match io::stdin()
+                                .read_line(
+                                    &mut input
+                                )
+                            {
+                                Ok(_) => {
+                                    match input
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                        .as_str()
+                                    {
+                                        "y" | "yes" => {
+                                            println!(
+                                                "Training interrupted."
+                                            );
+
+                                            return TrainResult::Interrupted;
+                                        }
+
+                                        "" | "n" | "no" => {
+                                            interrupt_requested
+                                                .store(
+                                                    false,
+                                                    Ordering::SeqCst,
+                                                );
+
+                                            println!(
+                                                "Resuming training..."
+                                            );
+
+                                            break;
+                                        }
+
+                                        _ => println!(
+                                            "Please enter Y or N."
+                                        ),
+                                    }
+                                }
+
+                                Err(_) => {
+                                    println!(
+                                        "Could not read input. \
+                         Exiting training."
+                                    );
+
+                                    return TrainResult::Interrupted;
+                                }
+                            }
+                        }
+                    }
+
+                    continue;
                 }
 
                 total_loss +=
                     batch_loss;
 
+                total_valid_targets +=
+                    valid_count;
+
                 // -----------------------------------------------------
-                // Backward
+                // Add tied-output embedding gradients
+                // -----------------------------------------------------
+
+                {
+                    let embedding_range =
+                        embeddings.parameter_range();
+
+                    let embedding_grads =
+                        mlp.params.grads_mut(
+                            embedding_range
+                        );
+
+                    debug_assert_eq!(
+                        embedding_grads.len(),
+                        embedding_output_grads.len()
+                    );
+
+                    for i in
+                        0..embedding_grads.len()
+                    {
+                        embedding_grads[i] +=
+                            embedding_output_grads[i];
+                    }
+                }
+
+                // -----------------------------------------------------
+                // Backward through backbone
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -1341,9 +2221,9 @@ impl Trainer {
                     Instant::now();
 
                 let input_grads =
-                    mlp.backward_batch(
+                    mlp.backward_lm_batch(
                         &forward,
-                        &output_grads,
+                        &hidden_grads,
                     );
 
                 #[cfg(feature = "timing")]
@@ -1353,7 +2233,7 @@ impl Trainer {
                 }
 
                 // -----------------------------------------------------
-                // Embedding gradients
+                // Input embedding gradients
                 // -----------------------------------------------------
 
                 #[cfg(feature = "timing")]
@@ -1365,7 +2245,7 @@ impl Trainer {
                     &batch_ids,
                     &input_grads,
                     current_batch,
-                    context_len,
+                    batch_context_len,
                 );
 
                 #[cfg(feature = "timing")]
@@ -1380,8 +2260,7 @@ impl Trainer {
 
                 let batch_normalization =
                     1.0f32
-                        / current_batch
-                        .max(1) as f32;
+                        / valid_count.max(1) as f32;
 
                 let mut grad_sq_sum =
                     0.0f64;
@@ -1433,14 +2312,23 @@ impl Trainer {
                     };
 
                 grad_sum +=
-                    batch_grad_sum as f32;
+                    batch_grad_sum as f32
+                        * valid_count as f32;
 
                 // -----------------------------------------------------
-                // Adam step
+                // Adam step + LR schedule
                 // -----------------------------------------------------
 
-                adam_step +=
-                    1;
+                let next_adam_step =
+                    adam_step + 1;
+
+                lr =
+                    self.lr_for_step(
+                        next_adam_step
+                    );
+
+                adam_step =
+                    next_adam_step;
 
                 beta1_power *=
                     ADAM_BETA1;
@@ -1561,7 +2449,7 @@ impl Trainer {
                         count,
                         sampler_seed,
                         data_len,
-                        lr,
+                        self.lr,
                         best_loss,
                         plateau_count,
                         &adam_first_moments,
@@ -1613,12 +2501,15 @@ impl Trainer {
                                 1.0
                             };
 
+                        let processed_valid_targets =
+                            total_valid_targets;
+
                         let running_loss =
-                            if processed_samples
+                            if processed_valid_targets
                                 > 0
                             {
                                 total_loss
-                                    / processed_samples
+                                    / processed_valid_targets
                                     as f32
                             } else {
                                 0.0
@@ -1662,7 +2553,7 @@ impl Trainer {
 
                         let batch_avg_loss =
                             batch_loss
-                                / current_batch
+                                / valid_count.max(1)
                                 as f32;
 
                         println!(
@@ -1671,7 +2562,7 @@ impl Trainer {
                          AvgPPL = {:.6}\n\
                          Loss = {:.6} | PPL = {:.6} | \
                          {:.1} samples/s | \
-                         Elapsed: {:.2?} | ETA: {:.2?}",
+                         Elapsed: {:.2?} | ETA: {:.2?} | LR: {}",
                             epoch,
                             batches_done,
                             total_batches,
@@ -1685,7 +2576,61 @@ impl Trainer {
                             samples_per_sec,
                             elapsed,
                             eta,
+                            lr,
                         );
+
+                        #[cfg(feature = "timing")]
+                        {
+                            let elapsed_secs =
+                                elapsed.as_secs_f64();
+
+                            let pct =
+                                |duration: Duration| {
+                                    if elapsed_secs > 0.0 {
+                                        duration.as_secs_f64()
+                                            / elapsed_secs
+                                            * 100.0
+                                    } else {
+                                        0.0
+                                    }
+                                };
+
+                            println!(
+                                "  Encode:          {:>10.3?} ({:>6.2}%)",
+                                encode_time,
+                                pct(encode_time)
+                            );
+
+                            println!(
+                                "  Forward SGEMM:   {:>10.3?} ({:>6.2}%)",
+                                forward_time,
+                                pct(forward_time)
+                            );
+
+                            println!(
+                                "  Tied LM head:    {:>10.3?} ({:>6.2}%)",
+                                tied_head_time,
+                                pct(tied_head_time)
+                            );
+
+                            println!(
+                                "  Backward SGEMM:  {:>10.3?} ({:>6.2}%)",
+                                backward_time,
+                                pct(backward_time)
+                            );
+
+                            println!(
+                                "  Embedding grad:  {:>10.3?} ({:>6.2}%)",
+                                embedding_grad_time,
+                                pct(embedding_grad_time)
+                            );
+
+                            println!(
+                                "  Adam update:     {:>10.3?} ({:>6.2}%)",
+                                update_time,
+                                pct(update_time)
+                            );
+                        }
                     }
                 }
 
@@ -1697,9 +2642,7 @@ impl Trainer {
                     Ordering::SeqCst
                 ) {
                     println!();
-                    println!(
-                        "Ctrl+C received. Current batch has finished."
-                    );
+                    println!("Ctrl+C received. Current batch has finished.");
 
                     emit_checkpoint(
                         &mut savefn,
@@ -1709,7 +2652,7 @@ impl Trainer {
                         count,
                         sampler_seed,
                         data_len,
-                        lr,
+                        self.lr,
                         best_loss,
                         plateau_count,
                         &adam_first_moments,
@@ -1720,13 +2663,8 @@ impl Trainer {
                     );
 
                     loop {
-                        print!(
-                            "Exit training? [y/N]: "
-                        );
-
-                        io::stdout()
-                            .flush()
-                            .ok();
+                        print!("Exit training? [y/N]: ");
+                        io::stdout().flush().ok();
 
                         let mut input =
                             String::new();
@@ -1764,18 +2702,15 @@ impl Trainer {
                                         break;
                                     }
 
-                                    _ => {
-                                        println!(
-                                            "Please enter Y or N."
-                                        );
-                                    }
+                                    _ => println!(
+                                        "Please enter Y or N."
+                                    ),
                                 }
                             }
 
                             Err(_) => {
                                 println!(
-                                    "Could not read input. \
-                                 Exiting training."
+                                    "Could not read input. Exiting training."
                                 );
 
                                 return TrainResult::Interrupted;
@@ -1789,41 +2724,33 @@ impl Trainer {
             // Epoch statistics
             // =========================================================
 
-            let samples =
-                count.saturating_sub(
-                    epoch_start_count
-                ) as f32;
-
-            if samples == 0.0 {
+            if total_valid_targets == 0 {
                 continue;
             }
 
+            let valid_targets =
+                total_valid_targets as f32;
+
             let avg_loss =
                 total_loss
-                    / samples;
+                    / valid_targets;
 
             let perplexity =
                 avg_loss.exp();
 
             let grad_avg =
                 grad_sum
-                    / samples;
+                    / valid_targets;
 
             // ---------------------------------------------------------
             // Best-loss tracking
             // ---------------------------------------------------------
 
-            if avg_loss
-                < best_loss
-            {
-                best_loss =
-                    avg_loss;
-
-                plateau_count =
-                    0;
+            if avg_loss < best_loss {
+                best_loss = avg_loss;
+                plateau_count = 0;
             } else {
-                plateau_count +=
-                    1;
+                plateau_count += 1;
             }
 
             // ---------------------------------------------------------
@@ -1839,8 +2766,7 @@ impl Trainer {
                             && epoch % frequency
                             == 0,
 
-                    _ =>
-                        false,
+                    _ => false,
                 };
 
             if should_checkpoint {
@@ -1852,7 +2778,7 @@ impl Trainer {
                     count,
                     sampler_seed,
                     data_len,
-                    lr,
+                    self.lr,
                     best_loss,
                     plateau_count,
                     &adam_first_moments,
@@ -1871,8 +2797,7 @@ impl Trainer {
                 now.elapsed();
 
             if update_frequency > 0
-                && epoch
-                % update_frequency
+                && epoch % update_frequency
                 == 0
             {
                 let grad_per_param =
@@ -1926,9 +2851,9 @@ impl Trainer {
                     );
 
                     println!(
-                        "  Loss:            {:>10.3?} ({:>6.2}%)",
-                        loss_time,
-                        pct(loss_time)
+                        "  Tied LM head:    {:>10.3?} ({:>6.2}%)",
+                        tied_head_time,
+                        pct(tied_head_time)
                     );
 
                     println!(
@@ -1952,10 +2877,7 @@ impl Trainer {
             }
 
             if grad_avg <= 1e-9 {
-                println!(
-                    "Early stopping, network will not learn anymore!"
-                );
-
+                println!("Early stopping, network will not learn anymore!");
                 return TrainResult::Finished;
             }
         }

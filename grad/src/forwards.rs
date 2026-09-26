@@ -187,590 +187,42 @@ fn activation_bias_simd(
 // ============================================================================
 // Global Mixer
 // ============================================================================
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn global_mixer_aggregate_avx2(
-    input: &[f32],
-    write_probs: &[f32],
-    global_vectors: &mut [f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    unsafe {
-        debug_assert_eq!(
-            input.len(),
-            batch_size
-                * positions
-                * channels
-        );
-
-        debug_assert_eq!(
-            write_probs.len(),
-            batch_size
-                * positions
-                * global_dim
-        );
-
-        debug_assert_eq!(
-            global_vectors.len(),
-            batch_size
-                * global_dim
-                * channels
-        );
-
-        for b in 0..batch_size {
-            let input_base =
-                b
-                    * positions
-                    * channels;
-
-            let probs_base =
-                b
-                    * positions
-                    * global_dim;
-
-            let global_base =
-                b
-                    * global_dim
-                    * channels;
-
-            for g in 0..global_dim {
-                let global_offset =
-                    global_base
-                        + g * channels;
-
-                let mut c =
-                    0usize;
-
-                while c + 8 <= channels {
-                    let mut acc =
-                        _mm256_setzero_ps();
-
-                    for p in 0..positions {
-                        let prob =
-                            *write_probs
-                                .get_unchecked(
-                                    probs_base
-                                        + p * global_dim
-                                        + g,
-                                );
-
-                        let prob_v =
-                            _mm256_set1_ps(
-                                prob
-                            );
-
-                        let x =
-                            _mm256_loadu_ps(
-                                input
-                                    .as_ptr()
-                                    .add(
-                                        input_base
-                                            + p
-                                            * channels
-                                            + c,
-                                    )
-                            );
-
-                        acc =
-                            _mm256_fmadd_ps(
-                                x,
-                                prob_v,
-                                acc,
-                            );
-                    }
-
-                    _mm256_storeu_ps(
-                        global_vectors
-                            .as_mut_ptr()
-                            .add(
-                                global_offset
-                                    + c,
-                            ),
-                        acc,
-                    );
-
-                    c += 8;
-                }
-
-                while c < channels {
-                    let mut sum =
-                        0.0f32;
-
-                    for p in 0..positions {
-                        let prob =
-                            *write_probs
-                                .get_unchecked(
-                                    probs_base
-                                        + p * global_dim
-                                        + g,
-                                );
-
-                        let x =
-                            *input
-                                .get_unchecked(
-                                    input_base
-                                        + p
-                                        * channels
-                                        + c,
-                                );
-
-                        sum +=
-                            prob * x;
-                    }
-
-                    *global_vectors
-                        .get_unchecked_mut(
-                            global_offset
-                                + c,
-                        ) =
-                        sum;
-
-                    c += 1;
-                }
-            }
-        }
-    }
-}
-
-fn global_mixer_aggregate_scalar(
-    input: &[f32],
-    write_probs: &[f32],
-    global_vectors: &mut [f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    for b in 0..batch_size {
-        let input_base =
-            b
-                * positions
-                * channels;
-
-        let probs_base =
-            b
-                * positions
-                * global_dim;
-
-        let global_base =
-            b
-                * global_dim
-                * channels;
-
-        for g in 0..global_dim {
-            let global_offset =
-                global_base
-                    + g * channels;
-
-            for c in 0..channels {
-                let mut sum =
-                    0.0f32;
-
-                for p in 0..positions {
-                    let prob =
-                        write_probs[
-                            probs_base
-                                + p
-                                * global_dim
-                                + g
-                            ];
-
-                    let x =
-                        input[
-                            input_base
-                                + p
-                                * channels
-                                + c
-                            ];
-
-                    sum +=
-                        prob * x;
-                }
-
-                global_vectors[
-                    global_offset + c
-                    ] = sum;
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn global_mixer_readback_avx2(
-    input: &[f32],
-    output: &mut [f32],
-    read_probs: &[f32],
-    global_vectors: &[f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    unsafe {
-        debug_assert_eq!(
-            input.len(),
-            output.len()
-        );
-
-        debug_assert_eq!(
-            read_probs.len(),
-            batch_size
-                * positions
-                * global_dim
-        );
-
-        debug_assert_eq!(
-            global_vectors.len(),
-            batch_size
-                * global_dim
-                * channels
-        );
-
-        output.copy_from_slice(
-            input
-        );
-
-        for b in 0..batch_size {
-            let input_base =
-                b
-                    * positions
-                    * channels;
-
-            let probs_base =
-                b
-                    * positions
-                    * global_dim;
-
-            let global_base =
-                b
-                    * global_dim
-                    * channels;
-
-            for p in 0..positions {
-                let output_offset =
-                    input_base
-                        + p * channels;
-
-                for g in 0..global_dim {
-                    let prob =
-                        *read_probs
-                            .get_unchecked(
-                                probs_base
-                                    + p
-                                    * global_dim
-                                    + g,
-                            );
-
-                    let prob_v =
-                        _mm256_set1_ps(
-                            prob
-                        );
-
-                    let global_offset =
-                        global_base
-                            + g * channels;
-
-                    let mut c =
-                        0usize;
-
-                    while c + 8 <= channels {
-                        let y =
-                            _mm256_loadu_ps(
-                                output
-                                    .as_ptr()
-                                    .add(
-                                        output_offset
-                                            + c,
-                                    )
-                            );
-
-                        let global =
-                            _mm256_loadu_ps(
-                                global_vectors
-                                    .as_ptr()
-                                    .add(
-                                        global_offset
-                                            + c,
-                                    )
-                            );
-
-                        let y =
-                            _mm256_fmadd_ps(
-                                global,
-                                prob_v,
-                                y,
-                            );
-
-                        _mm256_storeu_ps(
-                            output
-                                .as_mut_ptr()
-                                .add(
-                                    output_offset
-                                        + c,
-                                ),
-                            y,
-                        );
-
-                        c += 8;
-                    }
-
-                    while c < channels {
-                        let index =
-                            output_offset
-                                + c;
-
-                        let global_index =
-                            global_offset
-                                + c;
-
-                        *output
-                            .get_unchecked_mut(
-                                index,
-                            ) +=
-                            prob
-                                * *global_vectors
-                                .get_unchecked(
-                                    global_index,
-                                );
-
-                        c += 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn global_mixer_readback_scalar(
-    input: &[f32],
-    output: &mut [f32],
-    read_probs: &[f32],
-    global_vectors: &[f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    output.copy_from_slice(
-        input
-    );
-
-    for b in 0..batch_size {
-        let input_base =
-            b
-                * positions
-                * channels;
-
-        let probs_base =
-            b
-                * positions
-                * global_dim;
-
-        let global_base =
-            b
-                * global_dim
-                * channels;
-
-        for p in 0..positions {
-            let output_offset =
-                input_base
-                    + p * channels;
-
-            for g in 0..global_dim {
-                let prob =
-                    read_probs[
-                        probs_base
-                            + p * global_dim
-                            + g
-                        ];
-
-                let global_offset =
-                    global_base
-                        + g * channels;
-
-                for c in 0..channels {
-                    output[
-                        output_offset + c
-                        ] +=
-                        prob
-                            * global_vectors[
-                            global_offset + c
-                            ];
-                }
-            }
-        }
-    }
-}
-
-fn global_mixer_aggregate(
-    input: &[f32],
-    write_probs: &[f32],
-    global_vectors: &mut [f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    debug_assert_eq!(
-        input.len(),
-        batch_size
-            * positions
-            * channels
-    );
-
-    debug_assert_eq!(
-        write_probs.len(),
-        batch_size
-            * positions
-            * global_dim
-    );
-
-    debug_assert_eq!(
-        global_vectors.len(),
-        batch_size
-            * global_dim
-            * channels
-    );
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            unsafe {
-                global_mixer_aggregate_avx2(
-                    input,
-                    write_probs,
-                    global_vectors,
-                    batch_size,
-                    positions,
-                    channels,
-                    global_dim,
-                );
-            }
-
-            return;
-        }
-    }
-
-    global_mixer_aggregate_scalar(
-        input,
-        write_probs,
-        global_vectors,
-        batch_size,
-        positions,
-        channels,
-        global_dim,
-    );
-}
-
-fn global_mixer_readback(
-    input: &[f32],
-    output: &mut [f32],
-    read_probs: &[f32],
-    global_vectors: &[f32],
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    debug_assert_eq!(
-        input.len(),
-        output.len()
-    );
-
-    debug_assert_eq!(
-        read_probs.len(),
-        batch_size
-            * positions
-            * global_dim
-    );
-
-    debug_assert_eq!(
-        global_vectors.len(),
-        batch_size
-            * global_dim
-            * channels
-    );
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            unsafe {
-                global_mixer_readback_avx2(
-                    input,
-                    output,
-                    read_probs,
-                    global_vectors,
-                    batch_size,
-                    positions,
-                    channels,
-                    global_dim,
-                );
-            }
-
-            return;
-        }
-    }
-
-    global_mixer_readback_scalar(
-        input,
-        output,
-        read_probs,
-        global_vectors,
-        batch_size,
-        positions,
-        channels,
-        global_dim,
-    );
-}
-
-fn global_mixer_softmax_write(
+fn global_mixer_softmax_write_causal(
     values: &mut [f32],
+    scratch_log_norm: &mut [f32],
     biases: &[f32],
     positional_biases: &[f32],
     batch_size: usize,
     positions: usize,
     global_dim: usize,
 ) {
+    debug_assert_eq!(
+        values.len(),
+        batch_size * positions * global_dim
+    );
+
+    debug_assert_eq!(
+        scratch_log_norm.len(),
+        values.len()
+    );
+
     for b in 0..batch_size {
         let base =
-            b
-                * positions
-                * global_dim;
+            b * positions * global_dim;
 
         for g in 0..global_dim {
+            // ------------------------------------------------------------
+            // Pass 1:
+            // Compute log(sum(exp(score[0..=p]))) for every prefix.
+            //
+            // This uses an online log-sum-exp recurrence, so we do not
+            // need O(P^2) work and don't need another large allocation.
+            // ------------------------------------------------------------
+
             let mut max_value =
                 f32::NEG_INFINITY;
 
-            for p in 0..positions {
-                let index =
-                    base
-                        + p * global_dim
-                        + g;
-
-                let value =
-                    values[index]
-                        + biases[g]
-                        + positional_biases[
-                        p * global_dim
-                            + g
-                        ];
-
-                if value > max_value {
-                    max_value =
-                        value;
-                }
-            }
-
-            let mut sum =
+            let mut exp_sum =
                 0.0f32;
 
             for p in 0..positions {
@@ -779,27 +231,39 @@ fn global_mixer_softmax_write(
                         + p * global_dim
                         + g;
 
-                let value =
-                    (
-                        values[index]
-                            + biases[g]
-                            + positional_biases[
-                            p * global_dim
-                                + g
-                            ]
-                            - max_value
-                    )
-                        .exp();
+                let score =
+                    values[index]
+                        + biases[g]
+                        + positional_biases[
+                        p * global_dim + g
+                        ];
 
-                values[index] =
-                    value;
+                if score > max_value {
+                    if max_value.is_finite() {
+                        exp_sum *=
+                            (max_value - score).exp();
+                    } else {
+                        exp_sum = 0.0;
+                    }
 
-                sum +=
-                    value;
+                    max_value =
+                        score;
+
+                    exp_sum += 1.0;
+                } else {
+                    exp_sum +=
+                        (score - max_value).exp();
+                }
+
+                scratch_log_norm[index] =
+                    max_value
+                        + exp_sum.ln();
             }
 
-            let inv_sum =
-                1.0f32 / sum;
+            // ------------------------------------------------------------
+            // Pass 2:
+            // Convert each score into its prefix-normalized probability.
+            // ------------------------------------------------------------
 
             for p in 0..positions {
                 let index =
@@ -807,8 +271,19 @@ fn global_mixer_softmax_write(
                         + p * global_dim
                         + g;
 
-                values[index] *=
-                    inv_sum;
+                let score =
+                    values[index]
+                        + biases[g]
+                        + positional_biases[
+                        p * global_dim + g
+                        ];
+
+                values[index] =
+                    (
+                        score
+                            - scratch_log_norm[index]
+                    )
+                        .exp();
             }
         }
     }
@@ -1046,10 +521,6 @@ pub fn global_mixer_forward(
         global_dim
     );
 
-    let rows =
-        batch_size
-            * positions;
-
     debug_assert_eq!(
         write_positional_weights.len(),
         global_dim
@@ -1061,6 +532,10 @@ pub fn global_mixer_forward(
         global_dim
             * GLOBAL_MIXER_POS_FEATURES
     );
+
+    let rows =
+        batch_size
+            * positions;
 
     let position_features =
         global_mixer_position_features(
@@ -1082,12 +557,7 @@ pub fn global_mixer_forward(
         );
 
     // ------------------------------------------------------------------------
-    // Write projection.
-    //
-    // X       [rows, C]
-    // W_write [G, C]
-    //
-    // X @ W_write^T -> [rows, G]
+    // Write projection
     // ------------------------------------------------------------------------
 
     let mut write_probs =
@@ -1115,8 +585,22 @@ pub fn global_mixer_forward(
         );
     }
 
-    global_mixer_softmax_write(
+    // ------------------------------------------------------------------------
+    // Allocate read_probs early.
+    //
+    // We temporarily use it as scratch space for prefix log-normalizers.
+    // It gets overwritten by the read projection immediately afterward.
+    // ------------------------------------------------------------------------
+
+    let mut read_probs =
+        vec![
+            0.0f32;
+            rows * global_dim
+        ];
+
+    global_mixer_softmax_write_causal(
         &mut write_probs,
+        &mut read_probs,
         write_biases,
         &write_positional_biases,
         batch_size,
@@ -1125,39 +609,8 @@ pub fn global_mixer_forward(
     );
 
     // ------------------------------------------------------------------------
-    // Aggregate global vectors.
+    // Read projection
     // ------------------------------------------------------------------------
-
-    let mut global_vectors =
-        vec![
-            0.0f32;
-            batch_size
-                * global_dim
-                * channels
-        ];
-
-    global_mixer_aggregate(
-        input,
-        &write_probs,
-        &mut global_vectors,
-        batch_size,
-        positions,
-        channels,
-        global_dim,
-    );
-
-    // ------------------------------------------------------------------------
-    // Read projection.
-    //
-    // X @ W_read^T -> [rows, G]
-    // Softmax over G.
-    // ------------------------------------------------------------------------
-
-    let mut read_probs =
-        vec![
-            0.0f32;
-            rows * global_dim
-        ];
 
     unsafe {
         cblas::sgemm(
@@ -1188,22 +641,92 @@ pub fn global_mixer_forward(
     );
 
     // ------------------------------------------------------------------------
-    // Residual readback.
+    // Causal global accumulation + readback.
+    //
+    // G_p = G_{p-1} + write_probs[p] * X_p
+    //
+    // Y_p = X_p + read_probs[p] * G_p
+    //
+    // global_vectors stores only the FINAL prefix state for each batch item.
+    // That is enough for the causal backward pass to reconstruct G_p by
+    // walking backwards.
     // ------------------------------------------------------------------------
 
-    let mut output =
-        vec![0.0f32; input.len()];
+    let mut global_vectors =
+        vec![
+            0.0f32;
+            batch_size
+                * global_dim
+                * channels
+        ];
 
-    global_mixer_readback(
-        input,
-        &mut output,
-        &read_probs,
-        &global_vectors,
-        batch_size,
-        positions,
-        channels,
-        global_dim,
-    );
+    let mut output =
+        input.to_vec();
+
+    for b in 0..batch_size {
+        let input_base =
+            b
+                * positions
+                * channels;
+
+        let probs_base =
+            b
+                * positions
+                * global_dim;
+
+        let global_base =
+            b
+                * global_dim
+                * channels;
+
+        for p in 0..positions {
+            let input_row =
+                input_base
+                    + p * channels;
+
+            let probs_row =
+                probs_base
+                    + p * global_dim;
+
+            for g in 0..global_dim {
+                let write_prob =
+                    write_probs[
+                        probs_row + g
+                        ];
+
+                let global_row =
+                    global_base
+                        + g * channels;
+
+                // Update G_p first, so readback sees the current token.
+                for c in 0..channels {
+                    global_vectors[
+                        global_row + c
+                        ] +=
+                        write_prob
+                            * input[
+                            input_row + c
+                            ];
+                }
+
+                let read_prob =
+                    read_probs[
+                        probs_row + g
+                        ];
+
+                // Read G_p into Y_p.
+                for c in 0..channels {
+                    output[
+                        input_row + c
+                        ] +=
+                        read_prob
+                            * global_vectors[
+                            global_row + c
+                            ];
+                }
+            }
+        }
+    }
 
     (
         output,
@@ -1904,6 +1427,7 @@ pub fn weight_tying_forward(
     params: &ParameterStore,
     input: &[f32],
     batch_size: usize,
+    positions: usize,
 ) -> Vec<f32> {
     let embedding_dim =
         layer.embeddings.embedding_dim();
@@ -1911,9 +1435,12 @@ pub fn weight_tying_forward(
     let vocab_size =
         layer.embeddings.vocab_size();
 
+    let rows =
+        batch_size * positions;
+
     assert_eq!(
         input.len(),
-        batch_size * embedding_dim,
+        rows * embedding_dim,
         "Invalid WeightTying input size"
     );
 
@@ -1927,10 +1454,12 @@ pub fn weight_tying_forward(
         vocab_size * embedding_dim
     );
 
+    // [B * P, E] × [V, E]^T
+    // → [B * P, V]
     let mut output =
         vec![
             0.0;
-            batch_size * vocab_size
+            rows * vocab_size
         ];
 
     unsafe {
@@ -1938,7 +1467,7 @@ pub fn weight_tying_forward(
             Layout::RowMajor,
             Transpose::None,
             Transpose::Ordinary,
-            batch_size as i32,
+            rows as i32,
             vocab_size as i32,
             embedding_dim as i32,
             1.0,
@@ -1953,6 +1482,498 @@ pub fn weight_tying_forward(
     }
 
     output
+}
+
+// ============================================================================
+// Tiled tied-vocabulary softmax cross entropy
+// ============================================================================
+//
+// Training-only LM head.
+//
+// Instead of materializing:
+//
+//     [rows, vocab]
+//
+// this computes the vocabulary projection in tiles and uses an online
+// log-sum-exp recurrence:
+//
+//     logsumexp(x) = max + log(sum(exp(x - max)))
+//
+// The same vocabulary tiles are recomputed for the backward pass.
+//
+// This is analogous to FlashAttention's basic strategy:
+// don't materialize the enormous intermediate matrix.
+//
+// `grad_hidden` receives dLoss/dHidden.
+// `embedding_grads` receives the classifier-side gradient for the tied
+// embedding matrix.
+//
+// Neither output is normalized by valid_count. The trainer performs the
+// same normalization it already uses for the old implementation.
+// ============================================================================
+
+pub const TIED_VOCAB_TILE: usize = 256;
+
+#[inline]
+fn online_softmax_row_update(
+    logits: &[f32],
+    row_max: &mut f32,
+    row_sum: &mut f32,
+) {
+    debug_assert!(!logits.is_empty());
+
+    let mut tile_max =
+        f32::NEG_INFINITY;
+
+    for &x in logits {
+        tile_max =
+            tile_max.max(x);
+    }
+
+    let old_max =
+        *row_max;
+
+    let new_max =
+        old_max.max(tile_max);
+
+    let old_scale =
+        if old_max.is_finite() {
+            (old_max - new_max).exp()
+        } else {
+            0.0
+        };
+
+    let mut tile_sum =
+        0.0f32;
+
+    for &x in logits {
+        tile_sum +=
+            (x - new_max).exp();
+    }
+
+    *row_sum =
+        *row_sum * old_scale
+            + tile_sum;
+
+    *row_max =
+        new_max;
+}
+
+pub fn weight_tying_softmax_cross_entropy_tiled(
+    hidden: &[f32],
+    targets: &[u16],
+
+    grad_hidden: &mut Vec<f32>,
+    embedding_grads: &mut Vec<f32>,
+
+    row_max: &mut Vec<f32>,
+    row_sum: &mut Vec<f32>,
+    target_logits: &mut Vec<f32>,
+
+    tile_logits: &mut Vec<f32>,
+    tile_embedding_grads: &mut Vec<f32>,
+
+    batch_size: usize,
+    positions: usize,
+    embedding_dim: usize,
+    vocab_size: usize,
+    weights: &[f32],
+
+    ignore_index: u16,
+) -> (f32, usize) {
+    debug_assert_eq!(
+        hidden.len(),
+        batch_size
+            * positions
+            * embedding_dim
+    );
+
+    debug_assert_eq!(
+        targets.len(),
+        batch_size * positions
+    );
+
+    debug_assert_eq!(
+        weights.len(),
+        vocab_size * embedding_dim
+    );
+
+    let rows =
+        batch_size * positions;
+
+    // ------------------------------------------------------------------------
+    // Resize reusable buffers.
+    // ------------------------------------------------------------------------
+
+    grad_hidden.resize(
+        rows * embedding_dim,
+        0.0,
+    );
+
+    grad_hidden.fill(0.0);
+
+    embedding_grads.resize(
+        vocab_size * embedding_dim,
+        0.0,
+    );
+
+    embedding_grads.fill(0.0);
+
+    row_max.resize(
+        rows,
+        f32::NEG_INFINITY,
+    );
+
+    row_sum.resize(
+        rows,
+        0.0,
+    );
+
+    target_logits.resize(
+        rows,
+        0.0,
+    );
+
+    row_max.fill(
+        f32::NEG_INFINITY
+    );
+
+    row_sum.fill(0.0);
+
+    target_logits.fill(0.0);
+
+    tile_logits.resize(
+        rows * TIED_VOCAB_TILE,
+        0.0,
+    );
+
+    tile_embedding_grads.resize(
+        TIED_VOCAB_TILE * embedding_dim,
+        0.0,
+    );
+
+    let mut valid_count =
+        0usize;
+
+    for &target in targets {
+        if target != ignore_index {
+            valid_count += 1;
+        }
+    }
+
+    if valid_count == 0 {
+        return (
+            0.0,
+            0,
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // PASS 1
+    //
+    // Compute the exact global softmax normalization without storing all
+    // vocabulary logits.
+    // ------------------------------------------------------------------------
+
+    for vocab_start
+    in (0..vocab_size).step_by(
+        TIED_VOCAB_TILE
+    )
+    {
+        let tile_vocab =
+            (vocab_size - vocab_start)
+                .min(TIED_VOCAB_TILE);
+
+        let tile_logits_len =
+            rows * tile_vocab;
+
+        debug_assert!(
+            tile_logits_len
+                <= tile_logits.len()
+        );
+
+        // [rows, D] × [tile_vocab, D]^T
+        //
+        // -> [rows, tile_vocab]
+        unsafe {
+            cblas::sgemm(
+                Layout::RowMajor,
+                Transpose::None,
+                Transpose::Ordinary,
+                rows as i32,
+                tile_vocab as i32,
+                embedding_dim as i32,
+                1.0,
+                hidden,
+                embedding_dim as i32,
+                &weights[
+                    vocab_start * embedding_dim
+                        ..
+                        (vocab_start + tile_vocab)
+                            * embedding_dim
+                    ],
+                embedding_dim as i32,
+                0.0,
+                &mut tile_logits[
+                    ..tile_logits_len
+                    ],
+                tile_vocab as i32,
+            );
+        }
+
+        for row in 0..rows {
+            let target =
+                targets[row];
+
+            if target == ignore_index {
+                continue;
+            }
+
+            let base =
+                row * tile_vocab;
+
+            online_softmax_row_update(
+                &tile_logits[
+                    base..base + tile_vocab
+                    ],
+                &mut row_max[row],
+                &mut row_sum[row],
+            );
+
+            let target =
+                target as usize;
+
+            if target >= vocab_start
+                && target < vocab_start + tile_vocab
+            {
+                target_logits[row] =
+                    tile_logits[
+                        base
+                            + target
+                            - vocab_start
+                        ];
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Loss.
+    //
+    // CE = logsumexp(logits) - target_logit
+    // ------------------------------------------------------------------------
+
+    let mut total_loss =
+        0.0f32;
+
+    for row in 0..rows {
+        if targets[row] == ignore_index {
+            continue;
+        }
+
+        let logsumexp =
+            row_max[row]
+                + row_sum[row].ln();
+
+        total_loss +=
+            logsumexp
+                - target_logits[row];
+    }
+
+    // ------------------------------------------------------------------------
+    // PASS 2
+    //
+    // Recompute each vocabulary tile.
+    //
+    // tile_logits is immediately overwritten with:
+    //
+    //     softmax(logits) - one_hot(target)
+    //
+    // so no separate dLogits buffer is necessary.
+    // ------------------------------------------------------------------------
+
+    for vocab_start
+    in (0..vocab_size).step_by(
+        TIED_VOCAB_TILE
+    )
+    {
+        let tile_vocab =
+            (vocab_size - vocab_start)
+                .min(TIED_VOCAB_TILE);
+
+        let tile_logits_len =
+            rows * tile_vocab;
+
+        unsafe {
+            cblas::sgemm(
+                Layout::RowMajor,
+                Transpose::None,
+                Transpose::Ordinary,
+                rows as i32,
+                tile_vocab as i32,
+                embedding_dim as i32,
+                1.0,
+                hidden,
+                embedding_dim as i32,
+                &weights[
+                    vocab_start * embedding_dim
+                        ..
+                        (vocab_start + tile_vocab)
+                            * embedding_dim
+                    ],
+                embedding_dim as i32,
+                0.0,
+                &mut tile_logits[
+                    ..tile_logits_len
+                    ],
+                tile_vocab as i32,
+            );
+        }
+
+        // Convert logits into CE gradients in-place.
+        for row in 0..rows {
+            let target =
+                targets[row];
+
+            let base =
+                row * tile_vocab;
+
+            if target == ignore_index {
+                tile_logits[
+                    base..base + tile_vocab
+                    ]
+                    .fill(0.0);
+
+                continue;
+            }
+
+            let inv_sum =
+                1.0f32
+                    / row_sum[row];
+
+            let max_value =
+                row_max[row];
+
+            for c in 0..tile_vocab {
+                tile_logits[
+                    base + c
+                    ] =
+                    (
+                        tile_logits[
+                            base + c
+                            ]
+                            - max_value
+                    )
+                        .exp()
+                        * inv_sum;
+            }
+
+            let target =
+                target as usize;
+
+            if target >= vocab_start
+                && target < vocab_start + tile_vocab
+            {
+                tile_logits[
+                    base
+                        + target
+                        - vocab_start
+                    ] -= 1.0;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // dHidden += dLogits × E_tile
+        //
+        // [rows, tile_vocab] × [tile_vocab, D]
+        //
+        // -> [rows, D]
+        // --------------------------------------------------------------------
+
+        unsafe {
+            cblas::sgemm(
+                Layout::RowMajor,
+                Transpose::None,
+                Transpose::None,
+                rows as i32,
+                embedding_dim as i32,
+                tile_vocab as i32,
+                1.0,
+                &tile_logits[
+                    ..tile_logits_len
+                    ],
+                tile_vocab as i32,
+                &weights[
+                    vocab_start * embedding_dim
+                        ..
+                        (vocab_start + tile_vocab)
+                            * embedding_dim
+                    ],
+                embedding_dim as i32,
+                1.0,
+                grad_hidden,
+                embedding_dim as i32,
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // dEmbedding_tile = dLogitsᵀ × Hidden
+        //
+        // [tile_vocab, rows] × [rows, D]
+        //
+        // -> [tile_vocab, D]
+        // --------------------------------------------------------------------
+
+        let tile_grad_len =
+            tile_vocab
+                * embedding_dim;
+
+        tile_embedding_grads[
+            ..tile_grad_len
+            ]
+            .fill(0.0);
+
+        unsafe {
+            cblas::sgemm(
+                Layout::RowMajor,
+                Transpose::Ordinary,
+                Transpose::None,
+                tile_vocab as i32,
+                embedding_dim as i32,
+                rows as i32,
+                1.0,
+                &tile_logits[
+                    ..tile_logits_len
+                    ],
+                tile_vocab as i32,
+                hidden,
+                embedding_dim as i32,
+                0.0,
+                &mut tile_embedding_grads[
+                    ..tile_grad_len
+                    ],
+                embedding_dim as i32,
+            );
+        }
+
+        let destination =
+            &mut embedding_grads[
+                vocab_start * embedding_dim
+                    ..
+                    (vocab_start + tile_vocab)
+                        * embedding_dim
+                ];
+
+        destination.copy_from_slice(
+            &tile_embedding_grads[
+                ..tile_grad_len
+                ]
+        );
+    }
+
+    (
+        total_loss,
+        valid_count,
+    )
 }
 
 // ============================================================================
@@ -2201,9 +2222,18 @@ fn forward_layer_batch(
         // ====================================================================
 
         Layer::Residual(layer) => {
+            let channels =
+                layer.input_size;
+
+            assert!(
+                channels > 0,
+                "Residual channel count must be > 0"
+            );
+
             assert_eq!(
-                input_size,
-                layer.input_size
+                input_size % channels,
+                0,
+                "Residual channels must divide input size"
             );
 
             let (
@@ -2568,10 +2598,13 @@ fn forward_layer_batch(
                     .vocab_size();
 
             assert_eq!(
-                input_size,
-                embedding_dim,
-                "WeightTying input size must equal embedding dimension"
+                input_size % embedding_dim,
+                0,
+                "WeightTying input size must be divisible by embedding dimension"
             );
+
+            let positions =
+                input_size / embedding_dim;
 
             let output =
                 weight_tying_forward(
@@ -2579,6 +2612,7 @@ fn forward_layer_batch(
                     params,
                     input,
                     batch_size,
+                    positions,
                 );
 
             let cache =
@@ -2589,13 +2623,14 @@ fn forward_layer_batch(
                         &layer.embeddings
                     ),
                     batch_size,
+                    positions,
                     embedding_dim,
                     vocab_size,
                 };
 
             (
                 output,
-                vocab_size,
+                positions * vocab_size,
                 cache,
             )
         }

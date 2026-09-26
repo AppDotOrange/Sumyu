@@ -137,19 +137,26 @@ pub fn print_layer_specs(
     vocab_size: usize,
     indent: usize,
 ) -> (usize, usize) {
-    let prefix = "  ".repeat(indent);
+    let prefix =
+        "  ".repeat(indent);
 
     for (idx, layer) in specs.iter().enumerate() {
         match layer {
+            // ================================================================
+            // Dense
+            // ================================================================
+
             LayerSpec::Dense {
                 output_size,
                 ..
             } => {
                 let input_size =
-                    sequence_length * channels;
+                    sequence_length
+                        * channels;
 
                 let weights =
-                    input_size * output_size;
+                    input_size
+                        * output_size;
 
                 let biases =
                     *output_size;
@@ -172,6 +179,10 @@ pub fn print_layer_specs(
                 channels = *output_size;
             }
 
+            // ================================================================
+            // Conv1D
+            // ================================================================
+
             LayerSpec::Conv1D {
                 in_channels,
                 out_channels,
@@ -189,17 +200,23 @@ pub fn print_layer_specs(
 
                 let output_length =
                     if *causal {
-                        (sequence_length - 1) / stride + 1
+                        (sequence_length - 1)
+                            / *stride
+                            + 1
                     } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
+                        (
+                            sequence_length
+                                + 2 * *padding
+                                - *kernel_size
+                        )
+                            / *stride
                             + 1
                     };
 
                 let weights =
-                    out_channels
-                        * in_channels
-                        * kernel_size;
+                    *out_channels
+                        * *in_channels
+                        * *kernel_size;
 
                 let biases =
                     *out_channels;
@@ -225,9 +242,16 @@ pub fn print_layer_specs(
                     biases
                 );
 
-                sequence_length = output_length;
-                channels = *out_channels;
+                sequence_length =
+                    output_length;
+
+                channels =
+                    *out_channels;
             }
+
+            // ================================================================
+            // Depthwise Conv1D
+            // ================================================================
 
             LayerSpec::DepthwiseConv1D {
                 in_channels,
@@ -245,15 +269,22 @@ pub fn print_layer_specs(
 
                 let output_length =
                     if *causal {
-                        (sequence_length - 1) / stride + 1
+                        (sequence_length - 1)
+                            / *stride
+                            + 1
                     } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
+                        (
+                            sequence_length
+                                + 2 * *padding
+                                - *kernel_size
+                        )
+                            / *stride
                             + 1
                     };
 
                 let weights =
-                    in_channels * kernel_size;
+                    *in_channels
+                        * *kernel_size;
 
                 let biases =
                     *in_channels;
@@ -279,9 +310,16 @@ pub fn print_layer_specs(
                     biases
                 );
 
-                sequence_length = output_length;
-                channels = *in_channels;
+                sequence_length =
+                    output_length;
+
+                channels =
+                    *in_channels;
             }
+
+            // ================================================================
+            // Grouped Conv1D
+            // ================================================================
 
             LayerSpec::GroupedConv1D {
                 in_channels,
@@ -299,22 +337,46 @@ pub fn print_layer_specs(
                     "GroupedConv1D channel mismatch"
                 );
 
+                debug_assert!(
+                    *groups > 0,
+                    "GroupedConv1D groups must be > 0"
+                );
+
+                debug_assert_eq!(
+                    *in_channels % *groups,
+                    0,
+                    "GroupedConv1D in_channels must divide groups"
+                );
+
+                debug_assert_eq!(
+                    *out_channels % *groups,
+                    0,
+                    "GroupedConv1D out_channels must divide groups"
+                );
+
                 let output_length =
                     if *causal {
-                        (sequence_length - 1) / stride + 1
+                        (sequence_length - 1)
+                            / *stride
+                            + 1
                     } else {
-                        (sequence_length + 2 * padding - kernel_size)
-                            / stride
+                        (
+                            sequence_length
+                                + 2 * *padding
+                                - *kernel_size
+                        )
+                            / *stride
                             + 1
                     };
 
                 let group_in =
-                    in_channels / groups;
+                    *in_channels
+                        / *groups;
 
                 let weights =
-                    out_channels
+                    *out_channels
                         * group_in
-                        * kernel_size;
+                        * *kernel_size;
 
                 let biases =
                     *out_channels;
@@ -341,9 +403,16 @@ pub fn print_layer_specs(
                     biases
                 );
 
-                sequence_length = output_length;
-                channels = *out_channels;
+                sequence_length =
+                    output_length;
+
+                channels =
+                    *out_channels;
             }
+
+            // ================================================================
+            // Low-rank pointwise
+            // ================================================================
 
             LayerSpec::LowRankPointwise {
                 in_channels,
@@ -358,13 +427,15 @@ pub fn print_layer_specs(
                 );
 
                 let first_weights =
-                    in_channels * rank;
+                    *in_channels
+                        * *rank;
 
                 let first_biases =
                     *rank;
 
                 let second_weights =
-                    rank * out_channels;
+                    *rank
+                        * *out_channels;
 
                 let second_biases =
                     *out_channels;
@@ -396,11 +467,17 @@ pub fn print_layer_specs(
                     total
                 );
 
-                channels = *out_channels;
+                channels =
+                    *out_channels;
             }
 
+            // ================================================================
+            // ChannelScale
+            // ================================================================
+
             LayerSpec::ChannelScale {
-                channels: scale_channels,
+                channels:
+                scale_channels,
             } => {
                 debug_assert_eq!(
                     channels,
@@ -431,11 +508,17 @@ pub fn print_layer_specs(
                     biases
                 );
 
-                channels = *scale_channels;
+                channels =
+                    *scale_channels;
             }
 
+            // ================================================================
+            // LayerNorm
+            // ================================================================
+
             LayerSpec::LayerNorm {
-                channels: norm_channels,
+                channels:
+                norm_channels,
                 epsilon,
             } => {
                 debug_assert_eq!(
@@ -472,11 +555,17 @@ pub fn print_layer_specs(
                     total
                 );
 
-                channels = *norm_channels;
+                channels =
+                    *norm_channels;
             }
 
+            // ================================================================
+            // Global Mixer
+            // ================================================================
+
             LayerSpec::GlobalMixer {
-                channels: mixer_channels,
+                channels:
+                mixer_channels,
                 global_dim,
             } => {
                 debug_assert_eq!(
@@ -485,16 +574,19 @@ pub fn print_layer_specs(
                     "GlobalMixer channel mismatch"
                 );
 
-                const POSITIONAL_FEATURES: usize = 4;
+                const POSITIONAL_FEATURES:
+                usize = 4;
 
                 let write_weights =
-                    mixer_channels * global_dim;
+                    *mixer_channels
+                        * *global_dim;
 
                 let write_biases =
                     *global_dim;
 
                 let read_weights =
-                    mixer_channels * global_dim;
+                    *mixer_channels
+                        * *global_dim;
 
                 let read_biases =
                     *global_dim;
@@ -553,14 +645,17 @@ pub fn print_layer_specs(
                     total,
                 );
 
-                // GlobalMixer preserves both sequence length
-                // and channel count.
                 channels =
                     *mixer_channels;
             }
 
+            // ================================================================
+            // Residual
+            // ================================================================
+
             LayerSpec::Residual {
-                layers: inner_layers,
+                layers:
+                inner_layers,
             } => {
                 println!(
                     "{}╔══════════════════════════════════   Residual {}",
@@ -568,7 +663,10 @@ pub fn print_layer_specs(
                     idx + 1
                 );
 
-                let (inner_sequence_length, inner_channels) =
+                let (
+                    inner_sequence_length,
+                    inner_channels,
+                ) =
                     print_layer_specs(
                         inner_layers,
                         sequence_length,
@@ -596,26 +694,64 @@ pub fn print_layer_specs(
                 );
             }
 
+            // ================================================================
+            // Weight tying / multi-token prediction head
+            // ================================================================
+
             LayerSpec::WeightTying => {
+                let positions =
+                    sequence_length;
+
+                let logits =
+                    positions
+                        * vocab_size;
+
+                let shared_weights =
+                    vocab_size
+                        * channels;
+
                 println!(
-                    "{}████████████████████████████████   WeightTying {}: [{} × {}] → [{} logits]",
+                    "{}████████████████████████████████   WeightTying {}: [{} × {}] → [{} × {} logits]",
                     prefix,
                     idx + 1,
-                    sequence_length,
+                    positions,
                     channels,
+                    positions,
                     vocab_size,
                 );
 
                 println!(
-                    "{}                                  shared embedding matrix | 0 new params",
-                    prefix
+                    "{}                                  {} positions × {} vocabulary = {} logits",
+                    prefix,
+                    positions,
+                    vocab_size,
+                    logits,
                 );
 
-                sequence_length = 1;
-                channels = vocab_size;
+                println!(
+                    "{}                                  shared embedding matrix: {} params | 0 new params",
+                    prefix,
+                    shared_weights,
+                );
+
+                // MTP preserves one vocabulary distribution per
+                // sequence position.
+                //
+                // Shape:
+                //
+                //   [positions × channels]
+                //        ↓
+                //   [positions × vocab]
+                //
+                // Do NOT collapse sequence_length to 1 here.
+                channels =
+                    vocab_size;
             }
         }
     }
 
-    (sequence_length, channels)
+    (
+        sequence_length,
+        channels,
+    )
 }

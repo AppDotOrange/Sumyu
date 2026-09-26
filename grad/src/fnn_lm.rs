@@ -17,6 +17,8 @@ use crate::trainer::{
     CheckpointFrequency,
     CheckpointKind,
     CheckpointState,
+    LmLossMask,
+    LrSchedule,
     PermutationSampler,
     ResumeState,
     Trainer,
@@ -37,6 +39,7 @@ use serde::{
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
+use std::path::Path;
 
 // ============================================================================
 // Saved model
@@ -53,11 +56,8 @@ use std::sync::Arc;
 /// * hidden_layers: Vec<usize>
 /// * embeddings: SavedEmbeddings
 ///
-/// This struct is serialized into a .sumyu file using serde.
-#[derive(
-    Serialize,
-    Deserialize,
-)]
+/// This struct is serialized into a .sumyu file using serde and bincode.
+#[derive(Serialize, Deserialize)]
 pub struct SavedLM {
     description: String,
     mlp: SavedMLP,
@@ -67,10 +67,7 @@ pub struct SavedLM {
     embeddings: SavedEmbeddings,
 }
 
-#[derive(
-    Serialize,
-    Deserialize,
-)]
+#[derive(Serialize, Deserialize)]
 pub struct SavedCheckpoint {
     pub model: SavedLM,
 
@@ -96,9 +93,7 @@ pub struct SavedCheckpoint {
     pub adam_step: u64,
 }
 
-#[derive(
-    Deserialize,
-)]
+#[derive(Deserialize)]
 pub struct SavedCheckpointV1 {
     pub model: SavedLM,
 
@@ -159,9 +154,7 @@ pub fn tokenize(
     let trie =
         crate::helper::Trie::from_vocab(
             vocab,
-            byte_fallback_base(
-                vocab.to_vec()
-            ),
+            byte_fallback_base(vocab),
         );
 
     trie.tokenize_u32(text)
@@ -177,9 +170,7 @@ pub fn tokenize_u16(
     let trie =
         crate::helper::Trie::from_vocab(
             vocab,
-            byte_fallback_base(
-                vocab.to_vec()
-            ),
+            byte_fallback_base(vocab),
         );
 
     trie.tokenize_bytes_u16(
@@ -188,9 +179,7 @@ pub fn tokenize_u16(
 }
 
 #[inline]
-fn byte_fallback_base(
-    vocab: Vec<String>,
-) -> u32 {
+fn byte_fallback_base(vocab: &[String]) -> u32 {
     let base =
         vocab
             .iter()
@@ -217,7 +206,16 @@ fn byte_fallback_base(
 pub struct LM {
     trainer: Trainer,
     mlp: MLP,
+
+    // Tokenized training dataset.
     dataset: Vec<u16>,
+
+    // Optional loss mask for JSON datasets.
+    //
+    // None = ordinary LM training.
+    // Some(...) = only selected target ranges contribute to loss.
+    dataset_loss_mask: Option<LmLossMask>,
+
     vocab: Vec<String>,
     context_len: u32,
     hidden_layers: Vec<usize>,
@@ -253,7 +251,7 @@ impl LM {
             LayerSpec::Dense {
                 output_size: vocab.len(),
                 activation:
-                crate::neuron::Activation::None,
+                Activation::None,
             }
         );
 
@@ -289,6 +287,7 @@ impl LM {
             trainer,
             mlp,
             dataset: Vec::new(),
+            dataset_loss_mask: None,
             vocab,
             context_len,
             hidden_layers:
@@ -321,8 +320,7 @@ impl LM {
 
         let mlp =
             MLP::from_layers_with_embeddings(
-                context_len as usize
-                    * embedding_dim,
+                embedding_dim,
                 layers,
                 Arc::clone(&embeddings),
                 params,
@@ -340,6 +338,7 @@ impl LM {
             trainer,
             mlp,
             dataset: Vec::new(),
+            dataset_loss_mask: None,
             vocab,
             context_len,
             hidden_layers: Vec::new(),
@@ -408,6 +407,7 @@ impl LM {
             trainer,
             mlp,
             dataset: Vec::new(),
+            dataset_loss_mask: None,
             vocab: config.vocab,
             context_len:
             config.context_len as u32,
@@ -442,8 +442,7 @@ impl LM {
 
         let mlp =
             MLP::from_layers_with_embeddings(
-                config.context_len
-                    * config.emb_dim,
+                config.emb_dim,
                 &config.layer_specs,
                 Arc::clone(&embeddings),
                 params,
@@ -453,6 +452,7 @@ impl LM {
             trainer,
             mlp,
             dataset: Vec::new(),
+            dataset_loss_mask: None,
             vocab: config.vocab,
             context_len:
             config.context_len as u32,
@@ -535,6 +535,7 @@ impl LM {
             trainer,
             mlp,
             dataset: Vec::new(),
+            dataset_loss_mask: None,
             vocab,
             context_len,
             hidden_layers,
@@ -590,6 +591,16 @@ impl LM {
             );
     }
 
+    pub fn set_lr_schedule(
+        &mut self,
+        schedule: LrSchedule,
+    ) {
+        self.trainer
+            .reinit_lr_schedule(
+                schedule
+            );
+    }
+
     pub fn encode_nums(
         &self,
         string: String,
@@ -625,307 +636,7 @@ impl LM {
     // Single-token generation
     // ------------------------------------------------------------------------
 
-    pub fn generate_one_ids(
-        &self,
-        ids: &[u16],
-        temp: f32,
-        _threads: usize,
-    ) -> usize {
-        let input =
-            self.embeddings.encode_batch(
-                &self.mlp.params,
-                ids,
-                1,
-                self.context_len as usize,
-            );
 
-        let forward =
-            self.mlp.forward_batch(
-                &input,
-                1,
-                self.context_len as usize
-                    * self.embeddings.embedding_dim(),
-            );
-
-        let logits =
-            forward.output;
-
-        if temp <= 0.0 {
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(
-                    |a, b| {
-                        a.1.total_cmp(
-                            b.1
-                        )
-                    }
-                )
-                .unwrap()
-                .0;
-        }
-
-        let max_logit =
-            logits
-                .iter()
-                .copied()
-                .fold(
-                    f32::NEG_INFINITY,
-                    f32::max,
-                );
-
-        let exp_logits:
-            Vec<f32> =
-            logits
-                .iter()
-                .map(
-                    |&x| {
-                        (
-                            (x / temp)
-                                - max_logit
-                        )
-                            .exp()
-                    }
-                )
-                .collect();
-
-        let sum_exp:
-            f32 =
-            exp_logits.iter().sum();
-
-        let probs:
-            Vec<f32> =
-            exp_logits
-                .iter()
-                .map(
-                    |&x| {
-                        x / sum_exp
-                    }
-                )
-                .collect();
-
-        let dist =
-            WeightedIndex::new(
-                &probs
-            )
-                .unwrap();
-
-        dist.sample(
-            &mut rng()
-        )
-    }
-
-    pub fn generate_one(
-        &self,
-        context: String,
-        temp: f32,
-        threads: usize,
-    ) -> String {
-        let mut ids =
-            self.encode_nums(
-                context
-            );
-
-        if ids.len()
-            > self.context_len
-            as usize
-        {
-            ids =
-                ids[
-                    ids.len()
-                        - self.context_len
-                        as usize
-                        ..
-                    ]
-                    .to_vec();
-        } else if ids.len()
-            < self.context_len
-            as usize
-        {
-            let num_to_add =
-                self.context_len
-                    as usize
-                    - ids.len();
-
-            let mut new_ids =
-                vec![
-                    0u16;
-                    num_to_add
-                ];
-
-            new_ids.extend(
-                ids
-            );
-
-            ids =
-                new_ids;
-        }
-
-        let idx =
-            self.generate_one_ids(
-                &ids,
-                temp,
-                threads,
-            );
-
-        self.vocab[idx]
-            .clone()
-    }
-
-    pub fn generate_one_distribution(
-        &self,
-        context: String,
-        top_k: usize,
-        threads: usize,
-    ) {
-        let mut ids =
-            self.encode_nums(
-                context
-            );
-
-        if ids.len()
-            > self.context_len
-            as usize
-        {
-            ids =
-                ids[
-                    ids.len()
-                        - self.context_len
-                        as usize
-                        ..
-                    ]
-                    .to_owned();
-        } else if ids.len()
-            < self.context_len
-            as usize
-        {
-            let num_to_add =
-                self.context_len
-                    as usize
-                    - ids.len();
-
-            let mut new_ids =
-                vec![
-                    0u16;
-                    num_to_add
-                ];
-
-            new_ids.extend(
-                ids
-            );
-
-            ids =
-                new_ids;
-        }
-
-        println!(
-            "IDs: {:?}",
-            ids
-        );
-
-        println!(
-            "Split text: {:?}",
-            ids.iter()
-                .map(
-                    |x| {
-                        self.vocab[
-                            *x as usize
-                            ]
-                            .clone()
-                    }
-                )
-                .collect::<Vec<_>>()
-        );
-
-        let input =
-            self.embeddings.encode_batch(
-                &self.mlp.params,
-                &ids,
-                1,
-                self.context_len as usize,
-            );
-
-        let forward =
-            self.mlp.forward_batch(
-                &input,
-                1,
-                self.context_len as usize
-                    * self.embeddings.embedding_dim(),
-            );
-
-        let logits =
-            forward.output;
-
-        let max_logit =
-            logits
-                .iter()
-                .copied()
-                .fold(
-                    f32::NEG_INFINITY,
-                    f32::max,
-                );
-
-        let exp_logits:
-            Vec<f32> =
-            logits
-                .iter()
-                .map(
-                    |&x| {
-                        (x - max_logit).exp()
-                    }
-                )
-                .collect();
-
-        let sum_exp:
-            f32 =
-            exp_logits.iter().sum();
-
-        let probs:
-            Vec<f32> =
-            exp_logits
-                .iter()
-                .map(
-                    |&x| x / sum_exp
-                )
-                .collect();
-
-        let mut newest:
-            Vec<(usize, f32)> =
-            probs
-                .into_iter()
-                .enumerate()
-                .collect();
-
-        newest.sort_by(
-            |a, b| {
-                b.1.total_cmp(
-                    &a.1
-                )
-            }
-        );
-
-        for (
-            idx,
-            prob,
-        ) in newest
-            .iter()
-            .take(
-                top_k.min(
-                    newest.len()
-                )
-            )
-        {
-            println!(
-                "{}- {:.2}%",
-                self.vocab[*idx],
-                prob * 100.0
-            );
-        }
-
-        // Keep the public argument used.
-        let _ =
-            threads;
-    }
 
     // ------------------------------------------------------------------------
     // Generation
@@ -966,6 +677,352 @@ impl LM {
         )
     }
 
+    pub fn generate_one_ids(
+        &self,
+        ids: &[u16],
+        temp: f32,
+        _threads: usize,
+    ) -> usize {
+        assert!(
+            !ids.is_empty(),
+            "Generation input cannot be empty"
+        );
+
+        let positions =
+            ids.len();
+
+        let max_context_len =
+            self.context_len
+                as usize;
+
+        assert!(
+            positions <= max_context_len,
+            "Generation input exceeds maximum context length"
+        );
+
+        let embedding_dim =
+            self.embeddings.embedding_dim();
+
+        let vocab_size =
+            self.vocab.len();
+
+        let input =
+            self.embeddings.encode_batch(
+                &self.mlp.params,
+                ids,
+                1,
+                positions,
+            );
+
+        let forward =
+            self.mlp.forward_batch(
+                &input,
+                1,
+                positions * embedding_dim,
+            );
+
+        debug_assert_eq!(
+            forward.output_size,
+            positions * vocab_size
+        );
+
+        let last_position =
+            positions - 1;
+
+        let logits_start =
+            last_position
+                * vocab_size;
+
+        let logits_end =
+            logits_start
+                + vocab_size;
+
+        let logits =
+            &forward.output[
+                logits_start
+                    ..logits_end
+                ];
+
+        if temp <= 0.0 {
+            return logits
+                .iter()
+                .enumerate()
+                .max_by(
+                    |a, b| {
+                        a.1.total_cmp(
+                            b.1
+                        )
+                    }
+                )
+                .unwrap()
+                .0;
+        }
+
+        let max_logit =
+            logits
+                .iter()
+                .copied()
+                .fold(
+                    f32::NEG_INFINITY,
+                    f32::max,
+                );
+
+        let exp_logits:
+            Vec<f32> =
+            logits
+                .iter()
+                .map(
+                    |&x| {
+                        (
+                            (x - max_logit)
+                                / temp
+                        )
+                            .exp()
+                    }
+                )
+                .collect();
+
+        let sum_exp:
+            f32 =
+            exp_logits
+                .iter()
+                .sum();
+
+        let probs:
+            Vec<f32> =
+            exp_logits
+                .iter()
+                .map(
+                    |&x| {
+                        x / sum_exp
+                    }
+                )
+                .collect();
+
+        let dist =
+            WeightedIndex::new(
+                &probs
+            )
+                .unwrap();
+
+        dist.sample(
+            &mut rng()
+        )
+    }
+
+    pub fn generate_one(
+        &self,
+        context: String,
+        temp: f32,
+        threads: usize,
+    ) -> String {
+        let mut ids =
+            self.encode_nums(
+                context
+            );
+
+        let max_context_len =
+            self.context_len
+                as usize;
+
+        if ids.len()
+            > max_context_len
+        {
+            ids =
+                ids[
+                    ids.len()
+                        - max_context_len
+                        ..
+                    ]
+                    .to_vec();
+        }
+
+        let idx =
+            self.generate_one_ids(
+                &ids,
+                temp,
+                threads,
+            );
+
+        self.vocab[idx]
+            .clone()
+    }
+
+    pub fn generate_one_distribution(
+        &self,
+        context: String,
+        top_k: usize,
+        threads: usize,
+    ) {
+        let mut ids =
+            self.encode_nums(
+                context
+            );
+
+        let max_context_len =
+            self.context_len
+                as usize;
+
+        if ids.len()
+            > max_context_len
+        {
+            ids =
+                ids[
+                    ids.len()
+                        - max_context_len
+                        ..
+                    ]
+                    .to_owned();
+        }
+
+        assert!(
+            !ids.is_empty(),
+            "Generation input cannot be empty"
+        );
+
+        let positions =
+            ids.len();
+
+        let embedding_dim =
+            self.embeddings.embedding_dim();
+
+        let vocab_size =
+            self.vocab.len();
+
+        println!(
+            "IDs: {:?}",
+            ids
+        );
+
+        println!(
+            "Split text: {:?}",
+            ids.iter()
+                .map(
+                    |x| {
+                        self.vocab[
+                            *x as usize
+                            ]
+                            .clone()
+                    }
+                )
+                .collect::<Vec<_>>()
+        );
+
+        let input =
+            self.embeddings.encode_batch(
+                &self.mlp.params,
+                &ids,
+                1,
+                positions,
+            );
+
+        let forward =
+            self.mlp.forward_batch(
+                &input,
+                1,
+                positions
+                    * embedding_dim,
+            );
+
+        debug_assert_eq!(
+            forward.output_size,
+            positions * vocab_size
+        );
+
+        let last_position =
+            positions - 1;
+
+        let logits_start =
+            last_position
+                * vocab_size;
+
+        let logits_end =
+            logits_start
+                + vocab_size;
+
+        let logits =
+            &forward.output[
+                logits_start
+                    ..logits_end
+                ];
+
+        let max_logit =
+            logits
+                .iter()
+                .copied()
+                .fold(
+                    f32::NEG_INFINITY,
+                    f32::max,
+                );
+
+        let exp_logits:
+            Vec<f32> =
+            logits
+                .iter()
+                .map(
+                    |&x| {
+                        (
+                            x - max_logit
+                        )
+                            .exp()
+                    }
+                )
+                .collect();
+
+        let sum_exp:
+            f32 =
+            exp_logits
+                .iter()
+                .sum();
+
+        let probs:
+            Vec<f32> =
+            exp_logits
+                .iter()
+                .map(
+                    |&x| {
+                        x / sum_exp
+                    }
+                )
+                .collect();
+
+        let mut newest:
+            Vec<(usize, f32)> =
+            probs
+                .into_iter()
+                .enumerate()
+                .collect();
+
+        newest.sort_by(
+            |a, b| {
+                b.1.total_cmp(
+                    &a.1
+                )
+            }
+        );
+
+        for (
+            idx,
+            prob,
+        ) in newest
+            .iter()
+            .take(
+                top_k.min(
+                    newest.len()
+                )
+            )
+        {
+            println!(
+                "{}- {:.2}%",
+                self.vocab[*idx],
+                prob * 100.0
+            );
+        }
+
+        let _ =
+            threads;
+    }
+
     pub fn generate_gpt(
         &self,
         context: String,
@@ -977,18 +1034,18 @@ impl LM {
             crate::helper::Trie::from_vocab(
                 &self.vocab,
                 byte_fallback_base(
-                    self.vocab.clone()
+                    &self.vocab
                 ),
             );
 
-        let context_len =
+        let max_context_len =
             self.context_len
                 as usize;
 
         let mut tokenizer =
             crate::helper::IncrementalTokenizer::new(
                 &trie,
-                context_len,
+                max_context_len,
             );
 
         let initial_ids =
@@ -1001,9 +1058,8 @@ impl LM {
         );
 
         debug_assert_eq!(
-            tokenizer.current_ids(
-                context_len,
-                1,
+            tokenizer.current_ids_u16_unpadded(
+                max_context_len,
             ),
             {
                 let mut expected =
@@ -1011,36 +1067,20 @@ impl LM {
                         .iter()
                         .map(
                             |&x|
-                                x as usize
+                                x as u16
                         )
                         .collect::<Vec<_>>();
 
                 if expected.len()
-                    > context_len
+                    > max_context_len
                 {
                     expected =
                         expected[
                             expected.len()
-                                - context_len
+                                - max_context_len
                                 ..
                             ]
                             .to_vec();
-                } else if expected.len()
-                    < context_len
-                {
-                    let mut padded =
-                        vec![
-                            1usize;
-                            context_len
-                                - expected.len()
-                        ];
-
-                    padded.extend(
-                        expected
-                    );
-
-                    expected =
-                        padded;
                 }
 
                 expected
@@ -1056,9 +1096,8 @@ impl LM {
         for _ in 0..gen_length {
             let ids =
                 tokenizer
-                    .current_ids_u16(
-                        context_len,
-                        1,
+                    .current_ids_u16_unpadded(
+                        max_context_len,
                     );
 
             let idx =
@@ -1116,18 +1155,18 @@ impl LM {
             crate::helper::Trie::from_vocab(
                 &self.vocab,
                 byte_fallback_base(
-                    self.vocab.clone()
+                    &self.vocab
                 ),
             );
 
-        let context_len =
+        let max_context_len =
             self.context_len
                 as usize;
 
         let mut tokenizer =
             crate::helper::IncrementalTokenizer::new(
                 &trie,
-                context_len,
+                max_context_len,
             );
 
         tokenizer.push_raw_bytes(
@@ -1143,9 +1182,8 @@ impl LM {
         for _ in 0..gen_length {
             let ids =
                 tokenizer
-                    .current_ids_u16(
-                        context_len,
-                        1,
+                    .current_ids_u16_unpadded(
+                        max_context_len,
                     );
 
             let idx =
@@ -1277,6 +1315,24 @@ impl LM {
     ) {
         self.dataset =
             dataset;
+
+        // Explicitly supplied raw-token datasets are unmasked.
+        self.dataset_loss_mask =
+            None;
+    }
+
+    pub fn set_dataset_with_mask(
+        &mut self,
+        dataset: Vec<u16>,
+        loss_mask: LmLossMask,
+    ) {
+        self.dataset =
+            dataset;
+
+        self.dataset_loss_mask =
+            Some(
+                loss_mask
+            );
     }
 
     pub fn load_corpus(
@@ -1292,6 +1348,10 @@ impl LM {
                 corpus,
                 &self.vocab,
             );
+
+        // Raw text corpus = ordinary next-token training.
+        self.dataset_loss_mask =
+            None;
 
         println!(
             "Done! Loaded {} tokens ({} training samples).",
@@ -1313,6 +1373,150 @@ impl LM {
                 corpus,
                 &self.vocab,
             );
+
+        self.dataset_loss_mask =
+            None;
+    }
+
+    pub fn load_dataset_file(
+        &mut self,
+        path: &str,
+    ) {
+        let path_ref =
+            Path::new(path);
+
+        let is_json =
+            path_ref
+                .extension()
+                .and_then(
+                    |extension| {
+                        extension.to_str()
+                    }
+                )
+                .map(
+                    |extension| {
+                        extension.eq_ignore_ascii_case(
+                            "json"
+                        )
+                    }
+                )
+                .unwrap_or(false);
+
+        if is_json {
+            // =========================================================
+            // JSON MASKED DATASET PATH
+            //
+            // This is the ONLY case that loads the JSON-aware format.
+            // The loader tokenizes one turn at a time and produces:
+            //
+            //     tokens
+            //     loss ranges
+            //
+            // without keeping all original strings in RAM.
+            // =========================================================
+
+            println!(
+                "Loading masked JSON dataset: {}",
+                path
+            );
+
+            let byte_fallback =
+                byte_fallback_base(
+                    &self.vocab
+                );
+
+            let trie =
+                crate::helper::Trie::from_vocab(
+                    &self.vocab,
+                    byte_fallback,
+                );
+
+            let loaded =
+                crate::trainer::load_masked_json_lm_dataset(
+                    path_ref,
+                    1024 * 1024,
+                    move |text, out| {
+                        trie.tokenize_bytes_u16_into(
+                            text.as_bytes(),
+                            out,
+                        );
+                    },
+                )
+                    .unwrap_or_else(
+                        |error| {
+                            panic!(
+                                "Failed to load JSON LM dataset '{}': {}",
+                                path,
+                                error,
+                            );
+                        }
+                    );
+
+            self.dataset =
+                loaded.tokens;
+
+            self.dataset_loss_mask =
+                Some(
+                    loaded.loss_mask
+                );
+
+            let training_samples =
+                self.dataset
+                    .len()
+                    .saturating_sub(
+                        self.context_len
+                            as usize
+                    );
+
+            let masked_ranges =
+                self.dataset_loss_mask
+                    .as_ref()
+                    .map(
+                        |mask| {
+                            mask.ranges().len()
+                        }
+                    )
+                    .unwrap_or(0);
+
+            println!(
+                "Done! Loaded {} tokens ({} training samples, {} selected loss ranges).",
+                self.dataset.len(),
+                training_samples,
+                masked_ranges,
+            );
+
+            return;
+        }
+
+        // =============================================================
+        // NORMAL DATASET PATH
+        //
+        // .txt, .bin, .whatever-you-currently-use:
+        // read it exactly like before and do ordinary LM training.
+        // =============================================================
+
+        println!(
+            "Loading text dataset: {}",
+            path
+        );
+
+        let corpus =
+            fs::read_to_string(
+                path
+            )
+                .unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "Failed to read dataset '{}': {}",
+                            path,
+                            error,
+                        );
+                    }
+                );
+
+        self.load_corpus(
+            &corpus
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -1622,11 +1826,42 @@ impl LM {
             &self.dataset,
             self.context_len as usize,
             &self.embeddings,
+            self.dataset_loss_mask.as_ref(),
             seed.unwrap_or(
                 PermutationSampler::DEFAULT_SEED
             ),
             threads as usize,
         );
+    }
+
+    pub fn dataset_is_masked(
+        &self,
+    ) -> bool {
+        self.dataset_loss_mask
+            .is_some()
+    }
+
+    pub fn dataset_loss_mask(
+        &self,
+    ) -> Option<&LmLossMask> {
+        self.dataset_loss_mask
+            .as_ref()
+    }
+
+    pub fn set_cosine_lr(
+        &mut self,
+        warmup_steps: u64,
+        total_steps: u64,
+        min_lr_ratio: f32,
+    ) {
+        self.trainer
+            .reinit_lr_schedule(
+                LrSchedule::Cosine {
+                    warmup_steps,
+                    total_steps,
+                    min_lr_ratio,
+                }
+            );
     }
 
     // ------------------------------------------------------------------------
@@ -1886,28 +2121,13 @@ impl LM {
             );
 
         Self {
-            trainer:
-            Trainer::new(
-                0.0,
-                0,
-                0,
-                0,
-            ),
-
+            trainer: Trainer::new(0.0, 0, 0, 0),
             mlp,
-
-            dataset:
-            Vec::new(),
-
-            vocab:
-            saved.vocab,
-
-            context_len:
-            saved.context_len,
-
-            hidden_layers:
-            saved.hidden_layers,
-
+            dataset: Vec::new(),
+            dataset_loss_mask: None,
+            vocab: saved.vocab,
+            context_len: saved.context_len,
+            hidden_layers: saved.hidden_layers,
             embeddings,
         }
     }

@@ -21,13 +21,13 @@ use std::arch::x86_64::{
     _mm256_storeu_ps,
     _mm256_sub_ps,
 };
-
+use std::arch::x86_64::_mm256_fnmadd_ps;
 use crate::conv1d_backward::backward_direct;
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
 
 use crate::forwards::{
     global_mixer_position_features,
-    GLOBAL_MIXER_POS_FEATURES,
+    GLOBAL_MIXER_POS_FEATURES
 };
 
 
@@ -61,7 +61,10 @@ pub struct BackwardWorkspace {
     depthwise_weight_grads_kmajor: Vec<f32>,
 
     mixer_global_grads: Vec<f32>,
+    mixer_global_state: Vec<f32>,
     mixer_score_grads: Vec<f32>,
+    mixer_read_score_grads: Vec<f32>,
+    mixer_input_grads: Vec<f32>,
 
     mixer_pos_grads_write: Vec<f32>,
     mixer_pos_grads_read: Vec<f32>,
@@ -94,7 +97,11 @@ impl BackwardWorkspace {
             depthwise_weight_grads_kmajor: Vec::new(),
 
             mixer_global_grads: Vec::new(),
+            mixer_global_state: Vec::new(),
+
             mixer_score_grads: Vec::new(),
+            mixer_read_score_grads: Vec::new(),
+            mixer_input_grads: Vec::new(),
 
             mixer_pos_grads_write: Vec::new(),
             mixer_pos_grads_read: Vec::new(),
@@ -104,7 +111,7 @@ impl BackwardWorkspace {
 
 thread_local! {
     static BACKWARD_WORKSPACE: RefCell<BackwardWorkspace> =
-        RefCell::new(BackwardWorkspace::new());
+    RefCell::new(BackwardWorkspace::new());
 }
 
 
@@ -1657,6 +1664,7 @@ pub fn weight_tying_backward(
     input: &[f32],
     grad: &[f32],
     batch_size: usize,
+    positions: usize,
     embedding_dim: usize,
     vocab_size: usize,
     embeddings: &Embeddings,
@@ -1666,15 +1674,18 @@ pub fn weight_tying_backward(
     Vec<f32>,
     Vec<f32>,
 ) {
+    let rows =
+        batch_size * positions;
+
     assert_eq!(
         input.len(),
-        batch_size * embedding_dim,
+        rows * embedding_dim,
         "Invalid WeightTying input size"
     );
 
     assert_eq!(
         grad.len(),
-        batch_size * vocab_size,
+        rows * vocab_size,
         "Invalid WeightTying gradient size"
     );
 
@@ -1682,19 +1693,31 @@ pub fn weight_tying_backward(
         embeddings.parameter_range();
 
     let weights =
-        params.values(embedding_range);
+        params.values(
+            embedding_range
+        );
 
     debug_assert_eq!(
         weights.len(),
         vocab_size * embedding_dim
     );
 
+    // ------------------------------------------------------------------------
+    // dW = dYᵀ × X
+    //
+    // dY: [B*P, V]
+    // X:  [B*P, E]
+    // dW: [V, E]
+    // ------------------------------------------------------------------------
+
     workspace.embedding_grads.resize(
         vocab_size * embedding_dim,
         0.0,
     );
 
-    workspace.embedding_grads.fill(0.0);
+    workspace.embedding_grads.fill(
+        0.0
+    );
 
     unsafe {
         cblas::sgemm(
@@ -1703,7 +1726,7 @@ pub fn weight_tying_backward(
             Transpose::None,
             vocab_size as i32,
             embedding_dim as i32,
-            batch_size as i32,
+            rows as i32,
             1.0,
             grad,
             vocab_size as i32,
@@ -1715,10 +1738,18 @@ pub fn weight_tying_backward(
         );
     }
 
+    // ------------------------------------------------------------------------
+    // dX = dY × W
+    //
+    // dY: [B*P, V]
+    // W:  [V, E]
+    // dX: [B*P, E]
+    // ------------------------------------------------------------------------
+
     let mut input_grads =
         vec![
             0.0f32;
-            batch_size * embedding_dim
+            rows * embedding_dim
         ];
 
     unsafe {
@@ -1726,7 +1757,7 @@ pub fn weight_tying_backward(
             Layout::RowMajor,
             Transpose::None,
             Transpose::None,
-            batch_size as i32,
+            rows as i32,
             embedding_dim as i32,
             vocab_size as i32,
             1.0,
@@ -1965,6 +1996,167 @@ fn global_mixer_read_softmax_backward_scalar(
     }
 }
 
+fn global_mixer_write_softmax_causal_backward(
+    probs: &[f32],
+    score_grads: &mut [f32],
+    batch_size: usize,
+    positions: usize,
+    global_dim: usize,
+) {
+    debug_assert_eq!(
+        probs.len(),
+        batch_size
+            * positions
+            * global_dim
+    );
+
+    debug_assert_eq!(
+        score_grads.len(),
+        probs.len()
+    );
+
+    for b in 0..batch_size {
+        let base =
+            b
+                * positions
+                * global_dim;
+
+        for g in 0..global_dim {
+            // For prefix softmax:
+            //
+            //   a_p = exp(s_p) / sum_{q<=p} exp(s_q)
+            //
+            // s_p affects a_p, a_{p+1}, ..., a_{P-1}.
+            //
+            // Therefore the softmax backward pass is a reverse scan.
+
+            let mut suffix_dot =
+                0.0f32;
+
+            for p in (0..positions).rev() {
+                let index =
+                    base
+                        + p * global_dim
+                        + g;
+
+                let probability =
+                    probs[index];
+
+                let d_probability =
+                    score_grads[index];
+
+                suffix_dot +=
+                    probability
+                        * d_probability;
+
+                score_grads[index] =
+                    probability
+                        * (
+                        d_probability
+                            - suffix_dot
+                    );
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_write_softmax_causal_backward_avx2(
+    probs: &[f32],
+    score_grads: &mut [f32],
+    batch_size: usize,
+    positions: usize,
+    global_dim: usize,
+) {
+    for b in 0..batch_size {
+        let base =
+            b * positions * global_dim;
+
+        let mut g = 0usize;
+
+        while g + 8 <= global_dim {
+            let mut suffix =
+                _mm256_setzero_ps();
+
+            for p in (0..positions).rev() {
+                let index =
+                    base
+                        + p * global_dim
+                        + g;
+
+                let probability =
+                    _mm256_loadu_ps(
+                        probs.as_ptr()
+                            .add(index)
+                    );
+
+                let d_probability =
+                    _mm256_loadu_ps(
+                        score_grads.as_ptr()
+                            .add(index)
+                    );
+
+                suffix =
+                    _mm256_fmadd_ps(
+                        probability,
+                        d_probability,
+                        suffix,
+                    );
+
+                let result =
+                    _mm256_mul_ps(
+                        probability,
+                        _mm256_sub_ps(
+                            d_probability,
+                            suffix,
+                        ),
+                    );
+
+                _mm256_storeu_ps(
+                    score_grads
+                        .as_mut_ptr()
+                        .add(index),
+                    result,
+                );
+            }
+
+            g += 8;
+        }
+
+        while g < global_dim {
+            let mut suffix_dot =
+                0.0f32;
+
+            for p in (0..positions).rev() {
+                let index =
+                    base
+                        + p * global_dim
+                        + g;
+
+                let probability =
+                    probs[index];
+
+                let d_probability =
+                    score_grads[index];
+
+                suffix_dot +=
+                    probability
+                        * d_probability;
+
+                score_grads[index] =
+                    probability
+                        * (
+                        d_probability
+                            - suffix_dot
+                    );
+            }
+
+            g += 1;
+        }
+    }
+}
+
 fn global_mixer_positional_backward(
     score_grads: &[f32],
     position_features: &[[f32; GLOBAL_MIXER_POS_FEATURES]],
@@ -1988,65 +2180,776 @@ fn global_mixer_positional_backward(
 
     output_grads.fill(0.0);
 
-    for g in 0..global_dim {
-        let weight_base =
-            g * GLOBAL_MIXER_POS_FEATURES;
+    for b in 0..batch_size {
+        let score_base =
+            b * positions * global_dim;
 
-        let mut grad0 =
-            0.0f32;
+        for p in 0..positions {
+            let row =
+                score_base
+                    + p * global_dim;
 
-        let mut grad1 =
-            0.0f32;
+            let f =
+                position_features[p];
 
-        let mut grad2 =
-            0.0f32;
-
-        let mut grad3 =
-            0.0f32;
-
-        for b in 0..batch_size {
-            let score_base =
-                b * positions * global_dim;
-
-            for p in 0..positions {
+            for g in 0..global_dim {
                 let ds =
                     score_grads[
-                        score_base
-                            + p * global_dim
-                            + g
+                        row + g
                         ];
 
-                let f =
-                    position_features[p];
+                let weight_base =
+                    g
+                        * GLOBAL_MIXER_POS_FEATURES;
 
-                grad0 +=
-                    ds * f[0];
+                output_grads[
+                    weight_base
+                    ] += ds * f[0];
 
-                grad1 +=
-                    ds * f[1];
+                output_grads[
+                    weight_base + 1
+                    ] += ds * f[1];
 
-                grad2 +=
-                    ds * f[2];
+                output_grads[
+                    weight_base + 2
+                    ] += ds * f[2];
 
-                grad3 +=
-                    ds * f[3];
+                output_grads[
+                    weight_base + 3
+                    ] += ds * f[3];
             }
         }
-
-        output_grads[weight_base] =
-            grad0;
-
-        output_grads[weight_base + 1] =
-            grad1;
-
-        output_grads[weight_base + 2] =
-            grad2;
-
-        output_grads[weight_base + 3] =
-            grad3;
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_causal_reverse_avx2(
+    input: &[f32],
+    grad: &[f32],
+
+    write_probs: &[f32],
+    read_probs: &[f32],
+
+    global_state: &mut [f32],
+    global_grads: &mut [f32],
+    input_grads: &mut [f32],
+
+    read_score_grads: &mut [f32],
+    write_score_grads: &mut [f32],
+
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for p in (0..positions).rev() {
+            let input_row =
+                input_base
+                    + p * channels;
+
+            let probs_row =
+                probs_base
+                    + p * global_dim;
+
+            let mut g = 0usize;
+
+            while g + 8 <= global_dim {
+                let read_prob =
+                    _mm256_set1_ps(
+                        read_probs[
+                            probs_row + g
+                            ]
+                    );
+
+                let write_prob =
+                    _mm256_set1_ps(
+                        write_probs[
+                            probs_row + g
+                            ]
+                    );
+
+                let mut d_read0 =
+                    _mm256_setzero_ps();
+
+                let mut d_read1 =
+                    _mm256_setzero_ps();
+
+                let mut d_write0 =
+                    _mm256_setzero_ps();
+
+                let mut d_write1 =
+                    _mm256_setzero_ps();
+
+                let global_row0 =
+                    global_base
+                        + g * channels;
+
+                let mut c = 0usize;
+
+                while c + 16 <= channels {
+                    // --------------------------------------------------------
+                    // First 8 channels.
+                    // --------------------------------------------------------
+
+                    let state0 =
+                        _mm256_loadu_ps(
+                            global_state
+                                .as_ptr()
+                                .add(global_row0 + c)
+                        );
+
+                    let dy0 =
+                        _mm256_loadu_ps(
+                            grad
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let x0 =
+                        _mm256_loadu_ps(
+                            input
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let old_dg0 =
+                        _mm256_loadu_ps(
+                            global_grads
+                                .as_ptr()
+                                .add(global_row0 + c)
+                        );
+
+                    // d read score.
+                    d_read0 =
+                        _mm256_fmadd_ps(
+                            state0,
+                            dy0,
+                            d_read0,
+                        );
+
+                    // dG += read_prob * dY.
+                    let new_dg0 =
+                        _mm256_fmadd_ps(
+                            read_prob,
+                            dy0,
+                            old_dg0,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_grads
+                            .as_mut_ptr()
+                            .add(global_row0 + c),
+                        new_dg0,
+                    );
+
+                    // d write score.
+                    d_write0 =
+                        _mm256_fmadd_ps(
+                            new_dg0,
+                            x0,
+                            d_write0,
+                        );
+
+                    // dX through causal global state.
+                    let old_dx0 =
+                        _mm256_loadu_ps(
+                            input_grads
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let new_dx0 =
+                        _mm256_fmadd_ps(
+                            write_prob,
+                            new_dg0,
+                            old_dx0,
+                        );
+
+                    _mm256_storeu_ps(
+                        input_grads
+                            .as_mut_ptr()
+                            .add(input_row + c),
+                        new_dx0,
+                    );
+
+                    // Reconstruct G_{p-1}.
+                    let previous_state0 =
+                        _mm256_fnmadd_ps(
+                            write_prob,
+                            x0,
+                            state0,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_state
+                            .as_mut_ptr()
+                            .add(global_row0 + c),
+                        previous_state0,
+                    );
+
+                    // --------------------------------------------------------
+                    // Next 8 channels.
+                    // --------------------------------------------------------
+
+                    let c1 =
+                        c + 8;
+
+                    let state1 =
+                        _mm256_loadu_ps(
+                            global_state
+                                .as_ptr()
+                                .add(global_row0 + c1)
+                        );
+
+                    let dy1 =
+                        _mm256_loadu_ps(
+                            grad
+                                .as_ptr()
+                                .add(input_row + c1)
+                        );
+
+                    let x1 =
+                        _mm256_loadu_ps(
+                            input
+                                .as_ptr()
+                                .add(input_row + c1)
+                        );
+
+                    let old_dg1 =
+                        _mm256_loadu_ps(
+                            global_grads
+                                .as_ptr()
+                                .add(global_row0 + c1)
+                        );
+
+                    d_read1 =
+                        _mm256_fmadd_ps(
+                            state1,
+                            dy1,
+                            d_read1,
+                        );
+
+                    let new_dg1 =
+                        _mm256_fmadd_ps(
+                            read_prob,
+                            dy1,
+                            old_dg1,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_grads
+                            .as_mut_ptr()
+                            .add(global_row0 + c1),
+                        new_dg1,
+                    );
+
+                    d_write1 =
+                        _mm256_fmadd_ps(
+                            new_dg1,
+                            x1,
+                            d_write1,
+                        );
+
+                    let old_dx1 =
+                        _mm256_loadu_ps(
+                            input_grads
+                                .as_ptr()
+                                .add(input_row + c1)
+                        );
+
+                    let new_dx1 =
+                        _mm256_fmadd_ps(
+                            write_prob,
+                            new_dg1,
+                            old_dx1,
+                        );
+
+                    _mm256_storeu_ps(
+                        input_grads
+                            .as_mut_ptr()
+                            .add(input_row + c1),
+                        new_dx1,
+                    );
+
+                    let previous_state1 =
+                        _mm256_fnmadd_ps(
+                            write_prob,
+                            x1,
+                            state1,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_state
+                            .as_mut_ptr()
+                            .add(global_row0 + c1),
+                        previous_state1,
+                    );
+
+                    c += 16;
+                }
+
+                while c + 8 <= channels {
+                    let state =
+                        _mm256_loadu_ps(
+                            global_state
+                                .as_ptr()
+                                .add(global_row0 + c)
+                        );
+
+                    let dy =
+                        _mm256_loadu_ps(
+                            grad
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let x =
+                        _mm256_loadu_ps(
+                            input
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let old_dg =
+                        _mm256_loadu_ps(
+                            global_grads
+                                .as_ptr()
+                                .add(global_row0 + c)
+                        );
+
+                    d_read0 =
+                        _mm256_fmadd_ps(
+                            state,
+                            dy,
+                            d_read0,
+                        );
+
+                    let new_dg =
+                        _mm256_fmadd_ps(
+                            read_prob,
+                            dy,
+                            old_dg,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_grads
+                            .as_mut_ptr()
+                            .add(global_row0 + c),
+                        new_dg,
+                    );
+
+                    d_write0 =
+                        _mm256_fmadd_ps(
+                            new_dg,
+                            x,
+                            d_write0,
+                        );
+
+                    let old_dx =
+                        _mm256_loadu_ps(
+                            input_grads
+                                .as_ptr()
+                                .add(input_row + c)
+                        );
+
+                    let new_dx =
+                        _mm256_fmadd_ps(
+                            write_prob,
+                            new_dg,
+                            old_dx,
+                        );
+
+                    _mm256_storeu_ps(
+                        input_grads
+                            .as_mut_ptr()
+                            .add(input_row + c),
+                        new_dx,
+                    );
+
+                    let previous_state =
+                        _mm256_fnmadd_ps(
+                            write_prob,
+                            x,
+                            state,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_state
+                            .as_mut_ptr()
+                            .add(global_row0 + c),
+                        previous_state,
+                    );
+
+                    c += 8;
+                }
+
+                // ------------------------------------------------------------
+                // Scalar tail.
+                // ------------------------------------------------------------
+
+                let mut read_scalar0 =
+                    0.0f32;
+
+                let mut write_scalar0 =
+                    0.0f32;
+
+                let mut c_tail =
+                    c;
+
+                while c_tail < channels {
+                    let state_index =
+                        global_row0 + c_tail;
+
+                    let input_index =
+                        input_row + c_tail;
+
+                    let old_state =
+                        global_state[
+                            state_index
+                            ];
+
+                    let dy =
+                        grad[input_index];
+
+                    let x =
+                        input[input_index];
+
+                    read_scalar0 +=
+                        old_state * dy;
+
+                    let new_dg =
+                        global_grads[
+                            state_index
+                            ]
+                            + read_probs[
+                            probs_row + g
+                            ] * dy;
+
+                    global_grads[
+                        state_index
+                        ] =
+                        new_dg;
+
+                    write_scalar0 +=
+                        new_dg * x;
+
+                    input_grads[
+                        input_index
+                        ] +=
+                        write_probs[
+                            probs_row + g
+                            ]
+                            * new_dg;
+
+                    global_state[
+                        state_index
+                        ] =
+                        old_state
+                            - write_probs[
+                            probs_row + g
+                            ] * x;
+
+                    c_tail += 1;
+                }
+
+                // Horizontal reductions.
+                let mut tmp =
+                    [0.0f32; 8];
+
+                _mm256_storeu_ps(
+                    tmp.as_mut_ptr(),
+                    d_read0,
+                );
+
+                let mut read_value =
+                    tmp[0]
+                        + tmp[1]
+                        + tmp[2]
+                        + tmp[3]
+                        + tmp[4]
+                        + tmp[5]
+                        + tmp[6]
+                        + tmp[7];
+
+                _mm256_storeu_ps(
+                    tmp.as_mut_ptr(),
+                    d_read1,
+                );
+
+                read_value +=
+                    tmp[0]
+                        + tmp[1]
+                        + tmp[2]
+                        + tmp[3]
+                        + tmp[4]
+                        + tmp[5]
+                        + tmp[6]
+                        + tmp[7];
+
+                _mm256_storeu_ps(
+                    tmp.as_mut_ptr(),
+                    d_write0,
+                );
+
+                let mut write_value =
+                    tmp[0]
+                        + tmp[1]
+                        + tmp[2]
+                        + tmp[3]
+                        + tmp[4]
+                        + tmp[5]
+                        + tmp[6]
+                        + tmp[7];
+
+                _mm256_storeu_ps(
+                    tmp.as_mut_ptr(),
+                    d_write1,
+                );
+
+                write_value +=
+                    tmp[0]
+                        + tmp[1]
+                        + tmp[2]
+                        + tmp[3]
+                        + tmp[4]
+                        + tmp[5]
+                        + tmp[6]
+                        + tmp[7];
+
+                read_value +=
+                    read_scalar0;
+
+                write_value +=
+                    write_scalar0;
+
+                read_score_grads[
+                    probs_row + g
+                    ] =
+                    read_value;
+
+                write_score_grads[
+                    probs_row + g
+                    ] =
+                    write_value;
+
+                g += 8;
+            }
+
+            // Scalar global-channel tail.
+            while g < global_dim {
+                let read_prob =
+                    read_probs[
+                        probs_row + g
+                        ];
+
+                let write_prob =
+                    write_probs[
+                        probs_row + g
+                        ];
+
+                let global_row =
+                    global_base
+                        + g * channels;
+
+                let mut d_read =
+                    0.0f32;
+
+                let mut d_write =
+                    0.0f32;
+
+                for c in 0..channels {
+                    let global_index =
+                        global_row + c;
+
+                    let input_index =
+                        input_row + c;
+
+                    let old_state =
+                        global_state[
+                            global_index
+                            ];
+
+                    let dy =
+                        grad[input_index];
+
+                    let x =
+                        input[input_index];
+
+                    d_read +=
+                        old_state * dy;
+
+                    let new_dg =
+                        global_grads[
+                            global_index
+                            ]
+                            + read_prob * dy;
+
+                    global_grads[
+                        global_index
+                        ] =
+                        new_dg;
+
+                    d_write +=
+                        new_dg * x;
+
+                    input_grads[
+                        input_index
+                        ] +=
+                        write_prob * new_dg;
+
+                    global_state[
+                        global_index
+                        ] =
+                        old_state
+                            - write_prob * x;
+                }
+
+                read_score_grads[
+                    probs_row + g
+                    ] =
+                    d_read;
+
+                write_score_grads[
+                    probs_row + g
+                    ] =
+                    d_write;
+
+                g += 1;
+            }
+        }
+    }
+}
+
+fn global_mixer_causal_reverse_scalar(
+    input: &[f32],
+    grad: &[f32],
+
+    write_probs: &[f32],
+    read_probs: &[f32],
+
+    global_state: &mut [f32],
+    global_grads: &mut [f32],
+    input_grads: &mut [f32],
+
+    read_score_grads: &mut [f32],
+    write_score_grads: &mut [f32],
+
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for p in (0..positions).rev() {
+            let input_row =
+                input_base
+                    + p * channels;
+
+            let probs_row =
+                probs_base
+                    + p * global_dim;
+
+            for g in 0..global_dim {
+                let read_prob =
+                    read_probs[
+                        probs_row + g
+                        ];
+
+                let write_prob =
+                    write_probs[
+                        probs_row + g
+                        ];
+
+                let global_row =
+                    global_base
+                        + g * channels;
+
+                let mut d_read =
+                    0.0f32;
+
+                let mut d_write =
+                    0.0f32;
+
+                for c in 0..channels {
+                    let global_index =
+                        global_row + c;
+
+                    let input_index =
+                        input_row + c;
+
+                    let old_state =
+                        global_state[
+                            global_index
+                            ];
+
+                    let dy =
+                        grad[input_index];
+
+                    let x =
+                        input[input_index];
+
+                    d_read +=
+                        old_state * dy;
+
+                    let new_dg =
+                        global_grads[
+                            global_index
+                            ]
+                            + read_prob * dy;
+
+                    global_grads[
+                        global_index
+                        ] =
+                        new_dg;
+
+                    d_write +=
+                        new_dg * x;
+
+                    input_grads[
+                        input_index
+                        ] +=
+                        write_prob * new_dg;
+
+                    global_state[
+                        global_index
+                        ] =
+                        old_state
+                            - write_prob * x;
+                }
+
+                read_score_grads[
+                    probs_row + g
+                    ] =
+                    d_read;
+
+                write_score_grads[
+                    probs_row + g
+                    ] =
+                    d_write;
+            }
+        }
+    }
+}
 
 // ============================================================================
 // GlobalMixer backward
@@ -2114,6 +3017,73 @@ pub fn global_mixer_backward(
         global_dim * channels
     );
 
+    let mut mixer_grads =
+        GlobalMixerGradients::default();
+
+    // ========================================================================
+    // Workspace
+    // ========================================================================
+
+    // dG for the current prefix state.
+    workspace.mixer_global_grads.resize(
+        batch_size
+            * global_dim
+            * channels,
+        0.0,
+    );
+    workspace.mixer_global_grads.fill(0.0);
+
+    // Gradient of write probabilities.
+    workspace.mixer_score_grads.resize(
+        rows * global_dim,
+        0.0,
+    );
+    workspace.mixer_score_grads.fill(0.0);
+
+    // Raw gradient of read scores.
+    workspace.mixer_read_score_grads.resize(
+        rows * global_dim,
+        0.0,
+    );
+    workspace.mixer_read_score_grads.fill(0.0);
+
+    // Gradient through X -> causal global state.
+    workspace.mixer_input_grads.resize(
+        rows * channels,
+        0.0,
+    );
+    workspace.mixer_input_grads.fill(0.0);
+
+    // ========================================================================
+    // 1. Fused reverse causal scan
+    //
+    // The previous implementation performed separate passes for:
+    //
+    //   dR
+    //   dG
+    //   dWrite
+    //   dX
+    //   G(previous)
+    //
+    // These are now fused into one G×C traversal.
+    // ========================================================================
+
+    let global_state_len =
+        batch_size
+            * global_dim
+            * channels;
+
+    workspace.mixer_global_state.resize(
+        global_state_len,
+        0.0,
+    );
+
+    workspace
+        .mixer_global_state
+        .copy_from_slice(
+            global_vectors
+        );
+
     #[cfg(target_arch = "x86_64")]
     let use_avx2 =
         is_x86_feature_detected!("avx2")
@@ -2122,389 +3092,67 @@ pub fn global_mixer_backward(
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
 
-    let mut mixer_grads =
-        GlobalMixerGradients::default();
+    if use_avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            global_mixer_causal_reverse_avx2(
+                input,
+                &grad,
+                write_probs,
+                read_probs,
 
-    // ========================================================================
-    // 1. dGlobal = R^T dY
-    // ========================================================================
+                &mut workspace.mixer_global_state,
+                &mut workspace.mixer_global_grads,
+                &mut workspace.mixer_input_grads,
 
-    workspace.mixer_global_grads.resize(
-        batch_size
-            * global_dim
-            * channels,
-        0.0,
-    );
+                &mut workspace.mixer_read_score_grads,
+                &mut workspace.mixer_score_grads,
 
-    workspace.mixer_global_grads.fill(0.0);
-
-    for b in 0..batch_size {
-        let grad_base =
-            b * positions * channels;
-
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        for g in 0..global_dim {
-            let dst_base =
-                global_base
-                    + g * channels;
-
-            let mut c = 0usize;
-
-            if use_avx2 {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    while c + 8 <= channels {
-                        let mut acc0 =
-                            _mm256_setzero_ps();
-
-                        let mut acc1 =
-                            _mm256_setzero_ps();
-
-                        let mut p = 0usize;
-
-                        while p + 1 < positions {
-                            let r0 =
-                                _mm256_set1_ps(
-                                    read_probs[
-                                        probs_base
-                                            + p * global_dim
-                                            + g
-                                        ]
-                                );
-
-                            let r1 =
-                                _mm256_set1_ps(
-                                    read_probs[
-                                        probs_base
-                                            + (p + 1)
-                                            * global_dim
-                                            + g
-                                        ]
-                                );
-
-                            let dy0 =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_base
-                                                + p * channels
-                                                + c
-                                        )
-                                );
-
-                            let dy1 =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_base
-                                                + (p + 1)
-                                                * channels
-                                                + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    dy0,
-                                    r0,
-                                    acc0,
-                                );
-
-                            acc1 =
-                                _mm256_fmadd_ps(
-                                    dy1,
-                                    r1,
-                                    acc1,
-                                );
-
-                            p += 2;
-                        }
-
-                        while p < positions {
-                            let r =
-                                _mm256_set1_ps(
-                                    read_probs[
-                                        probs_base
-                                            + p * global_dim
-                                            + g
-                                        ]
-                                );
-
-                            let dy =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_base
-                                                + p * channels
-                                                + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    dy,
-                                    r,
-                                    acc0,
-                                );
-
-                            p += 1;
-                        }
-
-                        _mm256_storeu_ps(
-                            workspace
-                                .mixer_global_grads
-                                .as_mut_ptr()
-                                .add(
-                                    dst_base + c
-                                ),
-                            _mm256_add_ps(
-                                acc0,
-                                acc1,
-                            ),
-                        );
-
-                        c += 8;
-                    }
-                }
-            }
-
-            while c < channels {
-                let mut sum =
-                    0.0f32;
-
-                for p in 0..positions {
-                    sum +=
-                        read_probs[
-                            probs_base
-                                + p * global_dim
-                                + g
-                            ]
-                            * grad[
-                            grad_base
-                                + p * channels
-                                + c
-                            ];
-                }
-
-                workspace
-                    .mixer_global_grads[
-                    dst_base + c
-                    ] = sum;
-
-                c += 1;
-            }
+                batch_size,
+                positions,
+                channels,
+                global_dim,
+            );
         }
+    } else {
+        global_mixer_causal_reverse_scalar(
+            input,
+            &grad,
+            write_probs,
+            read_probs,
+
+            &mut workspace.mixer_global_state,
+            &mut workspace.mixer_global_grads,
+            &mut workspace.mixer_input_grads,
+
+            &mut workspace.mixer_read_score_grads,
+            &mut workspace.mixer_score_grads,
+
+            batch_size,
+            positions,
+            channels,
+            global_dim,
+        );
     }
 
     // ========================================================================
-    // 2. dR = dY Global^T
+    // 2. Read softmax backward
     // ========================================================================
 
-    workspace.mixer_score_grads.resize(
-        rows * global_dim,
-        0.0,
-    );
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 =
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma");
 
-    workspace.mixer_score_grads.fill(0.0);
-
-    for b in 0..batch_size {
-        let grad_base =
-            b * positions * channels;
-
-        let global_base =
-            b * global_dim * channels;
-
-        let score_base =
-            b * positions * global_dim;
-
-        for p in 0..positions {
-            let grad_row =
-                grad_base
-                    + p * channels;
-
-            let score_row =
-                score_base
-                    + p * global_dim;
-
-            for g in 0..global_dim {
-                let global_row =
-                    global_base
-                        + g * channels;
-
-                let mut sum =
-                    0.0f32;
-
-                if use_avx2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        let mut acc0 =
-                            _mm256_setzero_ps();
-
-                        let mut acc1 =
-                            _mm256_setzero_ps();
-
-                        let mut c = 0usize;
-
-                        while c + 16 <= channels {
-                            let dy0 =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_row + c
-                                        )
-                                );
-
-                            let gv0 =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c
-                                        )
-                                );
-
-                            let dy1 =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_row + c + 8
-                                        )
-                                );
-
-                            let gv1 =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c + 8
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    dy0,
-                                    gv0,
-                                    acc0,
-                                );
-
-                            acc1 =
-                                _mm256_fmadd_ps(
-                                    dy1,
-                                    gv1,
-                                    acc1,
-                                );
-
-                            c += 16;
-                        }
-
-                        while c + 8 <= channels {
-                            let dy =
-                                _mm256_loadu_ps(
-                                    grad.as_ptr()
-                                        .add(
-                                            grad_row + c
-                                        )
-                                );
-
-                            let gv =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    dy,
-                                    gv,
-                                    acc0,
-                                );
-
-                            c += 8;
-                        }
-
-                        let mut tmp =
-                            [0.0f32; 8];
-
-                        _mm256_storeu_ps(
-                            tmp.as_mut_ptr(),
-                            acc0,
-                        );
-
-                        sum =
-                            tmp[0]
-                                + tmp[1]
-                                + tmp[2]
-                                + tmp[3]
-                                + tmp[4]
-                                + tmp[5]
-                                + tmp[6]
-                                + tmp[7];
-
-                        _mm256_storeu_ps(
-                            tmp.as_mut_ptr(),
-                            acc1,
-                        );
-
-                        sum +=
-                            tmp[0]
-                                + tmp[1]
-                                + tmp[2]
-                                + tmp[3]
-                                + tmp[4]
-                                + tmp[5]
-                                + tmp[6]
-                                + tmp[7];
-
-                        while c < channels {
-                            sum +=
-                                grad[
-                                    grad_row + c
-                                    ]
-                                    * global_vectors[
-                                    global_row + c
-                                    ];
-
-                            c += 1;
-                        }
-                    }
-                } else {
-                    for c in 0..channels {
-                        sum +=
-                            grad[
-                                grad_row + c
-                                ]
-                                * global_vectors[
-                                global_row + c
-                                ];
-                    }
-                }
-
-                workspace
-                    .mixer_score_grads[
-                    score_row + g
-                    ] = sum;
-            }
-        }
-    }
-
-    // ========================================================================
-    // 3. Read softmax backward
-    // ========================================================================
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
     if use_avx2 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             global_mixer_read_softmax_backward_avx2(
                 read_probs,
-                &mut workspace.mixer_score_grads,
+                &mut workspace.mixer_read_score_grads,
                 batch_size,
                 positions,
                 global_dim,
@@ -2513,7 +3161,7 @@ pub fn global_mixer_backward(
     } else {
         global_mixer_read_softmax_backward_scalar(
             read_probs,
-            &mut workspace.mixer_score_grads,
+            &mut workspace.mixer_read_score_grads,
             batch_size,
             positions,
             global_dim,
@@ -2521,7 +3169,7 @@ pub fn global_mixer_backward(
     }
 
     // ========================================================================
-    // 4. Read positional gradients
+    // 3. Read positional gradients
     // ========================================================================
 
     workspace.mixer_pos_grads_read.resize(
@@ -2531,7 +3179,7 @@ pub fn global_mixer_backward(
     );
 
     global_mixer_positional_backward(
-        &workspace.mixer_score_grads,
+        &workspace.mixer_read_score_grads,
         &position_features,
         batch_size,
         positions,
@@ -2545,14 +3193,13 @@ pub fn global_mixer_backward(
             .clone();
 
     // ========================================================================
-    // 5. Read weight gradient
+    // 4. Read weight gradient
     // ========================================================================
 
     workspace.weight_grads.resize(
         global_dim * channels,
         0.0,
     );
-
     workspace.weight_grads.fill(0.0);
 
     unsafe {
@@ -2564,7 +3211,7 @@ pub fn global_mixer_backward(
             channels as i32,
             rows as i32,
             1.0,
-            &workspace.mixer_score_grads,
+            &workspace.mixer_read_score_grads,
             global_dim as i32,
             input,
             channels as i32,
@@ -2578,14 +3225,13 @@ pub fn global_mixer_backward(
         workspace.weight_grads.clone();
 
     // ========================================================================
-    // 6. Read bias gradient
+    // 5. Read bias gradient
     // ========================================================================
 
     workspace.bias_grads.resize(
         global_dim,
         0.0,
     );
-
     workspace.bias_grads.fill(0.0);
 
     for row in 0..rows {
@@ -2594,7 +3240,7 @@ pub fn global_mixer_backward(
 
         add_f32_slice_simd(
             &mut workspace.bias_grads,
-            &workspace.mixer_score_grads[
+            &workspace.mixer_read_score_grads[
                 base..base + global_dim
                 ],
         );
@@ -2604,14 +3250,8 @@ pub fn global_mixer_backward(
         workspace.bias_grads.clone();
 
     // ========================================================================
-    // 7. dX_read
-    //
-    // Add it after all original dY-dependent quantities above have already
-    // been computed.
+    // 6. dX through read-score projection
     // ========================================================================
-
-    let mut read_input_grads =
-        vec![0.0f32; rows * channels];
 
     unsafe {
         cblas::sgemm(
@@ -2622,255 +3262,53 @@ pub fn global_mixer_backward(
             channels as i32,
             global_dim as i32,
             1.0,
-            &workspace.mixer_score_grads,
+            &workspace.mixer_read_score_grads,
             global_dim as i32,
             read_weights,
             channels as i32,
-            0.0,
-            &mut read_input_grads,
+            1.0,
+            &mut grad,
             channels as i32,
         );
     }
 
-    add_f32_slice_simd(
-        &mut grad,
-        &read_input_grads,
-    );
-
     // ========================================================================
-    // 8. dA = X dGlobal^T
+    // 7. Causal write-softmax backward
+    //
+    // mixer_score_grads currently contains d(write_probs).
     // ========================================================================
 
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 =
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma");
 
-        let global_base =
-            b * global_dim * channels;
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
-        let score_base =
-            b * positions * global_dim;
-
-        for p in 0..positions {
-            let input_row =
-                input_base
-                    + p * channels;
-
-            let score_row =
-                score_base
-                    + p * global_dim;
-
-            for g in 0..global_dim {
-                let global_row =
-                    global_base
-                        + g * channels;
-
-                let mut sum =
-                    0.0f32;
-
-                if use_avx2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        let mut acc0 =
-                            _mm256_setzero_ps();
-
-                        let mut acc1 =
-                            _mm256_setzero_ps();
-
-                        let mut c = 0usize;
-
-                        while c + 16 <= channels {
-                            let x0 =
-                                _mm256_loadu_ps(
-                                    input.as_ptr()
-                                        .add(
-                                            input_row + c
-                                        )
-                                );
-
-                            let dg0 =
-                                _mm256_loadu_ps(
-                                    workspace
-                                        .mixer_global_grads
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c
-                                        )
-                                );
-
-                            let x1 =
-                                _mm256_loadu_ps(
-                                    input.as_ptr()
-                                        .add(
-                                            input_row + c + 8
-                                        )
-                                );
-
-                            let dg1 =
-                                _mm256_loadu_ps(
-                                    workspace
-                                        .mixer_global_grads
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c + 8
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    x0,
-                                    dg0,
-                                    acc0,
-                                );
-
-                            acc1 =
-                                _mm256_fmadd_ps(
-                                    x1,
-                                    dg1,
-                                    acc1,
-                                );
-
-                            c += 16;
-                        }
-
-                        while c + 8 <= channels {
-                            let x =
-                                _mm256_loadu_ps(
-                                    input.as_ptr()
-                                        .add(
-                                            input_row + c
-                                        )
-                                );
-
-                            let dg =
-                                _mm256_loadu_ps(
-                                    workspace
-                                        .mixer_global_grads
-                                        .as_ptr()
-                                        .add(
-                                            global_row + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    x,
-                                    dg,
-                                    acc0,
-                                );
-
-                            c += 8;
-                        }
-
-                        let mut tmp =
-                            [0.0f32; 8];
-
-                        _mm256_storeu_ps(
-                            tmp.as_mut_ptr(),
-                            acc0,
-                        );
-
-                        sum =
-                            tmp[0]
-                                + tmp[1]
-                                + tmp[2]
-                                + tmp[3]
-                                + tmp[4]
-                                + tmp[5]
-                                + tmp[6]
-                                + tmp[7];
-
-                        _mm256_storeu_ps(
-                            tmp.as_mut_ptr(),
-                            acc1,
-                        );
-
-                        sum +=
-                            tmp[0]
-                                + tmp[1]
-                                + tmp[2]
-                                + tmp[3]
-                                + tmp[4]
-                                + tmp[5]
-                                + tmp[6]
-                                + tmp[7];
-
-                        while c < channels {
-                            sum +=
-                                input[
-                                    input_row + c
-                                    ]
-                                    * workspace
-                                    .mixer_global_grads[
-                                    global_row + c
-                                    ];
-
-                            c += 1;
-                        }
-                    }
-                } else {
-                    for c in 0..channels {
-                        sum +=
-                            input[
-                                input_row + c
-                                ]
-                                * workspace
-                                .mixer_global_grads[
-                                global_row + c
-                                ];
-                    }
-                }
-
-                workspace.mixer_score_grads[
-                    score_row + g
-                    ] = sum;
-            }
+    if use_avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            global_mixer_write_softmax_causal_backward_avx2(
+                write_probs,
+                &mut workspace.mixer_score_grads,
+                batch_size,
+                positions,
+                global_dim,
+            );
         }
+    } else {
+        global_mixer_write_softmax_causal_backward(
+            write_probs,
+            &mut workspace.mixer_score_grads,
+            batch_size,
+            positions,
+            global_dim,
+        );
     }
 
     // ========================================================================
-    // 9. Write softmax backward
-    // ========================================================================
-
-    for b in 0..batch_size {
-        let score_base =
-            b * positions * global_dim;
-
-        for g in 0..global_dim {
-            let mut dot =
-                0.0f32;
-
-            for p in 0..positions {
-                let idx =
-                    score_base
-                        + p * global_dim
-                        + g;
-
-                dot +=
-                    write_probs[idx]
-                        * workspace
-                        .mixer_score_grads[idx];
-            }
-
-            for p in 0..positions {
-                let idx =
-                    score_base
-                        + p * global_dim
-                        + g;
-
-                workspace.mixer_score_grads[idx] =
-                    write_probs[idx]
-                        * (
-                        workspace
-                            .mixer_score_grads[idx]
-                            - dot
-                    );
-            }
-        }
-    }
-
-    // ========================================================================
-    // 10. Write positional gradients
+    // 8. Write positional gradients
     // ========================================================================
 
     workspace.mixer_pos_grads_write.resize(
@@ -2894,9 +3332,13 @@ pub fn global_mixer_backward(
             .clone();
 
     // ========================================================================
-    // 11. Write weight gradient
+    // 9. Write weight gradient
     // ========================================================================
 
+    workspace.weight_grads.resize(
+        global_dim * channels,
+        0.0,
+    );
     workspace.weight_grads.fill(0.0);
 
     unsafe {
@@ -2922,9 +3364,13 @@ pub fn global_mixer_backward(
         workspace.weight_grads.clone();
 
     // ========================================================================
-    // 12. Write bias gradient
+    // 10. Write bias gradient
     // ========================================================================
 
+    workspace.bias_grads.resize(
+        global_dim,
+        0.0,
+    );
     workspace.bias_grads.fill(0.0);
 
     for row in 0..rows {
@@ -2943,11 +3389,8 @@ pub fn global_mixer_backward(
         workspace.bias_grads.clone();
 
     // ========================================================================
-    // 13. dX_write
+    // 11. dX through write projection
     // ========================================================================
-
-    let mut write_input_grads =
-        vec![0.0f32; rows * channels];
 
     unsafe {
         cblas::sgemm(
@@ -2962,188 +3405,32 @@ pub fn global_mixer_backward(
             global_dim as i32,
             write_weights,
             channels as i32,
-            0.0,
-            &mut write_input_grads,
+            1.0,
+            &mut grad,
             channels as i32,
         );
     }
 
+    // ========================================================================
+    // 12. Combine all dX paths
+    //
+    // grad:
+    //   residual dY
+    //
+    // read_input_grads:
+    //   X -> read scores
+    //
+    // mixer_input_grads:
+    //   X -> causal global state
+    //
+    // write_input_grads:
+    //   X -> write scores
+    // ========================================================================
+
     add_f32_slice_simd(
         &mut grad,
-        &write_input_grads,
+        &workspace.mixer_input_grads,
     );
-
-    // ========================================================================
-    // 14. dX_global = A dGlobal
-    // ========================================================================
-
-    for b in 0..batch_size {
-        let grad_base =
-            b * positions * channels;
-
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        for p in 0..positions {
-            let dst_base =
-                grad_base
-                    + p * channels;
-
-            let probs_row =
-                probs_base
-                    + p * global_dim;
-
-            let mut c = 0usize;
-
-            if use_avx2 {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    while c + 8 <= channels {
-                        let mut acc0 =
-                            _mm256_setzero_ps();
-
-                        let mut acc1 =
-                            _mm256_setzero_ps();
-
-                        let mut g = 0usize;
-
-                        while g + 1 < global_dim {
-                            let a0 =
-                                _mm256_set1_ps(
-                                    write_probs[
-                                        probs_row + g
-                                        ]
-                                );
-
-                            let a1 =
-                                _mm256_set1_ps(
-                                    write_probs[
-                                        probs_row + g + 1
-                                        ]
-                                );
-
-                            let gv0 =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_base
-                                                + g * channels
-                                                + c
-                                        )
-                                );
-
-                            let gv1 =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_base
-                                                + (g + 1)
-                                                * channels
-                                                + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    gv0,
-                                    a0,
-                                    acc0,
-                                );
-
-                            acc1 =
-                                _mm256_fmadd_ps(
-                                    gv1,
-                                    a1,
-                                    acc1,
-                                );
-
-                            g += 2;
-                        }
-
-                        while g < global_dim {
-                            let a =
-                                _mm256_set1_ps(
-                                    write_probs[
-                                        probs_row + g
-                                        ]
-                                );
-
-                            let gv =
-                                _mm256_loadu_ps(
-                                    global_vectors
-                                        .as_ptr()
-                                        .add(
-                                            global_base
-                                                + g * channels
-                                                + c
-                                        )
-                                );
-
-                            acc0 =
-                                _mm256_fmadd_ps(
-                                    gv,
-                                    a,
-                                    acc0,
-                                );
-
-                            g += 1;
-                        }
-
-                        let old =
-                            _mm256_loadu_ps(
-                                grad.as_ptr()
-                                    .add(
-                                        dst_base + c
-                                    )
-                            );
-
-                        _mm256_storeu_ps(
-                            grad.as_mut_ptr()
-                                .add(
-                                    dst_base + c
-                                ),
-                            _mm256_add_ps(
-                                old,
-                                _mm256_add_ps(
-                                    acc0,
-                                    acc1,
-                                ),
-                            ),
-                        );
-
-                        c += 8;
-                    }
-                }
-            }
-
-            while c < channels {
-                let mut sum =
-                    0.0f32;
-
-                for g in 0..global_dim {
-                    sum +=
-                        write_probs[
-                            probs_row + g
-                            ]
-                            * global_vectors[
-                            global_base
-                                + g * channels
-                                + c
-                            ];
-                }
-
-                grad[dst_base + c] +=
-                    sum;
-
-                c += 1;
-            }
-        }
-    }
 
     (
         grad,
@@ -3755,11 +4042,12 @@ fn backward_layer_batch(
         // ====================================================================
 
         (
-            Layer::WeightTying(layer),
+            Layer::WeightTying(_),
             BatchLayerCache::WeightTying {
                 input,
                 embeddings,
                 batch_size: cached_batch_size,
+                positions,
                 embedding_dim,
                 vocab_size,
             },
@@ -3777,6 +4065,7 @@ fn backward_layer_batch(
                     input,
                     &grad,
                     *cached_batch_size,
+                    *positions,
                     *embedding_dim,
                     *vocab_size,
                     embeddings,
@@ -3789,8 +4078,6 @@ fn backward_layer_batch(
                 embeddings.parameter_range(),
                 &embedding_grads,
             );
-
-            let _ = layer;
 
             input_grads
         }
@@ -3879,10 +4166,6 @@ fn backward_layer_batch(
             input_grads
         }
 
-        _ => {
-            panic!(
-                "Layer/cache mismatch during backward pass"
-            );
-        }
+        _ => panic!("Layer/cache mismatch during backward pass")
     }
 }
