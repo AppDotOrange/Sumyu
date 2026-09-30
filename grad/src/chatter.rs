@@ -20,6 +20,7 @@ impl ChatFNN {
             let _ = io::stdout().flush();
             let mut user = "".to_string();
             io::stdin().read_line(&mut user).unwrap();
+            user = user.trim().parse().unwrap();
             context.push_str(&user);
             context.push_str("<EOT><BOT>");
             print!("BOT: ");

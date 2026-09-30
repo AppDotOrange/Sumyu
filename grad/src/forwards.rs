@@ -1976,6 +1976,95 @@ pub fn weight_tying_softmax_cross_entropy_tiled(
     )
 }
 
+pub fn weight_tying_forward_last(
+    layer: &WeightTyingLayer,
+    params: &ParameterStore,
+    input: &[f32],
+    batch_size: usize,
+    positions: usize,
+) -> Vec<f32> {
+    let embedding_dim =
+        layer.embeddings.embedding_dim();
+
+    let vocab_size =
+        layer.embeddings.vocab_size();
+
+    assert_eq!(
+        batch_size,
+        1,
+        "weight_tying_forward_last currently requires batch_size = 1"
+    );
+
+    assert_eq!(
+        input.len(),
+        positions * embedding_dim,
+        "Invalid WeightTying input size"
+    );
+
+    assert!(
+        positions > 0,
+        "WeightTying requires at least one position"
+    );
+
+    let weights =
+        params.values(
+            layer.embeddings.parameter_range()
+        );
+
+    debug_assert_eq!(
+        weights.len(),
+        vocab_size * embedding_dim
+    );
+
+    // Only project the final hidden state:
+    //
+    // [1, E] × [V, E]^T
+    // → [1, V]
+    //
+    // instead of:
+    //
+    // [P, E] × [V, E]^T
+    // → [P, V]
+
+    let last_start =
+        (positions - 1)
+            * embedding_dim;
+
+    let last_hidden =
+        &input[
+            last_start
+                ..
+                last_start + embedding_dim
+            ];
+
+    let mut output =
+        vec![
+            0.0f32;
+            vocab_size
+        ];
+
+    unsafe {
+        cblas::sgemm(
+            Layout::RowMajor,
+            Transpose::None,
+            Transpose::Ordinary,
+            1,
+            vocab_size as i32,
+            embedding_dim as i32,
+            1.0,
+            last_hidden,
+            embedding_dim as i32,
+            weights,
+            embedding_dim as i32,
+            0.0,
+            &mut output,
+            vocab_size as i32,
+        );
+    }
+
+    output
+}
+
 // ============================================================================
 // Layer stack
 // ============================================================================

@@ -248,40 +248,20 @@ fn derive_context_len(
         (sample as u64)
             .wrapping_add(
                 (epoch as u64)
-                    .wrapping_mul(
-                        0x9E3779B97F4A7C15
-                    )
+                    .wrapping_mul(0x9E3779B97F4A7C15)
             );
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D049BB133111EB);
+    x ^= x >> 31;
+    let min_context_len = max_context_len.min(8);
+    let range = max_context_len - min_context_len;
 
-    x ^=
-        x >> 30;
+    let u = x as f64 / u64::MAX as f64;
+    let biased = u.sqrt();
 
-    x =
-        x.wrapping_mul(
-            0xBF58476D1CE4E5B9
-        );
-
-    x ^=
-        x >> 27;
-
-    x =
-        x.wrapping_mul(
-            0x94D049BB133111EB
-        );
-
-    x ^=
-        x >> 31;
-
-    let min_context_len =
-        max_context_len.min(8);
-
-    min_context_len
-        + (x as usize
-        % (
-        max_context_len
-            - min_context_len
-            + 1
-    ))
+    min_context_len + (range as f64 * biased) as usize
 }
 
 // ============================================================================
@@ -458,10 +438,11 @@ impl LmLossMask {
         &self,
         targets: &mut Vec<u16>,
         tokens: &[u16],
+        token_byte_lens: &[u32],
         sample: usize,
         actual_context_len: usize,
         ignore_target: u16,
-    ) {
+    ) -> usize {
         let target_start =
             sample + 1;
 
@@ -478,10 +459,10 @@ impl LmLossMask {
             ignore_target,
         );
 
+        let mut valid_bytes =
+            0usize;
+
         // Find the first range that could overlap this target window.
-        //
-        // Because `ranges` is sorted and merged, every range before this
-        // point is guaranteed to end before the current window.
         let mut left = 0usize;
         let mut right =
             self.ranges.len();
@@ -521,6 +502,20 @@ impl LmLossMask {
                 continue;
             }
 
+            valid_bytes +=
+                tokens[
+                    copy_start
+                        ..copy_end
+                    ]
+                    .iter()
+                    .map(
+                        |&token|
+                            token_byte_lens[
+                                token as usize
+                                ] as usize
+                    )
+                    .sum::<usize>();
+
             let source =
                 copy_start
                     ..copy_end;
@@ -544,6 +539,8 @@ impl LmLossMask {
                     &tokens[source]
                 );
         }
+
+        valid_bytes
     }
 }
 
@@ -1414,6 +1411,7 @@ impl Trainer {
         tokens: &[u16],
         context_len: usize,
         embeddings: &Embeddings,
+        token_byte_lens: &[u32],
         loss_mask: Option<&LmLossMask>,
         sampler_seed: u64,
         threads: usize,
@@ -1510,6 +1508,12 @@ impl Trainer {
         let embedding_dim =
             embeddings.embedding_dim();
 
+        assert_eq!(
+            token_byte_lens.len(),
+            embeddings.vocab_size(),
+            "Token byte-length table must match vocabulary size"
+        );
+
         // =============================================================
         // Optimizer state
         // =============================================================
@@ -1572,8 +1576,7 @@ impl Trainer {
                         "Sampler seed differs from checkpoint"
                     );
 
-                    lr =
-                        state.lr;
+                    self.lr = state.lr;
 
                     best_loss =
                         state.best_loss;
@@ -1798,6 +1801,9 @@ impl Trainer {
             let mut total_valid_targets =
                 0usize;
 
+            let mut total_valid_bytes =
+                0usize;
+
             let mut grad_sum =
                 0.0f32;
 
@@ -1884,6 +1890,9 @@ impl Trainer {
                 batch_ids.clear();
                 targets.clear();
 
+                let mut batch_valid_bytes =
+                    0usize;
+
                 for batch_index
                 in 0..current_batch
                 {
@@ -1919,24 +1928,40 @@ impl Trainer {
 
                     match loss_mask {
                         None => {
-                            targets.extend_from_slice(
+                            let target_slice =
                                 &tokens[
                                     sample + 1
                                         ..sample
                                         + batch_context_len
                                         + 1
-                                    ]
+                                    ];
+
+                            targets.extend_from_slice(
+                                target_slice
                             );
+
+                            batch_valid_bytes +=
+                                target_slice
+                                    .iter()
+                                    .map(
+                                        |&token|
+                                            token_byte_lens[
+                                                token as usize
+                                                ] as usize
+                                    )
+                                    .sum::<usize>();
                         }
 
                         Some(mask) => {
-                            mask.write_targets(
-                                &mut targets,
-                                tokens,
-                                sample,
-                                batch_context_len,
-                                IGNORE_TARGET,
-                            );
+                            batch_valid_bytes +=
+                                mask.write_targets(
+                                    &mut targets,
+                                    tokens,
+                                    token_byte_lens,
+                                    sample,
+                                    batch_context_len,
+                                    IGNORE_TARGET,
+                                );
                         }
                     }
                 }
@@ -2186,6 +2211,9 @@ impl Trainer {
                 total_valid_targets +=
                     valid_count;
 
+                total_valid_bytes +=
+                    batch_valid_bytes;
+
                 // -----------------------------------------------------
                 // Add tied-output embedding gradients
                 // -----------------------------------------------------
@@ -2272,32 +2300,21 @@ impl Trainer {
                     &mlp.params.grads
                 {
                     if !g.is_finite() {
-                        println!(
-                            "Non-finite gradient detected. \
-                         Stopping training."
-                        );
-
+                        println!("Non-finite gradient detected. Stopping training.");
                         mlp.params.zero_grads();
-
                         return TrainResult::Finished;
                     }
 
-                    let mean_grad =
-                        g
-                            * batch_normalization;
+                    let mean_grad = g * batch_normalization;
 
-                    let gf =
-                        mean_grad as f64;
+                    let gf = mean_grad as f64;
 
-                    grad_sq_sum +=
-                        gf * gf;
+                    grad_sq_sum += gf * gf;
 
-                    batch_grad_sum +=
-                        gf.abs();
+                    batch_grad_sum += gf.abs();
                 }
 
-                let grad_norm =
-                    grad_sq_sum.sqrt();
+                let grad_norm = grad_sq_sum.sqrt();
 
                 let grad_scale =
                     if grad_norm
@@ -2319,22 +2336,15 @@ impl Trainer {
                 // Adam step + LR schedule
                 // -----------------------------------------------------
 
-                let next_adam_step =
-                    adam_step + 1;
+                let next_adam_step = adam_step + 1;
 
-                lr =
-                    self.lr_for_step(
-                        next_adam_step
-                    );
+                lr = self.lr_for_step(next_adam_step);
 
-                adam_step =
-                    next_adam_step;
+                adam_step = next_adam_step;
 
-                beta1_power *=
-                    ADAM_BETA1;
+                beta1_power *= ADAM_BETA1;
 
-                beta2_power *=
-                    ADAM_BETA2;
+                beta2_power *= ADAM_BETA2;
 
                 let beta1_correction_inv =
                     1.0f32
@@ -2351,8 +2361,7 @@ impl Trainer {
                     );
 
                 #[cfg(feature = "timing")]
-                let timer =
-                    Instant::now();
+                let timer = Instant::now();
 
                 for i in
                     0..parameter_count
@@ -2362,15 +2371,9 @@ impl Trainer {
                             * batch_normalization
                             * grad_scale;
 
-                    let m =
-                        &mut adam_first_moments[
-                            i
-                            ];
+                    let m = &mut adam_first_moments[i];
 
-                    let v =
-                        &mut adam_second_moments[
-                            i
-                            ];
+                    let v = &mut adam_second_moments[i];
 
                     *m =
                         ADAM_BETA1
@@ -2391,13 +2394,9 @@ impl Trainer {
                             * gradient
                             * gradient;
 
-                    let m_hat =
-                        *m
-                            * beta1_correction_inv;
+                    let m_hat = *m * beta1_correction_inv;
 
-                    let v_hat =
-                        *v
-                            * beta2_correction_inv;
+                    let v_hat = *v * beta2_correction_inv;
 
                     mlp.params.values[i] -=
                         lr
@@ -2412,15 +2411,12 @@ impl Trainer {
 
                 #[cfg(feature = "timing")]
                 {
-                    update_time +=
-                        timer.elapsed();
+                    update_time += timer.elapsed();
                 }
 
-                count +=
-                    current_batch;
+                count += current_batch;
 
-                batches_done +=
-                    1;
+                batches_done += 1;
 
                 // -----------------------------------------------------
                 // Batch checkpoint
@@ -2518,6 +2514,16 @@ impl Trainer {
                         let running_ppl =
                             running_loss.exp();
 
+                        let running_bpb =
+                            if total_valid_bytes > 0 {
+                                running_loss
+                                    * total_valid_targets as f32
+                                    / std::f32::consts::LN_2
+                                    / total_valid_bytes as f32
+                            } else {
+                                0.0
+                            };
+
                         let elapsed_secs =
                             elapsed.as_secs_f64();
 
@@ -2556,13 +2562,22 @@ impl Trainer {
                                 / valid_count.max(1)
                                 as f32;
 
+                        let batch_bpb =
+                            if batch_valid_bytes > 0 {
+                                batch_loss
+                                    / std::f32::consts::LN_2
+                                    / batch_valid_bytes as f32
+                            } else {
+                                0.0
+                            };
+
                         println!(
                             "Epoch {} | Batch {}/{} | {:>6.2}% | \
-                         Samples {}/{} | AvgLoss = {:.6} | \
-                         AvgPPL = {:.6}\n\
-                         Loss = {:.6} | PPL = {:.6} | \
-                         {:.1} samples/s | \
-                         Elapsed: {:.2?} | ETA: {:.2?} | LR: {}",
+ Samples {}/{} | AvgLoss = {:.6} | \
+ AvgPPL = {:.6} | AvgBPB = {:.6}\n\
+ Loss = {:.6} | PPL = {:.6} | BPB = {:.6} | \
+ {:.1} samples/s | \
+ Elapsed: {:.2?} | ETA: {:.2?} | LR: {}",
                             epoch,
                             batches_done,
                             total_batches,
@@ -2571,8 +2586,10 @@ impl Trainer {
                             data_len,
                             running_loss,
                             running_ppl,
+                            running_bpb,
                             batch_avg_loss,
                             batch_avg_loss.exp(),
+                            batch_bpb,
                             samples_per_sec,
                             elapsed,
                             eta,
@@ -2738,9 +2755,17 @@ impl Trainer {
             let perplexity =
                 avg_loss.exp();
 
-            let grad_avg =
-                grad_sum
-                    / valid_targets;
+            let bits_per_byte =
+                if total_valid_bytes > 0 {
+                    avg_loss
+                        / std::f32::consts::LN_2
+                        / total_valid_bytes as f32
+                        * total_valid_targets as f32
+                } else {
+                    0.0
+                };
+
+            let grad_avg = grad_sum / valid_targets;
 
             // ---------------------------------------------------------
             // Best-loss tracking
@@ -2793,8 +2818,7 @@ impl Trainer {
             // Epoch logging
             // ---------------------------------------------------------
 
-            let elapsed =
-                now.elapsed();
+            let elapsed = now.elapsed();
 
             if update_frequency > 0
                 && epoch % update_frequency
@@ -2812,12 +2836,13 @@ impl Trainer {
                 println!(
                     "Epoch {} | Loss (CE) = {:.6} | \
                  Grad avg per param = {:.8} | \
-                 PPL = {:.6} | \
+                 PPL = {:.6} | BPB = {:.6} | \
                  Time elapsed: {:.2?}.",
                     epoch,
                     avg_loss,
                     grad_per_param,
                     perplexity,
+                    bits_per_byte,
                     elapsed,
                 );
 

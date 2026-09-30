@@ -2268,6 +2268,85 @@ impl MLP {
         }
     }
 
+    pub(crate) fn forward_lm_last(
+        &self,
+        input: &[f32],
+        input_size: usize,
+    ) -> Vec<f32> {
+        let embedding_dim =
+            match self.layers.last() {
+                Some(Layer::WeightTying(layer)) =>
+                    layer.embeddings.embedding_dim(),
+
+                _ =>
+                    panic!(
+                        "LM forward requires WeightTying as the final layer"
+                    ),
+            };
+
+        assert_eq!(
+            input_size % embedding_dim,
+            0,
+            "LM input size must be divisible by embedding dimension"
+        );
+
+        let positions =
+            input_size / embedding_dim;
+
+        assert!(
+            positions > 0,
+            "LM input must contain at least one position"
+        );
+
+        assert_eq!(
+            input.len(),
+            input_size,
+            "Invalid LM input length"
+        );
+
+        let backbone_layers =
+            &self.layers[
+                ..self.layers.len() - 1
+                ];
+
+        let (
+            hidden,
+            output_size,
+            _layers,
+        ) =
+            forward_layers_batch(
+                backbone_layers,
+                &self.params,
+                input,
+                1,
+                input_size,
+                &self.thread_pool,
+            );
+
+        assert_eq!(
+            output_size,
+            positions * embedding_dim,
+            "LM backbone must preserve sequence length"
+        );
+
+        let weight_tying =
+            match self.layers.last() {
+                Some(Layer::WeightTying(layer)) =>
+                    layer,
+
+                _ =>
+                    unreachable!(),
+            };
+
+        weight_tying_forward_last(
+            weight_tying,
+            &self.params,
+            &hidden,
+            1,
+            positions,
+        )
+    }
+
     pub(crate) fn backward_lm_batch(
         &mut self,
         forward: &BatchForward,

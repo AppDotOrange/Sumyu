@@ -461,6 +461,13 @@ impl LM {
         }
     }
 
+    pub fn reconfigure_context_length(&mut self, new_context_len: usize) {
+        println!("Reconfiguring context length. This can be dangerous for a model's performance!");
+        println!("OLD CONTEXT: {}", self.context_len);
+        self.context_len = new_context_len as u32;
+        println!("NEW CONTEXT: {}", self.context_len);
+    }
+
     // ------------------------------------------------------------------------
     // Checkpoint loading
     // ------------------------------------------------------------------------
@@ -703,9 +710,6 @@ impl LM {
         let embedding_dim =
             self.embeddings.embedding_dim();
 
-        let vocab_size =
-            self.vocab.len();
-
         let input =
             self.embeddings.encode_batch(
                 &self.mlp.params,
@@ -714,34 +718,11 @@ impl LM {
                 positions,
             );
 
-        let forward =
-            self.mlp.forward_batch(
+        let logits =
+            self.mlp.forward_lm_last(
                 &input,
-                1,
                 positions * embedding_dim,
             );
-
-        debug_assert_eq!(
-            forward.output_size,
-            positions * vocab_size
-        );
-
-        let last_position =
-            positions - 1;
-
-        let logits_start =
-            last_position
-                * vocab_size;
-
-        let logits_end =
-            logits_start
-                + vocab_size;
-
-        let logits =
-            &forward.output[
-                logits_start
-                    ..logits_end
-                ];
 
         if temp <= 0.0 {
             return logits
@@ -880,14 +861,9 @@ impl LM {
             "Generation input cannot be empty"
         );
 
-        let positions =
-            ids.len();
+        let positions = ids.len();
 
-        let embedding_dim =
-            self.embeddings.embedding_dim();
-
-        let vocab_size =
-            self.vocab.len();
+        let embedding_dim = self.embeddings.embedding_dim();
 
         println!(
             "IDs: {:?}",
@@ -916,35 +892,11 @@ impl LM {
                 positions,
             );
 
-        let forward =
-            self.mlp.forward_batch(
-                &input,
-                1,
-                positions
-                    * embedding_dim,
-            );
-
-        debug_assert_eq!(
-            forward.output_size,
-            positions * vocab_size
-        );
-
-        let last_position =
-            positions - 1;
-
-        let logits_start =
-            last_position
-                * vocab_size;
-
-        let logits_end =
-            logits_start
-                + vocab_size;
-
         let logits =
-            &forward.output[
-                logits_start
-                    ..logits_end
-                ];
+            self.mlp.forward_lm_last(
+                &input,
+                positions * embedding_dim,
+            );
 
         let max_logit =
             logits
@@ -1154,14 +1106,10 @@ impl LM {
         let trie =
             crate::helper::Trie::from_vocab(
                 &self.vocab,
-                byte_fallback_base(
-                    &self.vocab
-                ),
+                byte_fallback_base(&self.vocab),
             );
 
-        let max_context_len =
-            self.context_len
-                as usize;
+        let max_context_len = self.context_len as usize;
 
         let mut tokenizer =
             crate::helper::IncrementalTokenizer::new(
@@ -1169,22 +1117,14 @@ impl LM {
                 max_context_len,
             );
 
-        tokenizer.push_raw_bytes(
-            context.as_bytes()
-        );
+        tokenizer.push_raw_bytes(context.as_bytes());
 
-        let mut output =
-            String::new();
+        let mut output = String::new();
 
-        let mut byte_buffer =
-            Vec::<u8>::new();
+        let mut byte_buffer = Vec::<u8>::new();
 
         for _ in 0..gen_length {
-            let ids =
-                tokenizer
-                    .current_ids_u16_unpadded(
-                        max_context_len,
-                    );
+            let ids = tokenizer.current_ids_u16_unpadded(max_context_len);
 
             let idx =
                 self.generate_one_ids(
@@ -1193,17 +1133,19 @@ impl LM {
                     threads,
                 );
 
-            let generation =
-                &self.vocab[idx];
+            let mut generation = &self.vocab[idx];
 
-            if generation.contains(
-                "<EOT>"
-            ) {
+            if generation.contains("<EOT>") {
                 let before_eot =
                     generation
                         .split("<EOT>")
                         .next()
                         .unwrap();
+
+                let empty = String::from("");
+                if generation == "<EOT>" {
+                    generation = &empty;
+                }
 
                 stream_token(
                     before_eot,
@@ -1221,13 +1163,9 @@ impl LM {
                     byte_buffer.clear();
                 }
 
-                let _ =
-                    std::io::stdout()
-                        .flush();
+                let _ = std::io::stdout().flush();
 
-                output.push_str(
-                    generation
-                );
+                output.push_str(generation);
 
                 return output;
             }
@@ -1620,10 +1558,7 @@ impl LM {
                 .as_deref()
                 .filter(
                     |path| {
-                        std::path::Path::new(
-                            path
-                        )
-                            .exists()
+                        Path::new(path).exists()
                     }
                 )
                 .map(
@@ -1652,6 +1587,31 @@ impl LM {
 
         let hidden_layers =
             self.hidden_layers.clone();
+
+        let byte_fallback =
+            byte_fallback_base(
+                &self.vocab
+            ) as usize;
+
+        let token_byte_lens:
+            Vec<u32> =
+            self.vocab
+                .iter()
+                .enumerate()
+                .map(
+                    |(i, token)| {
+                        if i >= byte_fallback
+                            && i < byte_fallback + 256
+                        {
+                            1
+                        } else {
+                            token
+                                .as_bytes()
+                                .len() as u32
+                        }
+                    }
+                )
+                .collect();
 
         let should_save_checkpoints =
             checkpoint_path.is_some();
@@ -1777,7 +1737,7 @@ impl LM {
                         .unwrap();
 
                 if let Some(parent) =
-                    std::path::Path::new(
+                    Path::new(
                         &path
                     )
                         .parent()
@@ -1826,6 +1786,7 @@ impl LM {
             &self.dataset,
             self.context_len as usize,
             &self.embeddings,
+            &token_byte_lens,
             self.dataset_loss_mask.as_ref(),
             seed.unwrap_or(
                 PermutationSampler::DEFAULT_SEED

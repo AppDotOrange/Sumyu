@@ -1,5 +1,5 @@
 use crate::neuron::{Activation, LayerSpec};
-use crate::vocabs::{ml_200_tok_vocab_v3, ml_v4, poke_v1, poke_v2, poke_v3, recipe_v1, recipe_v2, tale_v1, oasst1, fineweb, fineweb_v2, recipe_v3, fineweb_v3, tiny_shakespeare_v1, tinychat_v1, tinychat_v2};
+use crate::vocabs::{ml_200_tok_vocab_v3, ml_v4, poke_v1, poke_v2, poke_v3, recipe_v1, recipe_v2, tale_v1, oasst1, fineweb, fineweb_v2, recipe_v3, fineweb_v3, tiny_shakespeare_v1, tinychat_v1, tinychat_v2, tinychat_v2_no_pad};
 
 pub struct Config<'a> {
     pub lr: f32,
@@ -7603,7 +7603,7 @@ pub fn tinychat_v13_hybrid(
     )
 }
 
-pub fn tinychat_v14_hybrid(
+pub fn tinychat_v14_hybrid( // TinyChatP1 and TinyChatP1-post
     lr: f32,
     batch_size: usize,
     epochs: usize,
@@ -7815,6 +7815,305 @@ pub fn tinychat_v14_hybrid(
 
             LayerSpec::LayerNorm {
                 channels: 128,
+                epsilon: 1e-5,
+            },
+
+            // ============================================================
+            // TIED VOCABULARY HEAD
+            // ============================================================
+
+            LayerSpec::WeightTying,
+        ],
+        epochs,
+    )
+}
+
+pub fn tinychat_v15_hybrid( // TinyChatP1 large
+    lr: f32,
+    batch_size: usize,
+    epochs: usize,
+) -> HybridConfig {
+    HybridConfig::new(
+        lr,
+        batch_size,
+        0,
+        tinychat_v2_no_pad(), // 2259-token vocabulary
+        128,           // maximum context length
+        160,           // embedding/channel width
+        vec![
+
+            // ============================================================
+            // LOCAL BLOCK #1
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // LOCAL BLOCK #2
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // PRE-GLOBAL NORMALIZATION #1
+            // ============================================================
+
+            LayerSpec::LayerNorm {
+                channels: 160,
+                epsilon: 1e-5,
+            },
+
+            // ============================================================
+            // GLOBAL MIXER #1
+            //
+            // 40 global slots.
+            // ============================================================
+
+            LayerSpec::GlobalMixer {
+                channels: 160,
+                global_dim: 40,
+            },
+
+            // ============================================================
+            // LOCAL BLOCK #3
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // LOCAL BLOCK #4
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // PRE-GLOBAL NORMALIZATION #2
+            // ============================================================
+
+            LayerSpec::LayerNorm {
+                channels: 160,
+                epsilon: 1e-5,
+            },
+
+            // ============================================================
+            // GLOBAL MIXER #2
+            // ============================================================
+
+            LayerSpec::GlobalMixer {
+                channels: 160,
+                global_dim: 40,
+            },
+
+            // ============================================================
+            // LOCAL BLOCK #5
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // LOCAL BLOCK #6
+            // ============================================================
+
+            LayerSpec::Residual {
+                layers: vec![
+                    LayerSpec::LayerNorm {
+                        channels: 160,
+                        epsilon: 1e-5,
+                    },
+
+                    LayerSpec::DepthwiseConv1D {
+                        in_channels: 160,
+                        kernel_size: 7,
+                        stride: 1,
+                        padding: 3,
+                        causal: true,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+
+                    LayerSpec::LowRankPointwise {
+                        in_channels: 160,
+                        rank: 40,
+                        out_channels: 160,
+                        activation:
+                        Activation::LeakyReLU {
+                            slope: 0.01,
+                        },
+                    },
+                ],
+            },
+
+            // ============================================================
+            // PRE-GLOBAL NORMALIZATION #3
+            // ============================================================
+
+            LayerSpec::LayerNorm {
+                channels: 160,
+                epsilon: 1e-5,
+            },
+
+            // ============================================================
+            // GLOBAL MIXER #3
+            // ============================================================
+
+            LayerSpec::GlobalMixer {
+                channels: 160,
+                global_dim: 40,
+            },
+
+            // ============================================================
+            // FINAL NORMALIZATION
+            // ============================================================
+
+            LayerSpec::LayerNorm {
+                channels: 160,
                 epsilon: 1e-5,
             },
 
