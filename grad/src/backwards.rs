@@ -2022,15 +2022,18 @@ fn global_mixer_write_softmax_causal_backward(
                 * global_dim;
 
         for g in 0..global_dim {
-            // For prefix softmax:
+            // h = a_{p+1} * dL/da_{p+1}
+            //     + future contribution beyond p+1
             //
-            //   a_p = exp(s_p) / sum_{q<=p} exp(s_q)
-            //
-            // s_p affects a_p, a_{p+1}, ..., a_{P-1}.
-            //
-            // Therefore the softmax backward pass is a reverse scan.
+            // Initially there is no future position.
+            let mut h =
+                0.0f32;
 
-            let mut suffix_dot =
+            // Probability at p+1.
+            //
+            // Initialized to zero so the first iteration (the final
+            // position) naturally gets zero future contribution.
+            let mut next_probability =
                 0.0f32;
 
             for p in (0..positions).rev() {
@@ -2045,16 +2048,37 @@ fn global_mixer_write_softmax_causal_backward(
                 let d_probability =
                     score_grads[index];
 
-                suffix_dot +=
-                    probability
-                        * d_probability;
+                // Contribution from all future outputs q > p.
+                let future =
+                    (
+                        1.0f32
+                            - next_probability
+                    )
+                        * h;
 
-                score_grads[index] =
+                // Exact causal-prefix-softmax derivative.
+                let d_score =
                     probability
                         * (
-                        d_probability
-                            - suffix_dot
+                        (
+                            1.0f32
+                                - probability
+                        )
+                            * d_probability
+                            - future
                     );
+
+                score_grads[index] =
+                    d_score;
+
+                // Prepare h_p for the next iteration.
+                h =
+                    probability
+                        * d_probability
+                        + future;
+
+                next_probability =
+                    probability;
             }
         }
     }
@@ -2069,14 +2093,23 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
     positions: usize,
     global_dim: usize,
 ) {
+    let one =
+        _mm256_set1_ps(1.0f32);
+
     for b in 0..batch_size {
         let base =
-            b * positions * global_dim;
+            b
+                * positions
+                * global_dim;
 
-        let mut g = 0usize;
+        let mut g =
+            0usize;
 
         while g + 8 <= global_dim {
-            let mut suffix =
+            let mut h =
+                _mm256_setzero_ps();
+
+            let mut next_probability =
                 _mm256_setzero_ps();
 
             for p in (0..positions).rev() {
@@ -2087,29 +2120,52 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
 
                 let probability =
                     _mm256_loadu_ps(
-                        probs.as_ptr()
+                        probs
+                            .as_ptr()
                             .add(index)
                     );
 
                 let d_probability =
                     _mm256_loadu_ps(
-                        score_grads.as_ptr()
+                        score_grads
+                            .as_ptr()
                             .add(index)
                     );
 
-                suffix =
-                    _mm256_fmadd_ps(
-                        probability,
-                        d_probability,
-                        suffix,
+                // F_p =
+                // (1 - a_{p+1}) * H_{p+1}
+                let future =
+                    _mm256_mul_ps(
+                        _mm256_sub_ps(
+                            one,
+                            next_probability,
+                        ),
+                        h,
                     );
 
-                let result =
+                // ds_p =
+                // a_p * (
+                //     (1 - a_p) * da_p
+                //     - F_p
+                // )
+                let one_minus_probability =
+                    _mm256_sub_ps(
+                        one,
+                        probability,
+                    );
+
+                let local =
+                    _mm256_mul_ps(
+                        one_minus_probability,
+                        d_probability,
+                    );
+
+                let d_score =
                     _mm256_mul_ps(
                         probability,
                         _mm256_sub_ps(
-                            d_probability,
-                            suffix,
+                            local,
+                            future,
                         ),
                     );
 
@@ -2117,15 +2173,30 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                     score_grads
                         .as_mut_ptr()
                         .add(index),
-                    result,
+                    d_score,
                 );
+
+                // H_p =
+                // a_p * da_p + F_p
+                h =
+                    _mm256_fmadd_ps(
+                        probability,
+                        d_probability,
+                        future,
+                    );
+
+                next_probability =
+                    probability;
             }
 
             g += 8;
         }
 
         while g < global_dim {
-            let mut suffix_dot =
+            let mut h =
+                0.0f32;
+
+            let mut next_probability =
                 0.0f32;
 
             for p in (0..positions).rev() {
@@ -2140,16 +2211,31 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                 let d_probability =
                     score_grads[index];
 
-                suffix_dot +=
-                    probability
-                        * d_probability;
+                let future =
+                    (
+                        1.0f32
+                            - next_probability
+                    )
+                        * h;
 
                 score_grads[index] =
                     probability
                         * (
-                        d_probability
-                            - suffix_dot
+                        (
+                            1.0f32
+                                - probability
+                        )
+                            * d_probability
+                            - future
                     );
+
+                h =
+                    probability
+                        * d_probability
+                        + future;
+
+                next_probability =
+                    probability;
             }
 
             g += 1;

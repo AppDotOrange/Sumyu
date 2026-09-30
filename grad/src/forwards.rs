@@ -20,7 +20,6 @@ use cblas::{
     Transpose,
 };
 use rayon::ThreadPool;
-
 use crate::backwards::add_f32_slice_simd;
 use crate::conv1d_kernels::conv1d_forward;
 use crate::depthwise_kernel::depthwise_conv1d_forward;
@@ -2842,10 +2841,8 @@ fn forward_layer_batch(
                     global_vectors,
                     read_probs,
                     positions,
-                    channels:
-                    layer.channels,
-                    global_dim:
-                    layer.global_dim,
+                    channels: layer.channels,
+                    global_dim: layer.global_dim,
                 };
 
             (

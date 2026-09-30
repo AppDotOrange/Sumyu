@@ -8,7 +8,7 @@ fn main() {
     print!("\x1B[2J\x1B[3J\x1B[1;1H");
     let _ = io::stdout().flush();
     let tokens = 1_000;
-    let (mut lm) = LM::from_checkpoint("tinychat14/MiniChatterV14_batch_10100_epoch_1.check");
+    let (mut lm) = LM::from_checkpoint("tinychat15/MiniChatterV15_batch_2300_epoch_1.check");
     // lm.find_clusters(0.9);
     lm.params();
     /*
