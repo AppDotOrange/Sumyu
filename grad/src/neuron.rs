@@ -2018,6 +2018,7 @@ fn load_layer(
     }
 }
 
+#[derive(Clone)]
 pub struct MLP {
     pub(crate) layers: Vec<Layer>,
     pub(crate) params: ParameterStore,

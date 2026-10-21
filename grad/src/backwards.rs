@@ -5,11 +5,8 @@ use crate::neuron::{
     Layer,
 };
 use crate::parameters::ParameterStore;
-
 use cblas::{Layout, Transpose};
-
 use std::cell::RefCell;
-
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     _mm256_add_ps,
@@ -20,17 +17,14 @@ use std::arch::x86_64::{
     _mm256_setzero_ps,
     _mm256_storeu_ps,
     _mm256_sub_ps,
+    _mm256_fnmadd_ps
 };
-use std::arch::x86_64::_mm256_fnmadd_ps;
 use crate::conv1d_backward::backward_direct;
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
-
 use crate::forwards::{
     global_mixer_position_features,
     GLOBAL_MIXER_POS_FEATURES
 };
-
-
 // ============================================================================
 // Shared backward workspace
 // ============================================================================
@@ -189,22 +183,12 @@ pub unsafe fn add_f32_slice_avx2(
     let mut i = 0usize;
 
     while i + 8 <= len {
-        let a = _mm256_loadu_ps(
-            dst.as_ptr().add(i)
-        );
+        let a = _mm256_loadu_ps(dst.as_ptr().add(i));
+        let b = _mm256_loadu_ps(src.as_ptr().add(i));
 
-        let b = _mm256_loadu_ps(
-            src.as_ptr().add(i)
-        );
-
-        _mm256_storeu_ps(
-            dst.as_mut_ptr().add(i),
-            _mm256_add_ps(a, b),
-        );
-
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_add_ps(a, b));
         i += 8;
     }
-
     while i < len {
         dst[i] += src[i];
         i += 1;
@@ -217,16 +201,10 @@ pub fn add_f32_slice_simd(
     src: &[f32],
 ) {
     debug_assert_eq!(dst.len(), src.len());
-
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            unsafe {
-                add_f32_slice_avx2(dst, src);
-            }
-
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { add_f32_slice_avx2(dst, src) }
             return;
         }
     }
@@ -251,16 +229,13 @@ unsafe fn mul_add_f32_slice_avx2(
 
     while i + 8 <= len {
         let x = _mm256_loadu_ps(
-            a.as_ptr().add(i)
-        );
+            a.as_ptr().add(i));
 
         let y = _mm256_loadu_ps(
-            b.as_ptr().add(i)
-        );
+            b.as_ptr().add(i));
 
         let old = _mm256_loadu_ps(
-            dst.as_ptr().add(i)
-        );
+            dst.as_ptr().add(i));
 
         let result = _mm256_fmadd_ps(
             x,
@@ -293,9 +268,7 @@ fn mul_add_f32_slice_simd(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
+        if is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma"){
             unsafe {
                 mul_add_f32_slice_avx2(
                     dst,
@@ -418,8 +391,7 @@ pub fn depthwise_conv1d_backward(
 
     debug_assert_eq!(
         grad.len(),
-        output.len()
-    );
+        output.len());
 
     debug_assert_eq!(
         weights.len(),
@@ -578,8 +550,7 @@ pub fn depthwise_conv1d_backward(
         input_grads,
         workspace.weight_grads.clone(),
         workspace.bias_grads.clone(),
-    )
-}
+    )}
 
 
 // ============================================================================
@@ -609,39 +580,27 @@ unsafe fn channel_scale_backward_avx2(
         while c + 8 <= channels {
             let x =
                 _mm256_loadu_ps(
-                    input.as_ptr()
-                        .add(offset + c)
-                );
+                    input.as_ptr().add(offset + c));
 
             let g =
                 _mm256_loadu_ps(
-                    grad.as_ptr()
-                        .add(offset + c)
-                );
+                    grad.as_ptr().add(offset + c));
 
             let scale =
                 _mm256_loadu_ps(
-                    scales.as_ptr()
-                        .add(c)
-                );
+                    scales.as_ptr().add(c));
 
             let old_dx =
                 _mm256_loadu_ps(
-                    input_grads.as_ptr()
-                        .add(offset + c)
-                );
+                    input_grads.as_ptr().add(offset + c));
 
             let old_dscale =
                 _mm256_loadu_ps(
-                    scale_grads.as_ptr()
-                        .add(c)
-                );
+                    scale_grads.as_ptr().add(c));
 
             let old_dbias =
                 _mm256_loadu_ps(
-                    bias_grads.as_ptr()
-                        .add(c)
-                );
+                    bias_grads.as_ptr().add(c));
 
             let dx =
                 _mm256_fmadd_ps(
@@ -664,20 +623,17 @@ unsafe fn channel_scale_backward_avx2(
                 );
 
             _mm256_storeu_ps(
-                input_grads.as_mut_ptr()
-                    .add(offset + c),
+                input_grads.as_mut_ptr().add(offset + c),
                 dx,
             );
 
             _mm256_storeu_ps(
-                scale_grads.as_mut_ptr()
-                    .add(c),
+                scale_grads.as_mut_ptr().add(c),
                 dscale,
             );
 
             _mm256_storeu_ps(
-                bias_grads.as_mut_ptr()
-                    .add(c),
+                bias_grads.as_mut_ptr().add(c),
                 dbias,
             );
 
@@ -714,13 +670,11 @@ fn channel_scale_backward_simd(
 ) {
     debug_assert_eq!(
         input.len(),
-        grad.len()
-    );
+        grad.len());
 
     debug_assert_eq!(
         input.len(),
-        input_grads.len()
-    );
+        input_grads.len());
 
     debug_assert_eq!(
         scale_grads.len(),
@@ -734,9 +688,7 @@ fn channel_scale_backward_simd(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
+        if is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma"){
             unsafe {
                 channel_scale_backward_avx2(
                     input,
@@ -793,8 +745,7 @@ pub fn channel_scale_backward(
 ) {
     debug_assert_eq!(
         input.len(),
-        grad.len()
-    );
+        grad.len());
 
     debug_assert_eq!(
         input.len() % batch_size,
@@ -854,8 +805,7 @@ pub fn channel_scale_backward(
         input_grads,
         workspace.weight_grads.clone(),
         workspace.bias_grads.clone(),
-    )
-}
+    )}
 
 
 // ============================================================================
@@ -1048,8 +998,7 @@ pub fn low_rank_pointwise_backward(
         workspace.first_bias_grads.clone(),
         workspace.second_weight_grads.clone(),
         workspace.second_bias_grads.clone(),
-    )
-}
+    )}
 
 // ============================================================================
 // LayerNorm backward
@@ -1098,33 +1047,27 @@ unsafe fn layer_norm_backward_group_avx2(
     while c + 16 <= channels {
         let x0 =
             _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
+                input.as_ptr().add(c));
 
         let x1 =
             _mm256_loadu_ps(
-                input.as_ptr().add(c + 8)
-            );
+                input.as_ptr().add(c + 8));
 
         let dy0 =
             _mm256_loadu_ps(
-                grad.as_ptr().add(c)
-            );
+                grad.as_ptr().add(c));
 
         let dy1 =
             _mm256_loadu_ps(
-                grad.as_ptr().add(c + 8)
-            );
+                grad.as_ptr().add(c + 8));
 
         let g0 =
             _mm256_loadu_ps(
-                gamma.as_ptr().add(c)
-            );
+                gamma.as_ptr().add(c));
 
         let g1 =
             _mm256_loadu_ps(
-                gamma.as_ptr().add(c + 8)
-            );
+                gamma.as_ptr().add(c + 8));
 
         let xhat0 =
             _mm256_mul_ps(
@@ -1192,18 +1135,15 @@ unsafe fn layer_norm_backward_group_avx2(
     while c + 8 <= channels {
         let x =
             _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
+                input.as_ptr().add(c));
 
         let dy =
             _mm256_loadu_ps(
-                grad.as_ptr().add(c)
-            );
+                grad.as_ptr().add(c));
 
         let g =
             _mm256_loadu_ps(
-                gamma.as_ptr().add(c)
-            );
+                gamma.as_ptr().add(c));
 
         let xhat =
             _mm256_mul_ps(
@@ -1309,8 +1249,7 @@ unsafe fn layer_norm_backward_group_avx2(
             gamma[c];
 
         let xhat =
-            (input[c] - mean)
-                * inv_std;
+            (input[c] - mean)* inv_std;
 
         let dxhat =
             dy * g;
@@ -1349,18 +1288,15 @@ unsafe fn layer_norm_backward_group_avx2(
     while c + 8 <= channels {
         let x =
             _mm256_loadu_ps(
-                input.as_ptr().add(c)
-            );
+                input.as_ptr().add(c));
 
         let dy =
             _mm256_loadu_ps(
-                grad.as_ptr().add(c)
-            );
+                grad.as_ptr().add(c));
 
         let g =
             _mm256_loadu_ps(
-                gamma.as_ptr().add(c)
-            );
+                gamma.as_ptr().add(c));
 
         let xhat =
             _mm256_mul_ps(
@@ -1379,8 +1315,7 @@ unsafe fn layer_norm_backward_group_avx2(
 
         let old_dgamma =
             _mm256_loadu_ps(
-                weight_grads.as_ptr().add(c)
-            );
+                weight_grads.as_ptr().add(c));
 
         _mm256_storeu_ps(
             weight_grads.as_mut_ptr().add(c),
@@ -1392,8 +1327,7 @@ unsafe fn layer_norm_backward_group_avx2(
 
         let old_dbeta =
             _mm256_loadu_ps(
-                bias_grads.as_ptr().add(c)
-            );
+                bias_grads.as_ptr().add(c));
 
         _mm256_storeu_ps(
             bias_grads.as_mut_ptr().add(c),
@@ -1446,8 +1380,7 @@ unsafe fn layer_norm_backward_group_avx2(
             gamma[c];
 
         let xhat =
-            (x - mean)
-                * inv_std;
+            (x - mean)* inv_std;
 
         weight_grads[c] +=
             dy * xhat;
@@ -1596,8 +1529,7 @@ pub fn layer_norm_backward(
                 grad_group[c];
 
             let xhat =
-                (x - mean)
-                    * inv_std;
+                (x - mean)* inv_std;
 
             let dxhat =
                 dy * gamma[c];
@@ -1625,8 +1557,7 @@ pub fn layer_norm_backward(
                 grad_group[c];
 
             let xhat =
-                (x - mean)
-                    * inv_std;
+                (x - mean)* inv_std;
 
             workspace.weight_grads[c] +=
                 dy * xhat;
@@ -1652,8 +1583,7 @@ pub fn layer_norm_backward(
         input_grads,
         workspace.weight_grads.clone(),
         workspace.bias_grads.clone(),
-    )
-}
+    )}
 
 
 // ============================================================================
@@ -1774,8 +1704,7 @@ pub fn weight_tying_backward(
     (
         input_grads,
         workspace.embedding_grads.clone(),
-    )
-}
+    )}
 
 
 // ============================================================================
@@ -1809,27 +1738,19 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
         while g + 16 <= global_dim {
             let p0 =
                 _mm256_loadu_ps(
-                    probs.as_ptr()
-                        .add(base + g)
-                );
+                    probs.as_ptr().add(base + g));
 
             let dg0 =
                 _mm256_loadu_ps(
-                    score_grads.as_ptr()
-                        .add(base + g)
-                );
+                    score_grads.as_ptr().add(base + g));
 
             let p1 =
                 _mm256_loadu_ps(
-                    probs.as_ptr()
-                        .add(base + g + 8)
-                );
+                    probs.as_ptr().add(base + g + 8));
 
             let dg1 =
                 _mm256_loadu_ps(
-                    score_grads.as_ptr()
-                        .add(base + g + 8)
-                );
+                    score_grads.as_ptr().add(base + g + 8));
 
             dot0 =
                 _mm256_fmadd_ps(
@@ -1851,15 +1772,11 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
         while g + 8 <= global_dim {
             let p =
                 _mm256_loadu_ps(
-                    probs.as_ptr()
-                        .add(base + g)
-                );
+                    probs.as_ptr().add(base + g));
 
             let dg =
                 _mm256_loadu_ps(
-                    score_grads.as_ptr()
-                        .add(base + g)
-                );
+                    score_grads.as_ptr().add(base + g));
 
             dot0 =
                 _mm256_fmadd_ps(
@@ -1920,15 +1837,11 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
         while g + 8 <= global_dim {
             let p =
                 _mm256_loadu_ps(
-                    probs.as_ptr()
-                        .add(base + g)
-                );
+                    probs.as_ptr().add(base + g));
 
             let dg =
                 _mm256_loadu_ps(
-                    score_grads.as_ptr()
-                        .add(base + g)
-                );
+                    score_grads.as_ptr().add(base + g));
 
             let result =
                 _mm256_mul_ps(
@@ -1940,8 +1853,7 @@ unsafe fn global_mixer_read_softmax_backward_avx2(
                 );
 
             _mm256_storeu_ps(
-                score_grads.as_mut_ptr()
-                    .add(base + g),
+                score_grads.as_mut_ptr().add(base + g),
                 result,
             );
 
@@ -2022,18 +1934,7 @@ fn global_mixer_write_softmax_causal_backward(
                 * global_dim;
 
         for g in 0..global_dim {
-            // h = a_{p+1} * dL/da_{p+1}
-            //     + future contribution beyond p+1
-            //
-            // Initially there is no future position.
             let mut h =
-                0.0f32;
-
-            // Probability at p+1.
-            //
-            // Initialized to zero so the first iteration (the final
-            // position) naturally gets zero future contribution.
-            let mut next_probability =
                 0.0f32;
 
             for p in (0..positions).rev() {
@@ -2048,37 +1949,29 @@ fn global_mixer_write_softmax_causal_backward(
                 let d_probability =
                     score_grads[index];
 
-                // Contribution from all future outputs q > p.
-                let future =
-                    (
-                        1.0f32
-                            - next_probability
-                    )
-                        * h;
-
-                // Exact causal-prefix-softmax derivative.
                 let d_score =
                     probability
                         * (
                         (
                             1.0f32
                                 - probability
-                        )
-                            * d_probability
-                            - future
+                        ) * d_probability
+                            - h
                     );
 
                 score_grads[index] =
                     d_score;
 
-                // Prepare h_p for the next iteration.
                 h =
-                    probability
-                        * d_probability
-                        + future;
-
-                next_probability =
-                    probability;
+                    (
+                        1.0f32
+                            - probability
+                    )
+                        * (
+                        probability
+                            * d_probability
+                            + h
+                    );
             }
         }
     }
@@ -2106,10 +1999,13 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
             0usize;
 
         while g + 8 <= global_dim {
+            // This is:
+            //
+            // H_p = sum_{q > p}
+            //       (S_p / S_q) * a_q * dL/da_q
+            //
+            // During the reverse scan, h stores H_p.
             let mut h =
-                _mm256_setzero_ps();
-
-            let mut next_probability =
                 _mm256_setzero_ps();
 
             for p in (0..positions).rev() {
@@ -2132,27 +2028,20 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                             .add(index)
                     );
 
-                // F_p =
-                // (1 - a_{p+1}) * H_{p+1}
-                let future =
-                    _mm256_mul_ps(
-                        _mm256_sub_ps(
-                            one,
-                            next_probability,
-                        ),
-                        h,
-                    );
-
-                // ds_p =
-                // a_p * (
-                //     (1 - a_p) * da_p
-                //     - F_p
-                // )
                 let one_minus_probability =
                     _mm256_sub_ps(
                         one,
                         probability,
                     );
+
+                // ------------------------------------------------------------
+                // ds_p =
+                //
+                // a_p * (
+                //     (1 - a_p) * da_p
+                //     - H_p
+                // )
+                // ------------------------------------------------------------
 
                 let local =
                     _mm256_mul_ps(
@@ -2165,7 +2054,7 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                         probability,
                         _mm256_sub_ps(
                             local,
-                            future,
+                            h,
                         ),
                     );
 
@@ -2176,27 +2065,45 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                     d_score,
                 );
 
-                // H_p =
-                // a_p * da_p + F_p
-                h =
-                    _mm256_fmadd_ps(
+                // ------------------------------------------------------------
+                // Update H for the next iteration:
+                //
+                // H_{p-1} =
+                //     (1 - a_p) *
+                //     (
+                //         a_p * da_p
+                //         + H_p
+                //     )
+                //
+                // This denominator-ratio factor is essential for a causal
+                // prefix softmax.
+                // ------------------------------------------------------------
+
+                let weighted_current =
+                    _mm256_mul_ps(
                         probability,
                         d_probability,
-                        future,
                     );
 
-                next_probability =
-                    probability;
+                let combined =
+                    _mm256_add_ps(
+                        weighted_current,
+                        h,
+                    );
+
+                h =
+                    _mm256_mul_ps(
+                        one_minus_probability,
+                        combined,
+                    );
             }
 
             g += 8;
         }
 
+        // Scalar global-dim tail.
         while g < global_dim {
             let mut h =
-                0.0f32;
-
-            let mut next_probability =
                 0.0f32;
 
             for p in (0..positions).rev() {
@@ -2211,31 +2118,24 @@ unsafe fn global_mixer_write_softmax_causal_backward_avx2(
                 let d_probability =
                     score_grads[index];
 
-                let future =
-                    (
-                        1.0f32
-                            - next_probability
-                    )
-                        * h;
-
-                score_grads[index] =
+                let d_score =
                     probability
                         * (
-                        (
-                            1.0f32
-                                - probability
-                        )
+                        (1.0f32 - probability)
                             * d_probability
-                            - future
+                            - h
                     );
 
-                h =
-                    probability
-                        * d_probability
-                        + future;
+                score_grads[index] =
+                    d_score;
 
-                next_probability =
-                    probability;
+                h =
+                    (1.0f32 - probability)
+                        * (
+                        probability
+                            * d_probability
+                            + h
+                    );
             }
 
             g += 1;
@@ -2391,30 +2291,22 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     let state0 =
                         _mm256_loadu_ps(
                             global_state
-                                .as_ptr()
-                                .add(global_row0 + c)
-                        );
+                                .as_ptr().add(global_row0 + c));
 
                     let dy0 =
                         _mm256_loadu_ps(
                             grad
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let x0 =
                         _mm256_loadu_ps(
                             input
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let old_dg0 =
                         _mm256_loadu_ps(
                             global_grads
-                                .as_ptr()
-                                .add(global_row0 + c)
-                        );
+                                .as_ptr().add(global_row0 + c));
 
                     // d read score.
                     d_read0 =
@@ -2434,8 +2326,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_grads
-                            .as_mut_ptr()
-                            .add(global_row0 + c),
+                            .as_mut_ptr().add(global_row0 + c),
                         new_dg0,
                     );
 
@@ -2451,9 +2342,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     let old_dx0 =
                         _mm256_loadu_ps(
                             input_grads
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let new_dx0 =
                         _mm256_fmadd_ps(
@@ -2464,8 +2353,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         input_grads
-                            .as_mut_ptr()
-                            .add(input_row + c),
+                            .as_mut_ptr().add(input_row + c),
                         new_dx0,
                     );
 
@@ -2479,8 +2367,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_state
-                            .as_mut_ptr()
-                            .add(global_row0 + c),
+                            .as_mut_ptr().add(global_row0 + c),
                         previous_state0,
                     );
 
@@ -2488,36 +2375,27 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     // Next 8 channels.
                     // --------------------------------------------------------
 
-                    let c1 =
-                        c + 8;
+                    let c1 = c + 8;
 
                     let state1 =
                         _mm256_loadu_ps(
                             global_state
-                                .as_ptr()
-                                .add(global_row0 + c1)
-                        );
+                                .as_ptr().add(global_row0 + c1));
 
                     let dy1 =
                         _mm256_loadu_ps(
                             grad
-                                .as_ptr()
-                                .add(input_row + c1)
-                        );
+                                .as_ptr().add(input_row + c1));
 
                     let x1 =
                         _mm256_loadu_ps(
                             input
-                                .as_ptr()
-                                .add(input_row + c1)
-                        );
+                                .as_ptr().add(input_row + c1));
 
                     let old_dg1 =
                         _mm256_loadu_ps(
                             global_grads
-                                .as_ptr()
-                                .add(global_row0 + c1)
-                        );
+                                .as_ptr().add(global_row0 + c1));
 
                     d_read1 =
                         _mm256_fmadd_ps(
@@ -2535,8 +2413,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_grads
-                            .as_mut_ptr()
-                            .add(global_row0 + c1),
+                            .as_mut_ptr().add(global_row0 + c1),
                         new_dg1,
                     );
 
@@ -2550,9 +2427,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     let old_dx1 =
                         _mm256_loadu_ps(
                             input_grads
-                                .as_ptr()
-                                .add(input_row + c1)
-                        );
+                                .as_ptr().add(input_row + c1));
 
                     let new_dx1 =
                         _mm256_fmadd_ps(
@@ -2563,8 +2438,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         input_grads
-                            .as_mut_ptr()
-                            .add(input_row + c1),
+                            .as_mut_ptr().add(input_row + c1),
                         new_dx1,
                     );
 
@@ -2577,8 +2451,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_state
-                            .as_mut_ptr()
-                            .add(global_row0 + c1),
+                            .as_mut_ptr().add(global_row0 + c1),
                         previous_state1,
                     );
 
@@ -2589,30 +2462,22 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     let state =
                         _mm256_loadu_ps(
                             global_state
-                                .as_ptr()
-                                .add(global_row0 + c)
-                        );
+                                .as_ptr().add(global_row0 + c));
 
                     let dy =
                         _mm256_loadu_ps(
                             grad
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let x =
                         _mm256_loadu_ps(
                             input
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let old_dg =
                         _mm256_loadu_ps(
                             global_grads
-                                .as_ptr()
-                                .add(global_row0 + c)
-                        );
+                                .as_ptr().add(global_row0 + c));
 
                     d_read0 =
                         _mm256_fmadd_ps(
@@ -2630,8 +2495,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_grads
-                            .as_mut_ptr()
-                            .add(global_row0 + c),
+                            .as_mut_ptr().add(global_row0 + c),
                         new_dg,
                     );
 
@@ -2645,9 +2509,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
                     let old_dx =
                         _mm256_loadu_ps(
                             input_grads
-                                .as_ptr()
-                                .add(input_row + c)
-                        );
+                                .as_ptr().add(input_row + c));
 
                     let new_dx =
                         _mm256_fmadd_ps(
@@ -2658,8 +2520,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         input_grads
-                            .as_mut_ptr()
-                            .add(input_row + c),
+                            .as_mut_ptr().add(input_row + c),
                         new_dx,
                     );
 
@@ -2672,8 +2533,7 @@ unsafe fn global_mixer_causal_reverse_avx2(
 
                     _mm256_storeu_ps(
                         global_state
-                            .as_mut_ptr()
-                            .add(global_row0 + c),
+                            .as_mut_ptr().add(global_row0 + c),
                         previous_state,
                     );
 
@@ -3149,8 +3009,7 @@ pub fn global_mixer_backward(
     //   dG
     //   dWrite
     //   dX
-    //   G(previous)
-    //
+    //   G(previous)//
     // These are now fused into one G×C traversal.
     // ========================================================================
 
@@ -3172,8 +3031,7 @@ pub fn global_mixer_backward(
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 =
-        is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma");
+        is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma");
 
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
@@ -3227,8 +3085,7 @@ pub fn global_mixer_backward(
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 =
-        is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma");
+        is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma");
 
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
@@ -3366,8 +3223,7 @@ pub fn global_mixer_backward(
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 =
-        is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma");
+        is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma");
 
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
@@ -3521,8 +3377,7 @@ pub fn global_mixer_backward(
     (
         grad,
         mixer_grads,
-    )
-}
+    )}
 
 
 #[derive(Default)]
@@ -3578,10 +3433,7 @@ fn backward_layers_batch_inner(
     );
 
     for (layer, cache) in
-        model_layers.iter()
-            .zip(caches.iter())
-            .rev()
-    {
+        model_layers.iter().zip(caches.iter()).rev(){
         grad = backward_layer_batch(
             layer,
             cache,
@@ -3820,8 +3672,7 @@ fn backward_layer_batch(
 
             debug_assert_eq!(
                 result.len(),
-                skip_grad.len()
-            );
+                skip_grad.len());
 
             add_f32_slice_simd(
                 &mut result,
@@ -4040,16 +3891,8 @@ fn backward_layer_batch(
                 channels,
             },
         ) => {
-            let scales =
-                params.values(
-                    layer.scales
-                );
-
-            let (
-                input_grads,
-                scale_grads,
-                bias_grads,
-            ) =
+            let scales = params.values(layer.scales);
+            let (input_grads, scale_grads, bias_grads) =
                 channel_scale_backward(
                     input,
                     &grad,
@@ -4058,26 +3901,21 @@ fn backward_layer_batch(
                     scales,
                     workspace,
                 );
-
             accumulate_parameter_grads(
                 params,
                 layer.scales,
                 &scale_grads,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.biases,
                 &bias_grads,
             );
-
             input_grads
         }
-
         // ====================================================================
         // LayerNorm
         // ====================================================================
-
         (
             Layer::LayerNorm(layer),
             BatchLayerCache::LayerNorm {
@@ -4087,16 +3925,8 @@ fn backward_layer_batch(
                 channels,
             },
         ) => {
-            let gamma =
-                params.values(
-                    layer.gamma
-                );
-
-            let (
-                input_grads,
-                gamma_grads,
-                beta_grads,
-            ) =
+            let gamma = params.values(layer.gamma);
+            let (input_grads, gamma_grads, beta_grads) =
                 layer_norm_backward(
                     input,
                     &grad,
@@ -4107,26 +3937,21 @@ fn backward_layer_batch(
                     gamma,
                     workspace,
                 );
-
             accumulate_parameter_grads(
                 params,
                 layer.gamma,
                 &gamma_grads,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.beta,
                 &beta_grads,
             );
-
             input_grads
         }
-
         // ====================================================================
         // Weight tying
         // ====================================================================
-
         (
             Layer::WeightTying(_),
             BatchLayerCache::WeightTying {
@@ -4143,10 +3968,7 @@ fn backward_layer_batch(
                 batch_size
             );
 
-            let (
-                input_grads,
-                embedding_grads,
-            ) =
+            let (input_grads, embedding_grads) =
                 weight_tying_backward(
                     input,
                     &grad,
@@ -4158,13 +3980,11 @@ fn backward_layer_batch(
                     params,
                     workspace,
                 );
-
             accumulate_parameter_grads(
                 params,
                 embeddings.parameter_range(),
                 &embedding_grads,
             );
-
             input_grads
         }
 
@@ -4184,20 +4004,9 @@ fn backward_layer_batch(
                 global_dim,
             },
         ) => {
-            let write_weights =
-                params.values(
-                    layer.write_weights
-                );
-
-            let read_weights =
-                params.values(
-                    layer.read_weights
-                );
-
-            let (
-                input_grads,
-                mixer_grads,
-            ) =
+            let write_weights = params.values(layer.write_weights);
+            let read_weights = params.values(layer.read_weights);
+            let (input_grads, mixer_grads) =
                 global_mixer_backward(
                     input,
                     write_probs,
@@ -4212,46 +4021,37 @@ fn backward_layer_batch(
                     read_weights,
                     workspace,
                 );
-
             accumulate_parameter_grads(
                 params,
                 layer.write_weights,
                 &mixer_grads.write_weights,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.write_biases,
                 &mixer_grads.write_biases,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.read_weights,
                 &mixer_grads.read_weights,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.read_biases,
                 &mixer_grads.read_biases,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.write_positional_weights,
                 &mixer_grads.write_positional_weights,
             );
-
             accumulate_parameter_grads(
                 params,
                 layer.read_positional_weights,
                 &mixer_grads.read_positional_weights,
             );
-
             input_grads
         }
-
-        _ => panic!("Layer/cache mismatch during backward pass")
-    }
+        _ => panic!("Layer/cache mismatch during backward pass")}
 }

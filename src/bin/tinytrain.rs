@@ -1,6 +1,6 @@
 use std::{fs, io, io::Write};
 use grad;
-use grad::fnn_lm::LM;
+use grad::lm::LM;
 use grad::helper;
 use grad::trainer::CheckpointFrequency;
 

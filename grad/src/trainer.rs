@@ -876,6 +876,7 @@ where
 // Trainer
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Trainer {
     lr: f32,
     lr_schedule: LrSchedule,

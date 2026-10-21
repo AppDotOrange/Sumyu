@@ -407,18 +407,21 @@ impl Embeddings {
         threshold: f32,
         vocab: Vec<String>,
     ) {
-        let n =
-            self.vocab_size();
+        // Number of nearest neighbours each token is allowed to nominate.
+        //
+        // 8 is a good default for a ~2k vocabulary:
+        // large enough to find semantic neighbourhoods, small enough
+        // to prevent giant "everything is vaguely related" clusters.
+        const K: usize = 8;
+
+        // Don't print hundreds of members for a giant cluster.
+        const MAX_PRINTED_MEMBERS: usize = 24;
+
+        let n = self.vocab_size();
 
         if n < 2 {
-            println!(
-                "Highest similarity: N/A"
-            );
-
-            println!(
-                "\nTotal clusters: 0"
-            );
-
+            println!("Highest similarity: N/A");
+            println!("\nTotal clusters: 0");
             return;
         }
 
@@ -427,53 +430,37 @@ impl Embeddings {
             "Vocabulary is smaller than the embedding vocabulary"
         );
 
-        let dim =
-            self.embedding_dim;
+        assert!(
+            threshold >= -1.0 && threshold <= 1.0,
+            "Cosine similarity threshold must be in [-1, 1]"
+        );
 
-        let values =
-            params.values(
-                self.parameter_range
-            );
+        let dim = self.embedding_dim;
 
-        let mut normalized =
-            vec![
-                0.0f32;
-                n * dim
-            ];
+        let values = params.values(self.parameter_range);
+
+        // -------------------------------------------------------------
+        // Normalize every embedding.
+        // -------------------------------------------------------------
+
+        let mut normalized = vec![0.0f32; n * dim];
 
         for id in 0..n {
-            let start =
-                id * dim;
+            let start = id * dim;
 
-            let src =
-                &values[
-                    start..start + dim
-                    ];
+            let src = &values[start..start + dim];
+            let dst = &mut normalized[start..start + dim];
 
-            let dst =
-                &mut normalized[
-                    start..start + dim
-                    ];
-
-            let mut norm_sq =
-                0.0f32;
+            let mut norm_sq = 0.0f32;
 
             for i in 0..dim {
-                let x =
-                    src[i];
-
-                dst[i] =
-                    x;
-
-                norm_sq +=
-                    x * x;
+                let x = src[i];
+                dst[i] = x;
+                norm_sq += x * x;
             }
 
             if norm_sq > 0.0 {
-                let inv_norm =
-                    norm_sq
-                        .sqrt()
-                        .recip();
+                let inv_norm = norm_sq.sqrt().recip();
 
                 for x in dst {
                     *x *= inv_norm;
@@ -481,8 +468,168 @@ impl Embeddings {
             }
         }
 
-        let mut parent:
-            Vec<usize> =
+        // -------------------------------------------------------------
+        // Cosine similarity helper.
+        //
+        // Embeddings are normalized, so cosine similarity is just dot().
+        // -------------------------------------------------------------
+
+        #[inline]
+        fn similarity(
+            normalized: &[f32],
+            dim: usize,
+            a: usize,
+            b: usize,
+        ) -> f32 {
+            let a_start = a * dim;
+            let b_start = b * dim;
+
+            let a_vec = &normalized[
+                a_start..a_start + dim
+                ];
+
+            let b_vec = &normalized[
+                b_start..b_start + dim
+                ];
+
+            let mut dot = 0.0f32;
+
+            for k in 0..dim {
+                dot += a_vec[k] * b_vec[k];
+            }
+
+            dot
+        }
+
+        // -------------------------------------------------------------
+        // Find the globally closest pair.
+        // -------------------------------------------------------------
+
+        let mut max_sim = -1.0f32;
+        let mut max_pair = (0usize, 0usize);
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim =
+                    similarity(
+                        &normalized,
+                        dim,
+                        i,
+                        j,
+                    );
+
+                if sim > max_sim {
+                    max_sim = sim;
+                    max_pair = (i, j);
+                }
+            }
+        }
+
+        println!(
+            "Highest similarity: {:.5} between {} ({}) and {} ({})",
+            max_sim,
+            max_pair.0,
+            vocab[max_pair.0],
+            max_pair.1,
+            vocab[max_pair.1],
+        );
+
+        // -------------------------------------------------------------
+        // Find top-K neighbours for every token.
+        //
+        // Instead of keeping every pair above the threshold, we only
+        // keep the strongest local relationships.
+        // -------------------------------------------------------------
+
+        let k = K.min(n - 1);
+
+        // neighbours[id] = [(other_id, similarity), ...]
+        //
+        // Sorted strongest -> weakest.
+        let mut neighbours =
+            vec![Vec::<(usize, f32)>::new(); n];
+
+        for i in 0..n {
+            let mut best =
+                Vec::<(usize, f32)>::with_capacity(k + 1);
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+
+                let sim =
+                    similarity(
+                        &normalized,
+                        dim,
+                        i,
+                        j,
+                    );
+
+                // Insert into the small sorted top-K list.
+                //
+                // Since K is only 8, this is cheaper and simpler than
+                // introducing a heap.
+                let pos = best
+                    .binary_search_by(
+                        |&(_, existing)| {
+                            existing
+                                .partial_cmp(&sim)
+                                .unwrap_or(
+                                    std::cmp::Ordering::Equal
+                                )
+                                .reverse()
+                        }
+                    )
+                    .unwrap_or_else(|p| p);
+
+                best.insert(pos, (j, sim));
+
+                if best.len() > k {
+                    best.pop();
+                }
+            }
+
+            neighbours[i] = best;
+        }
+
+        // -------------------------------------------------------------
+        // Mutual-KNN graph.
+        //
+        // An edge exists only when:
+        //
+        //   1. similarity >= threshold
+        //   2. A considers B one of its top-K neighbours
+        //   3. B considers A one of its top-K neighbours
+        //
+        // This kills most of the giant transitive chains from the
+        // previous implementation.
+        // -------------------------------------------------------------
+
+        let mut edges =
+            vec![Vec::<(usize, f32)>::new(); n];
+
+        for i in 0..n {
+            for &(j, sim) in &neighbours[i] {
+                if sim < threshold {
+                    continue;
+                }
+
+                let mutual = neighbours[j]
+                    .iter()
+                    .any(|&(other, _)| other == i);
+
+                if mutual {
+                    edges[i].push((j, sim));
+                }
+            }
+        }
+
+        // -------------------------------------------------------------
+        // Union-find over the mutual-KNN graph.
+        // -------------------------------------------------------------
+
+        let mut parent: Vec<usize> =
             (0..n).collect();
 
         let mut size =
@@ -518,139 +665,213 @@ impl Embeddings {
                 return;
             }
 
-            if size[root_a]
-                < size[root_b]
-            {
+            if size[root_a] < size[root_b] {
                 std::mem::swap(
                     &mut root_a,
                     &mut root_b,
                 );
             }
 
-            parent[root_b] =
-                root_a;
-
-            size[root_a] +=
-                size[root_b];
+            parent[root_b] = root_a;
+            size[root_a] += size[root_b];
         }
 
-        let mut max_sim =
-            -1.0f32;
-
-        let mut max_pair =
-            (0usize, 0usize);
-
         for i in 0..n {
-            let a =
-                &normalized[
-                    i * dim
-                        ..(i + 1) * dim
-                    ];
-
-            for j in (i + 1)..n {
-                let b =
-                    &normalized[
-                        j * dim
-                            ..(j + 1) * dim
-                        ];
-
-                let mut dot =
-                    0.0f32;
-
-                for k in 0..dim {
-                    dot +=
-                        a[k] * b[k];
-                }
-
-                let sim =
-                    dot;
-
-                if sim > max_sim {
-                    max_sim =
-                        sim;
-
-                    max_pair =
-                        (i, j);
-                }
-
-                if sim >= threshold {
-                    union(
-                        &mut parent,
-                        &mut size,
-                        i,
-                        j,
-                    );
-                }
+            for &(j, _) in &edges[i] {
+                union(
+                    &mut parent,
+                    &mut size,
+                    i,
+                    j,
+                );
             }
         }
 
-        println!(
-            "Highest similarity: {:.5} between {} and {}",
-            max_sim,
-            max_pair.0,
-            max_pair.1
-        );
+        // -------------------------------------------------------------
+        // Build clusters.
+        // -------------------------------------------------------------
 
-        let mut cluster_members:
-            Vec<Vec<usize>> =
-            Vec::new();
-
-        let mut cluster_index =
-            vec![usize::MAX; n];
+        let mut cluster_members =
+            vec![Vec::<usize>::new(); n];
 
         for id in 0..n {
             let root =
-                find(
-                    &mut parent,
-                    id,
-                );
+                find(&mut parent, id);
 
-            if cluster_index[root]
-                == usize::MAX
-            {
-                cluster_index[root] =
-                    cluster_members.len();
-
-                cluster_members
-                    .push(Vec::new());
-            }
-
-            cluster_members[
-                cluster_index[root]
-                ]
-                .push(id);
+            cluster_members[root].push(id);
         }
 
         let mut clusters =
-            0;
+            Vec::<Vec<usize>>::new();
 
-        for cluster
-        in cluster_members
-        {
-            if cluster.len() <= 1 {
-                continue;
+        for members in cluster_members {
+            if members.len() >= 2 {
+                clusters.push(members);
+            }
+        }
+
+        // Largest clusters first.
+        clusters.sort_by_key(
+            |cluster| std::cmp::Reverse(cluster.len())
+        );
+
+        // -------------------------------------------------------------
+        // Print clusters.
+        // -------------------------------------------------------------
+
+        let mut cluster_number = 0usize;
+
+        for cluster in &clusters {
+            cluster_number += 1;
+
+            // Find the cluster's "core" token:
+            // the member having the most strong mutual-KNN edges.
+            //
+            // If tied, use average similarity as the tiebreaker.
+            let mut core = cluster[0];
+            let mut best_degree = 0usize;
+            let mut best_avg = -1.0f32;
+
+            for &id in cluster {
+                let mut degree = 0usize;
+                let mut sum = 0.0f32;
+
+                for &(other, sim) in &edges[id] {
+                    if cluster.contains(&other) {
+                        degree += 1;
+                        sum += sim;
+                    }
+                }
+
+                let avg =
+                    if degree > 0 {
+                        sum / degree as f32
+                    } else {
+                        0.0
+                    };
+
+                if degree > best_degree
+                    || (
+                    degree == best_degree
+                        && avg > best_avg
+                )
+                {
+                    core = id;
+                    best_degree = degree;
+                    best_avg = avg;
+                }
             }
 
-            clusters += 1;
-
             println!(
-                "\nCluster {} ({} tokens):",
-                clusters,
+                "\nCluster {} ({} tokens)",
+                cluster_number,
                 cluster.len()
             );
 
-            for id in cluster {
+            println!(
+                "  Core: {} ({})",
+                core,
+                vocab[core]
+            );
+
+            println!(
+                "  Core connections: {}",
+                best_degree
+            );
+
+            if best_degree > 0 {
                 println!(
-                    "  token {} ({})",
+                    "  Core average similarity: {:.4}",
+                    best_avg
+                );
+            }
+
+            // ---------------------------------------------------------
+            // Sort members by similarity to the core.
+            // This makes the printed cluster much more useful than
+            // simply printing vocabulary-ID order.
+            // ---------------------------------------------------------
+
+            let mut ranked =
+                cluster
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != core)
+                    .map(|id| {
+                        let sim =
+                            similarity(
+                                &normalized,
+                                dim,
+                                core,
+                                id,
+                            );
+
+                        (id, sim)
+                    })
+                    .collect::<Vec<_>>();
+
+            ranked.sort_by(
+                |a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(
+                            std::cmp::Ordering::Equal
+                        )
+                }
+            );
+
+            let printed =
+                ranked
+                    .len()
+                    .min(MAX_PRINTED_MEMBERS);
+
+            for &(id, sim) in
+                ranked.iter().take(printed)
+            {
+                println!(
+                    "    {:.4}  {} ({})",
+                    sim,
                     id,
                     vocab[id]
                 );
             }
+
+            if ranked.len() > printed {
+                println!(
+                    "    ... {} more tokens",
+                    ranked.len() - printed
+                );
+            }
         }
 
+        // -------------------------------------------------------------
+        // Summary.
+        // -------------------------------------------------------------
+
+        let mutual_edges: usize =
+            edges
+                .iter()
+                .map(|e| e.len())
+                .sum::<usize>()
+                / 2;
+
         println!(
-            "\nTotal clusters: {}",
-            clusters
+            "\nClusters: {}",
+            clusters.len()
+        );
+
+        println!(
+            "Mutual-KNN edges: {}",
+            mutual_edges
+        );
+
+        println!(
+            "Threshold: {:.3}",
+            threshold
+        );
+
+        println!(
+            "K: {}",
+            k
         );
     }
 }

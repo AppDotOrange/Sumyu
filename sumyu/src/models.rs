@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use grad::fnn_lm::LM;
+use grad::lm::LM;
 
 #[derive(Clone)]
 pub struct ModelFile {

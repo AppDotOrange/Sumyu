@@ -1,7 +1,7 @@
 pub mod neuron;
 pub mod trainer;
 pub mod helper;
-pub mod fnn_lm;
+pub mod lm;
 pub mod chatter;
 pub mod embeddings;
 pub mod batched;

@@ -203,6 +203,7 @@ fn byte_fallback_base(vocab: &[String]) -> u32 {
 // LM
 // ============================================================================
 
+#[derive(Clone)]
 pub struct LM {
     trainer: Trainer,
     mlp: MLP,

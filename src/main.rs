@@ -1,4 +1,4 @@
-use grad::fnn_lm::{SavedLM, LM};
+use grad::lm::{SavedLM, LM};
 use grad::helper;
 use std::{fs, io};
 use std::io::Write;
@@ -581,10 +581,10 @@ fn main() {
 
         lm.train(
             Some(1),
-            Some("tinychat15/MiniChatterV15_batch_2000_epoch_1.check"),
+            Some("tinychat15/MiniChatterV15_batch_52687_epoch_1.check"),
             Some("tinychat15/MiniChatterV15"),
             CheckpointFrequency::EveryBatch(10),
-            Some(1e-3),
+            Some(3e-4),
             None,
             true,
             4,
