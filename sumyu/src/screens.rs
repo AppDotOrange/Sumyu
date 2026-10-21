@@ -1,5 +1,5 @@
 use std::{io, sync::mpsc, thread};
-use grad::fnn_lm::LM;
+use grad::lm::LM;
 use crate::{input, models::{self, DatasetFile, ModelFile}, terminal::Terminal};
 
 const WIDTH: usize = 50;
@@ -368,7 +368,7 @@ fn prompt_screen(
         print!("Generating...");
         terminal.flush();
 
-        let output = lm.generate(prompt.clone(), tokens, temperature);
+        let output = lm.generate(prompt.clone(), tokens, temperature, 1);
 
         terminal.clear();
 
