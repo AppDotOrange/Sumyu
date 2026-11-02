@@ -10,6 +10,7 @@ use crate::neuron::{
     Activation,
     LayerSpec,
     MLP,
+    MLPInferenceState,
     SavedMLP,
 };
 use crate::parameters::ParameterStore;
@@ -179,6 +180,38 @@ pub fn tokenize_u16(
 }
 
 #[inline]
+fn sample_logits(logits: &[f32], temp: f32) -> usize {
+    assert!(!logits.is_empty(), "Cannot sample from empty logits");
+
+    if temp <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+    }
+
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let exp_logits: Vec<f32> = logits
+        .iter()
+        .map(|&x| ((x - max_logit) / temp).exp())
+        .collect();
+
+    let sum_exp: f32 = exp_logits.iter().sum();
+    let probs: Vec<f32> = exp_logits
+        .iter()
+        .map(|&x| x / sum_exp)
+        .collect();
+
+    let distribution = WeightedIndex::new(&probs).unwrap();
+    distribution.sample(&mut rng())
+}
+
 fn byte_fallback_base(vocab: &[String]) -> u32 {
     let base =
         vocab
@@ -202,6 +235,21 @@ fn byte_fallback_base(vocab: &[String]) -> u32 {
 // ============================================================================
 // LM
 // ============================================================================
+
+/// Persistent state for token-by-token LM inference.
+///
+/// The state is model-specific: create it from an LM and keep using it with
+/// that same LM instance until the sequence is reset.
+#[derive(Clone)]
+pub struct LMInferenceState {
+    mlp_state: MLPInferenceState,
+}
+
+impl LMInferenceState {
+    pub fn position(&self) -> usize {
+        self.mlp_state.position()
+    }
+}
 
 #[derive(Clone)]
 pub struct LM {
@@ -241,9 +289,9 @@ impl LM {
                 LayerSpec::Dense {
                     output_size: size,
                     activation:
-                        Activation::LeakyReLU {
-                            slope: 0.01,
-                        },
+                    Activation::LeakyReLU {
+                        slope: 0.01,
+                    },
                 }
             );
         }
@@ -641,6 +689,82 @@ impl LM {
     }
 
     // ------------------------------------------------------------------------
+    // Incremental inference
+    // ------------------------------------------------------------------------
+
+    /// Create fresh, bounded-memory inference state for this LM.
+    ///
+    /// This requires a variable-context model whose causal convolutions use
+    /// stride 1. Dense, non-causal and strided convolution layers are rejected.
+    pub fn new_inference_state(&self) -> Result<LMInferenceState, String> {
+        Ok(LMInferenceState {
+            mlp_state: self.mlp.new_lm_inference_state()?,
+        })
+    }
+
+    /// Tokenize text using this model's vocabulary and byte fallback.
+    pub fn tokenize_text(&self, text: &str) -> Vec<u16> {
+        tokenize_u16(text, &self.vocab)
+    }
+
+    /// Sample a token ID from model logits.
+    pub fn sample_next_token(
+        &self,
+        logits: &[f32],
+        temperature: f32,
+    ) -> u16 {
+        sample_logits(logits, temperature) as u16
+    }
+
+    pub fn token_text(&self, token_id: u16) -> &str {
+        self.vocab
+            .get(token_id as usize)
+            .expect("Token ID is outside the vocabulary")
+    }
+
+    /// Consume one token ID and return logits predicting the following token.
+    pub fn forward_token_id(
+        &self,
+        token_id: u16,
+        state: &mut LMInferenceState,
+    ) -> Vec<f32> {
+        assert!(
+            (token_id as usize) < self.vocab.len(),
+            "Token ID is outside the vocabulary"
+        );
+
+        let input = self.embeddings.encode_batch(
+            &self.mlp.params,
+            &[token_id],
+            1,
+            1,
+        );
+
+        self.mlp.forward_lm_incremental(
+            &input,
+            &mut state.mlp_state,
+        )
+    }
+
+    /// Feed a prompt through a fresh or existing state and return the final
+    /// next-token logits. The prompt itself is not retained in memory.
+    pub fn prefill_ids(
+        &self,
+        ids: &[u16],
+        state: &mut LMInferenceState,
+    ) -> Result<Vec<f32>, String> {
+        if ids.is_empty() {
+            return Err("Cannot prefill incremental inference with an empty prompt".to_string());
+        }
+
+        let mut logits = Vec::new();
+        for &token_id in ids {
+            logits = self.forward_token_id(token_id, state);
+        }
+        Ok(logits)
+    }
+
+    // ------------------------------------------------------------------------
     // Single-token generation
     // ------------------------------------------------------------------------
 
@@ -657,32 +781,35 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
-        let mut context_ =
-            context;
+        let _ = threads;
 
-        let mut tokens =
-            Vec::<String>::new();
-
-        for _ in 0..gen_length {
-            let token =
-                self.generate_one(
-                    context_.clone(),
-                    temp,
-                    threads,
-                );
-
-            context_.push_str(
-                &token
-            );
-
-            tokens.push(
-                token
-            );
+        if gen_length == 0 {
+            return String::new();
         }
 
-        decode_token_stream(
-            &tokens
-        )
+        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        assert!(
+            !prompt_ids.is_empty(),
+            "Generation input cannot be empty"
+        );
+
+        let mut state = self.new_inference_state()
+            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
+        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
+            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
+
+        let mut tokens = Vec::<String>::with_capacity(gen_length);
+
+        for step in 0..gen_length {
+            let idx = sample_logits(&logits, temp);
+            tokens.push(self.vocab[idx].clone());
+
+            if step + 1 < gen_length {
+                logits = self.forward_token_id(idx as u16, &mut state);
+            }
+        }
+
+        decode_token_stream(&tokens)
     }
 
     pub fn generate_one_ids(
@@ -725,71 +852,7 @@ impl LM {
                 positions * embedding_dim,
             );
 
-        if temp <= 0.0 {
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(
-                    |a, b| {
-                        a.1.total_cmp(
-                            b.1
-                        )
-                    }
-                )
-                .unwrap()
-                .0;
-        }
-
-        let max_logit =
-            logits
-                .iter()
-                .copied()
-                .fold(
-                    f32::NEG_INFINITY,
-                    f32::max,
-                );
-
-        let exp_logits:
-            Vec<f32> =
-            logits
-                .iter()
-                .map(
-                    |&x| {
-                        (
-                            (x - max_logit)
-                                / temp
-                        )
-                            .exp()
-                    }
-                )
-                .collect();
-
-        let sum_exp:
-            f32 =
-            exp_logits
-                .iter()
-                .sum();
-
-        let probs:
-            Vec<f32> =
-            exp_logits
-                .iter()
-                .map(
-                    |&x| {
-                        x / sum_exp
-                    }
-                )
-                .collect();
-
-        let dist =
-            WeightedIndex::new(
-                &probs
-            )
-                .unwrap();
-
-        dist.sample(
-            &mut rng()
-        )
+        sample_logits(&logits, temp)
     }
 
     pub fn generate_one(
@@ -983,117 +1046,49 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
-        let trie =
-            crate::helper::Trie::from_vocab(
-                &self.vocab,
-                byte_fallback_base(
-                    &self.vocab
-                ),
-            );
+        let _ = threads; // Incremental inference currently processes one token at a time.
 
-        let max_context_len =
-            self.context_len
-                as usize;
+        if gen_length == 0 {
+            return String::new();
+        }
 
-        let mut tokenizer =
-            crate::helper::IncrementalTokenizer::new(
-                &trie,
-                max_context_len,
-            );
-
-        let initial_ids =
-            trie.tokenize_u32(
-                &context
-            );
-
-        tokenizer.push_raw_bytes(
-            context.as_bytes()
+        // Tokenize the complete prompt once. Unlike the previous implementation,
+        // we do not truncate this to context_len: convolution histories remain
+        // bounded, while each GlobalMixer carries its compact persistent state.
+        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        assert!(
+            !prompt_ids.is_empty(),
+            "Generation input cannot be empty"
         );
 
-        debug_assert_eq!(
-            tokenizer.current_ids_u16_unpadded(
-                max_context_len,
-            ),
-            {
-                let mut expected =
-                    initial_ids
-                        .iter()
-                        .map(
-                            |&x|
-                                x as u16
-                        )
-                        .collect::<Vec<_>>();
+        let mut state = self.new_inference_state()
+            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
+        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
+            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
 
-                if expected.len()
-                    > max_context_len
-                {
-                    expected =
-                        expected[
-                            expected.len()
-                                - max_context_len
-                                ..
-                            ]
-                            .to_vec();
-                }
+        let mut output = String::new();
+        let mut byte_buffer = Vec::<u8>::new();
 
-                expected
+        for step in 0..gen_length {
+            let idx = sample_logits(&logits, temp);
+            let generation = &self.vocab[idx];
+
+            output.push_str(generation);
+            stream_token(generation, &mut byte_buffer);
+            let _ = std::io::stdout().flush();
+
+            // The sampled token becomes the next model input. Avoid doing this
+            // final forward step when no subsequent token will be sampled.
+            if step + 1 < gen_length {
+                logits = self.forward_token_id(idx as u16, &mut state);
             }
-        );
-
-        let mut output =
-            String::new();
-
-        let mut byte_buffer =
-            Vec::<u8>::new();
-
-        for _ in 0..gen_length {
-            let ids =
-                tokenizer
-                    .current_ids_u16_unpadded(
-                        max_context_len,
-                    );
-
-            let idx =
-                self.generate_one_ids(
-                    &ids,
-                    temp,
-                    threads,
-                );
-
-            let generation =
-                &self.vocab[idx];
-
-            tokenizer.push_token(
-                generation
-            );
-
-            output.push_str(
-                generation
-            );
-
-            stream_token(
-                generation,
-                &mut byte_buffer,
-            );
-
-            let _ =
-                std::io::stdout()
-                    .flush();
         }
 
         if !byte_buffer.is_empty() {
-            print!(
-                "{}",
-                String::from_utf8_lossy(
-                    &byte_buffer
-                )
-            );
+            print!("{}", String::from_utf8_lossy(&byte_buffer));
         }
 
-        let _ =
-            std::io::stdout()
-                .flush();
-
+        let _ = std::io::stdout().flush();
         output
     }
 
@@ -1104,106 +1099,59 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
-        let trie =
-            crate::helper::Trie::from_vocab(
-                &self.vocab,
-                byte_fallback_base(&self.vocab),
-            );
+        let _ = threads;
 
-        let max_context_len = self.context_len as usize;
+        if gen_length == 0 {
+            return String::new();
+        }
 
-        let mut tokenizer =
-            crate::helper::IncrementalTokenizer::new(
-                &trie,
-                max_context_len,
-            );
+        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        assert!(
+            !prompt_ids.is_empty(),
+            "Generation input cannot be empty"
+        );
 
-        tokenizer.push_raw_bytes(context.as_bytes());
+        let mut state = self.new_inference_state()
+            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
+        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
+            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
 
         let mut output = String::new();
-
         let mut byte_buffer = Vec::<u8>::new();
 
-        for _ in 0..gen_length {
-            let ids = tokenizer.current_ids_u16_unpadded(max_context_len);
-
-            let idx =
-                self.generate_one_ids(
-                    &ids,
-                    temp,
-                    threads,
-                );
-
-            let mut generation = &self.vocab[idx];
+        for step in 0..gen_length {
+            let idx = sample_logits(&logits, temp);
+            let generation = &self.vocab[idx];
 
             if generation.contains("<EOT>") {
-                let before_eot =
-                    generation
-                        .split("<EOT>")
-                        .next()
-                        .unwrap();
+                let before_eot = generation.split("<EOT>").next().unwrap();
 
-                let empty = String::from("");
-                if generation == "<EOT>" {
-                    generation = &empty;
-                }
-
-                stream_token(
-                    before_eot,
-                    &mut byte_buffer,
-                );
-
+                stream_token(before_eot, &mut byte_buffer);
                 if !byte_buffer.is_empty() {
-                    print!(
-                        "{}",
-                        String::from_utf8_lossy(
-                            &byte_buffer
-                        )
-                    );
-
+                    print!("{}", String::from_utf8_lossy(&byte_buffer));
                     byte_buffer.clear();
                 }
-
                 let _ = std::io::stdout().flush();
 
-                output.push_str(generation);
-
+                output.push_str(before_eot);
                 return output;
             }
 
-            tokenizer.push_token(
-                generation
-            );
+            output.push_str(generation);
+            stream_token(generation, &mut byte_buffer);
+            let _ = std::io::stdout().flush();
 
-            output.push_str(
-                generation
-            );
-
-            stream_token(
-                generation,
-                &mut byte_buffer,
-            );
-
-            let _ =
-                std::io::stdout()
-                    .flush();
+            if step + 1 < gen_length {
+                logits = self.forward_token_id(idx as u16, &mut state);
+            }
         }
 
         if !byte_buffer.is_empty() {
-            print!(
-                "{}",
-                String::from_utf8_lossy(
-                    &byte_buffer
-                )
-            );
+            print!("{}", String::from_utf8_lossy(&byte_buffer));
         }
 
-        let _ =
-            std::io::stdout()
-                .flush();
-
+        let _ = std::io::stdout().flush();
         println!();
-
         output
     }
 
@@ -2174,7 +2122,7 @@ impl LM {
             ),
         )
     }
-    
+
     pub fn find_clusters(&self, threshold: f32) {
         self.embeddings.find_clusters(&self.mlp.parameters(), threshold, self.vocab.clone())
     }

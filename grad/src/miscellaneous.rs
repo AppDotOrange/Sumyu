@@ -1,4 +1,4 @@
-use crate::neuron::LayerSpec;
+use crate::neuron::{LayerSpec, GLOBAL_MIXER_POS_FEATURES};
 
 pub fn stream_token(
     token: &str,
@@ -574,9 +574,6 @@ pub fn print_layer_specs(
                     "GlobalMixer channel mismatch"
                 );
 
-                const POSITIONAL_FEATURES:
-                usize = 4;
-
                 let write_weights =
                     *mixer_channels
                         * *global_dim;
@@ -593,11 +590,11 @@ pub fn print_layer_specs(
 
                 let write_positional_weights =
                     *global_dim
-                        * POSITIONAL_FEATURES;
+                        * GLOBAL_MIXER_POS_FEATURES;
 
                 let read_positional_weights =
                     *global_dim
-                        * POSITIONAL_FEATURES;
+                        * GLOBAL_MIXER_POS_FEATURES;
 
                 let positional_total =
                     write_positional_weights
@@ -633,7 +630,7 @@ pub fn print_layer_specs(
                 println!(
                     "{}                                  positional features {} | {} write positional + {} read positional = {} params",
                     prefix,
-                    POSITIONAL_FEATURES,
+                    GLOBAL_MIXER_POS_FEATURES,
                     write_positional_weights,
                     read_positional_weights,
                     positional_total,

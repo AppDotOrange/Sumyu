@@ -33,6 +33,7 @@ use crate::neuron::{
     LayerNormLayer,
     LowRankPointwiseLayer,
     WeightTyingLayer,
+    GLOBAL_MIXER_POS_FEATURES,
 };
 use crate::parameters::ParameterStore;
 
@@ -194,7 +195,7 @@ fn global_mixer_softmax_write_causal(
     batch_size: usize,
     positions: usize,
     global_dim: usize,
-) {
+) -> Vec<f32> {
     debug_assert_eq!(
         values.len(),
         batch_size * positions * global_dim
@@ -204,6 +205,17 @@ fn global_mixer_softmax_write_causal(
         scratch_log_norm.len(),
         values.len()
     );
+
+    // Final prefix log-normalizer for each batch item and global channel.
+    // This is retained for continuation by incremental inference.
+    let mut final_log_norm = vec![
+        f32::NEG_INFINITY;
+        batch_size * global_dim
+    ];
+
+    if positions == 0 {
+        return final_log_norm;
+    }
 
     for b in 0..batch_size {
         let base =
@@ -259,6 +271,11 @@ fn global_mixer_softmax_write_causal(
                         + exp_sum.ln();
             }
 
+            final_log_norm[b * global_dim + g] =
+                scratch_log_norm[
+                    base + (positions - 1) * global_dim + g
+                    ];
+
             // ------------------------------------------------------------
             // Pass 2:
             // Convert each score into its prefix-normalized probability.
@@ -286,6 +303,8 @@ fn global_mixer_softmax_write_causal(
             }
         }
     }
+
+    final_log_norm
 }
 
 fn global_mixer_softmax_read(
@@ -363,50 +382,67 @@ fn global_mixer_softmax_read(
     }
 }
 
-pub const GLOBAL_MIXER_POS_FEATURES: usize = 4;
+const GLOBAL_MIXER_POSITION_MIN_PERIOD: f64 = 3.0;
+const GLOBAL_MIXER_POSITION_MAX_PERIOD: f64 = 1_048_576.0;
+const GLOBAL_MIXER_POSITION_REFERENCE: f64 = 128.0;
 
 #[inline]
 pub fn global_mixer_position_features(
     positions: usize,
-) -> Vec<
-    [f32; GLOBAL_MIXER_POS_FEATURES]
-> {
-    let mut features =
-        vec![
-            [0.0f32; GLOBAL_MIXER_POS_FEATURES];
-            positions
-        ];
+    position_offset: usize,
+) -> Vec<[f32; GLOBAL_MIXER_POS_FEATURES]> {
+    const FREQUENCY_BANDS: usize =
+        GLOBAL_MIXER_POS_FEATURES / 2;
+
+    let mut features = vec![
+        [0.0f32; GLOBAL_MIXER_POS_FEATURES];
+        positions
+    ];
 
     if positions == 0 {
         return features;
     }
 
-    if positions == 1 {
-        features[0] = [
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-        ];
+    // Validate the last absolute position once. This also guarantees that
+    // position_offset + local_position cannot overflow inside the loop.
+    position_offset
+        .checked_add(positions - 1)
+        .expect("GlobalMixer position overflow");
 
-        return features;
+    let period_ratio =
+        GLOBAL_MIXER_POSITION_MAX_PERIOD
+            / GLOBAL_MIXER_POSITION_MIN_PERIOD;
+
+    // Wavelengths are logarithmically spaced from 3 to 1,048,576 tokens.
+    // Compute them once per call rather than once per token.
+    let mut periods = [0.0f64; FREQUENCY_BANDS];
+    for band in 0..FREQUENCY_BANDS {
+        let scale =
+            band as f64 / (FREQUENCY_BANDS - 1) as f64;
+
+        periods[band] =
+            GLOBAL_MIXER_POSITION_MIN_PERIOD
+                * period_ratio.powf(scale);
     }
 
-    let denom =
-        (positions - 1) as f32;
+    for local_position in 0..positions {
+        let absolute_position =
+            position_offset + local_position;
+        let p = absolute_position as f64;
 
-    for p in 0..positions {
-        let x =
-            2.0f32
-                * (p as f32 / denom)
-                - 1.0;
+        for band in 0..FREQUENCY_BANDS {
+            let angle =
+                std::f64::consts::TAU * p / periods[band];
 
-        features[p] = [
-            x,
-            x * x,
-            (std::f32::consts::PI * x).sin(),
-            (std::f32::consts::PI * x).cos(),
-        ];
+            features[local_position][band * 2] =
+                angle.sin() as f32;
+            features[local_position][band * 2 + 1] =
+                angle.cos() as f32;
+        }
+
+        // One non-periodic, slowly varying absolute-position feature.
+        features[local_position][GLOBAL_MIXER_POS_FEATURES - 1] =
+            (1.0 + p / GLOBAL_MIXER_POSITION_REFERENCE).ln() as f32;
     }
 
     features
@@ -447,21 +483,13 @@ fn global_mixer_build_positional_biases(
                 g
                     * GLOBAL_MIXER_POS_FEATURES;
 
-            biases[row + g] =
-                f[0]
-                    * positional_weights[w]
-                    + f[1]
-                    * positional_weights[
-                    w + 1
-                    ]
-                    + f[2]
-                    * positional_weights[
-                    w + 2
-                    ]
-                    + f[3]
-                    * positional_weights[
-                    w + 3
-                    ];
+            let mut bias = 0.0f32;
+            for feature in 0..GLOBAL_MIXER_POS_FEATURES {
+                bias +=
+                    f[feature]
+                        * positional_weights[w + feature];
+            }
+            biases[row + g] = bias;
         }
     }
 
@@ -473,6 +501,7 @@ pub fn global_mixer_forward(
     input: &[f32],
     batch_size: usize,
     positions: usize,
+    position_offset: usize,
     write_weights: &[f32],
     write_biases: &[f32],
     read_weights: &[f32],
@@ -484,6 +513,8 @@ pub fn global_mixer_forward(
     Vec<f32>,
     Vec<f32>,
     Vec<f32>,
+    Vec<f32>,
+    Vec<[f32; GLOBAL_MIXER_POS_FEATURES]>,
 ) {
     let channels =
         layer.channels;
@@ -538,7 +569,8 @@ pub fn global_mixer_forward(
 
     let position_features =
         global_mixer_position_features(
-            positions
+            positions,
+            position_offset,
         );
 
     let write_positional_biases =
@@ -597,15 +629,16 @@ pub fn global_mixer_forward(
             rows * global_dim
         ];
 
-    global_mixer_softmax_write_causal(
-        &mut write_probs,
-        &mut read_probs,
-        write_biases,
-        &write_positional_biases,
-        batch_size,
-        positions,
-        global_dim,
-    );
+    let write_log_norm =
+        global_mixer_softmax_write_causal(
+            &mut write_probs,
+            &mut read_probs,
+            write_biases,
+            &write_positional_biases,
+            batch_size,
+            positions,
+            global_dim,
+        );
 
     // ------------------------------------------------------------------------
     // Read projection
@@ -732,7 +765,590 @@ pub fn global_mixer_forward(
         write_probs,
         global_vectors,
         read_probs,
+        write_log_norm,
+        position_features,
     )
+}
+
+
+// ============================================================================
+// Incremental inference state
+// ============================================================================
+
+/// Per-layer state required to process one token at a time.
+///
+/// Causal convolutions retain only their last K-1 input vectors. GlobalMixer
+/// retains its cumulative global vectors and prefix write log-normalizers.
+/// All other supported layers are stateless between tokens.
+#[derive(Clone)]
+pub enum LayerInferenceState {
+    Stateless,
+    CausalConvHistory {
+        history: Vec<f32>,
+    },
+    Residual {
+        inner: Vec<LayerInferenceState>,
+    },
+    GlobalMixer {
+        global_vectors: Vec<f32>,
+        write_log_norm: Vec<f32>,
+    },
+}
+
+/// Stateful inference cache for an MLP whose final layer is WeightTying.
+/// The cache is tied to the architecture and parameter layout used to create it.
+#[derive(Clone)]
+pub struct MLPInferenceState {
+    pub(crate) layer_states: Vec<LayerInferenceState>,
+    pub(crate) next_position: usize,
+}
+
+impl MLPInferenceState {
+    pub(crate) fn new(backbone_layers: &[Layer]) -> Result<Self, String> {
+        let mut layer_states = Vec::with_capacity(backbone_layers.len());
+
+        for (index, layer) in backbone_layers.iter().enumerate() {
+            layer_states.push(new_layer_inference_state(layer).map_err(|error| {
+                format!("Cannot initialize incremental state for backbone layer {}: {}", index + 1, error)
+            })?);
+        }
+
+        Ok(Self {
+            layer_states,
+            next_position: 0,
+        })
+    }
+
+    pub fn position(&self) -> usize {
+        self.next_position
+    }
+}
+
+fn new_layer_inference_state(
+    layer: &Layer,
+) -> Result<LayerInferenceState, String> {
+    match layer {
+        Layer::Dense(_) => Err(
+            "Dense is not supported by variable-context incremental inference".to_string()
+        ),
+
+        Layer::Conv1D(layer) => {
+            if !layer.causal || layer.stride != 1 {
+                return Err(format!(
+                    "Conv1D requires causal=true and stride=1 (got causal={}, stride={})",
+                    layer.causal,
+                    layer.stride,
+                ));
+            }
+            Ok(LayerInferenceState::CausalConvHistory {
+                history: Vec::with_capacity(
+                    layer.kernel_size.saturating_sub(1) * layer.in_channels
+                ),
+            })
+        }
+
+        Layer::DepthwiseConv1D(layer) => {
+            if !layer.causal || layer.stride != 1 {
+                return Err(format!(
+                    "DepthwiseConv1D requires causal=true and stride=1 (got causal={}, stride={})",
+                    layer.causal,
+                    layer.stride,
+                ));
+            }
+            Ok(LayerInferenceState::CausalConvHistory {
+                history: Vec::with_capacity(
+                    layer.kernel_size.saturating_sub(1) * layer.in_channels
+                ),
+            })
+        }
+
+        Layer::GroupedConv1D(layer) => {
+            if !layer.causal || layer.stride != 1 {
+                return Err(format!(
+                    "GroupedConv1D requires causal=true and stride=1 (got causal={}, stride={})",
+                    layer.causal,
+                    layer.stride,
+                ));
+            }
+            Ok(LayerInferenceState::CausalConvHistory {
+                history: Vec::with_capacity(
+                    layer.kernel_size.saturating_sub(1) * layer.in_channels
+                ),
+            })
+        }
+
+        Layer::Residual(layer) => {
+            let mut inner = Vec::with_capacity(layer.layers.len());
+            for (index, inner_layer) in layer.layers.iter().enumerate() {
+                inner.push(new_layer_inference_state(inner_layer).map_err(|error| {
+                    format!("Residual inner layer {}: {}", index + 1, error)
+                })?);
+            }
+            Ok(LayerInferenceState::Residual { inner })
+        }
+
+        Layer::LowRankPointwise(_)
+        | Layer::ChannelScale(_)
+        | Layer::LayerNorm(_) => Ok(LayerInferenceState::Stateless),
+
+        Layer::GlobalMixer(layer) => Ok(LayerInferenceState::GlobalMixer {
+            global_vectors: vec![
+                0.0f32;
+                layer.global_dim * layer.channels
+            ],
+            write_log_norm: vec![
+                f32::NEG_INFINITY;
+                layer.global_dim
+            ],
+        }),
+
+        Layer::WeightTying(_) => Err(
+            "WeightTying must be the final LM layer, not part of the incremental backbone".to_string()
+        ),
+    }
+}
+
+#[inline]
+fn append_causal_history(
+    history: &mut Vec<f32>,
+    current: &[f32],
+    channels: usize,
+    kernel_size: usize,
+) {
+    let keep = kernel_size.saturating_sub(1) * channels;
+    if keep == 0 {
+        history.clear();
+        return;
+    }
+
+    history.extend_from_slice(current);
+    if history.len() > keep {
+        let remove = history.len() - keep;
+        history.drain(0..remove);
+    }
+}
+
+#[inline]
+fn causal_window_source<'a>(
+    history: &'a [f32],
+    current: &'a [f32],
+    channels: usize,
+    leading_padding: usize,
+    kernel_offset: usize,
+) -> Option<&'a [f32]> {
+    if kernel_offset < leading_padding {
+        return None;
+    }
+
+    let window_position = kernel_offset - leading_padding;
+    let history_positions = history.len() / channels;
+
+    if window_position < history_positions {
+        let start = window_position * channels;
+        Some(&history[start..start + channels])
+    } else if window_position == history_positions {
+        Some(current)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn global_mixer_logaddexp(a: f32, b: f32) -> f32 {
+    if !a.is_finite() {
+        return b;
+    }
+    if !b.is_finite() {
+        return a;
+    }
+
+    let maximum = a.max(b);
+    maximum + ((a - maximum).exp() + (b - maximum).exp()).ln()
+}
+
+/// Process one token through a GlobalMixer while preserving its prefix state.
+/// This is algebraically the one-token continuation of global_mixer_forward:
+/// logZ_new = logaddexp(logZ_old, score), a = exp(score - logZ_new).
+fn global_mixer_forward_incremental(
+    layer: &GlobalMixerLayer,
+    input: &[f32],
+    absolute_position: usize,
+    global_vectors: &mut [f32],
+    write_log_norm: &mut [f32],
+    params: &ParameterStore,
+) -> Vec<f32> {
+    let channels = layer.channels;
+    let global_dim = layer.global_dim;
+
+    assert_eq!(input.len(), channels);
+    assert_eq!(global_vectors.len(), global_dim * channels);
+    assert_eq!(write_log_norm.len(), global_dim);
+
+    let write_weights = params.values(layer.write_weights);
+    let write_biases = params.values(layer.write_biases);
+    let read_weights = params.values(layer.read_weights);
+    let read_biases = params.values(layer.read_biases);
+    let write_positional_weights = params.values(layer.write_positional_weights);
+    let read_positional_weights = params.values(layer.read_positional_weights);
+
+    debug_assert_eq!(write_weights.len(), global_dim * channels);
+    debug_assert_eq!(read_weights.len(), global_dim * channels);
+    debug_assert_eq!(write_biases.len(), global_dim);
+    debug_assert_eq!(read_biases.len(), global_dim);
+    debug_assert_eq!(
+        write_positional_weights.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES
+    );
+    debug_assert_eq!(
+        read_positional_weights.len(),
+        global_dim * GLOBAL_MIXER_POS_FEATURES
+    );
+
+    let position_features =
+        global_mixer_position_features(1, absolute_position);
+
+    let write_positional_biases =
+        global_mixer_build_positional_biases(
+            &position_features,
+            write_positional_weights,
+            global_dim,
+        );
+
+    let read_positional_biases =
+        global_mixer_build_positional_biases(
+            &position_features,
+            read_positional_weights,
+            global_dim,
+        );
+
+    // Update the persistent prefix-normalized write state.
+    for g in 0..global_dim {
+        let weight_base = g * channels;
+        let mut score = write_biases[g] + write_positional_biases[g];
+
+        for c in 0..channels {
+            score += input[c] * write_weights[weight_base + c];
+        }
+
+        let new_log_norm =
+            global_mixer_logaddexp(write_log_norm[g], score);
+
+        let write_probability =
+            (score - new_log_norm).exp();
+
+        write_log_norm[g] = new_log_norm;
+
+        let global_base = g * channels;
+        for c in 0..channels {
+            global_vectors[global_base + c] +=
+                write_probability * input[c];
+        }
+    }
+
+    // Read from the updated state, matching the batched order G_p then Y_p.
+    let mut read_scores = vec![0.0f32; global_dim];
+    let mut maximum = f32::NEG_INFINITY;
+
+    for g in 0..global_dim {
+        let weight_base = g * channels;
+        let mut score = read_biases[g] + read_positional_biases[g];
+
+        for c in 0..channels {
+            score += input[c] * read_weights[weight_base + c];
+        }
+
+        read_scores[g] = score;
+        maximum = maximum.max(score);
+    }
+
+    let mut denominator = 0.0f32;
+    for score in &mut read_scores {
+        *score = (*score - maximum).exp();
+        denominator += *score;
+    }
+
+    let inverse_denominator = 1.0f32 / denominator;
+    let mut output = input.to_vec();
+
+    for g in 0..global_dim {
+        let read_probability = read_scores[g] * inverse_denominator;
+        let global_base = g * channels;
+
+        for c in 0..channels {
+            output[c] +=
+                read_probability * global_vectors[global_base + c];
+        }
+    }
+
+    output
+}
+
+/// Run the variable-context LM backbone for exactly one new token.
+/// `position` is absolute and must advance by one for each consumed token.
+pub fn forward_layers_incremental(
+    layers: &[Layer],
+    params: &ParameterStore,
+    input: &[f32],
+    position: usize,
+    states: &mut [LayerInferenceState],
+) -> Vec<f32> {
+    assert_eq!(
+        layers.len(),
+        states.len(),
+        "Incremental state does not match the backbone layer count"
+    );
+
+    let mut current = input.to_vec();
+
+    for (layer, state) in layers.iter().zip(states.iter_mut()) {
+        current = forward_layer_incremental(
+            layer,
+            params,
+            &current,
+            position,
+            state,
+        );
+    }
+
+    current
+}
+
+fn forward_layer_incremental(
+    layer: &Layer,
+    params: &ParameterStore,
+    input: &[f32],
+    position: usize,
+    state: &mut LayerInferenceState,
+) -> Vec<f32> {
+    match layer {
+        Layer::Conv1D(layer) => {
+            let history = match state {
+                LayerInferenceState::CausalConvHistory { history } => history,
+                _ => panic!("Conv1D incremental state mismatch"),
+            };
+
+            let channels = layer.in_channels;
+            let kernel_size = layer.kernel_size;
+            let kernel_width = kernel_size * channels;
+            let weights = params.values(layer.weights);
+            let biases = params.values(layer.biases);
+
+            debug_assert_eq!(input.len(), channels);
+            debug_assert_eq!(weights.len(), layer.out_channels * kernel_width);
+            debug_assert_eq!(biases.len(), layer.out_channels);
+
+            let history_positions = history.len() / channels;
+            let leading_padding = kernel_size.saturating_sub(history_positions + 1);
+            let mut output = vec![0.0f32; layer.out_channels];
+
+            for oc in 0..layer.out_channels {
+                let mut sum = biases[oc];
+                let output_weight_base = oc * kernel_width;
+
+                for k in leading_padding..kernel_size {
+                    let Some(source) = causal_window_source(
+                        history,
+                        input,
+                        channels,
+                        leading_padding,
+                        k,
+                    ) else {
+                        continue;
+                    };
+
+                    let weight_base = output_weight_base + k * channels;
+                    for ic in 0..channels {
+                        sum += source[ic] * weights[weight_base + ic];
+                    }
+                }
+
+                output[oc] = layer.activation.apply(sum);
+            }
+
+            append_causal_history(history, input, channels, kernel_size);
+            output
+        }
+
+        Layer::DepthwiseConv1D(layer) => {
+            let history = match state {
+                LayerInferenceState::CausalConvHistory { history } => history,
+                _ => panic!("DepthwiseConv1D incremental state mismatch"),
+            };
+
+            let channels = layer.in_channels;
+            let kernel_size = layer.kernel_size;
+            let weights = params.values(layer.weights);
+            let biases = params.values(layer.biases);
+
+            debug_assert_eq!(input.len(), channels);
+            debug_assert_eq!(weights.len(), channels * kernel_size);
+            debug_assert_eq!(biases.len(), channels);
+
+            let history_positions = history.len() / channels;
+            let leading_padding = kernel_size.saturating_sub(history_positions + 1);
+            let mut output = vec![0.0f32; channels];
+
+            for c in 0..channels {
+                let mut sum = biases[c];
+
+                for k in leading_padding..kernel_size {
+                    let Some(source) = causal_window_source(
+                        history,
+                        input,
+                        channels,
+                        leading_padding,
+                        k,
+                    ) else {
+                        continue;
+                    };
+
+                    sum += source[c] * weights[c * kernel_size + k];
+                }
+
+                output[c] = layer.activation.apply(sum);
+            }
+
+            append_causal_history(history, input, channels, kernel_size);
+            output
+        }
+
+        Layer::GroupedConv1D(layer) => {
+            let history = match state {
+                LayerInferenceState::CausalConvHistory { history } => history,
+                _ => panic!("GroupedConv1D incremental state mismatch"),
+            };
+
+            let channels = layer.in_channels;
+            let kernel_size = layer.kernel_size;
+            let group_in = channels / layer.groups;
+            let group_out = layer.out_channels / layer.groups;
+            let kernel_width = group_in * kernel_size;
+            let weights = params.values(layer.weights);
+            let biases = params.values(layer.biases);
+
+            debug_assert_eq!(input.len(), channels);
+            debug_assert_eq!(
+                weights.len(),
+                layer.out_channels * kernel_width
+            );
+            debug_assert_eq!(biases.len(), layer.out_channels);
+
+            let history_positions = history.len() / channels;
+            let leading_padding = kernel_size.saturating_sub(history_positions + 1);
+            let mut output = vec![0.0f32; layer.out_channels];
+
+            for group in 0..layer.groups {
+                let input_group_base = group * group_in;
+                let output_group_base = group * group_out;
+                let weight_group_base = group * group_out * kernel_width;
+
+                for oc in 0..group_out {
+                    let output_channel = output_group_base + oc;
+                    let weight_output_base =
+                        weight_group_base + oc * kernel_width;
+                    let mut sum = biases[output_channel];
+
+                    for k in leading_padding..kernel_size {
+                        let Some(source) = causal_window_source(
+                            history,
+                            input,
+                            channels,
+                            leading_padding,
+                            k,
+                        ) else {
+                            continue;
+                        };
+
+                        let weight_base = weight_output_base + k * group_in;
+                        for ic in 0..group_in {
+                            sum += source[input_group_base + ic]
+                                * weights[weight_base + ic];
+                        }
+                    }
+
+                    output[output_channel] = layer.activation.apply(sum);
+                }
+            }
+
+            append_causal_history(history, input, channels, kernel_size);
+            output
+        }
+
+        Layer::Residual(layer) => {
+            let inner_states = match state {
+                LayerInferenceState::Residual { inner } => inner,
+                _ => panic!("Residual incremental state mismatch"),
+            };
+
+            let mut output = forward_layers_incremental(
+                &layer.layers,
+                params,
+                input,
+                position,
+                inner_states,
+            );
+
+            assert_eq!(output.len(), input.len(), "Residual block changed token width");
+            for (value, residual) in output.iter_mut().zip(input.iter()) {
+                *value += *residual;
+            }
+            output
+        }
+
+        Layer::LowRankPointwise(layer) => {
+            let first_weights = params.values(layer.first_weights);
+            let first_biases = params.values(layer.first_biases);
+            let second_weights = params.values(layer.second_weights);
+            let second_biases = params.values(layer.second_biases);
+
+            let (output, _) = low_rank_pointwise_forward(
+                layer,
+                input,
+                1,
+                1,
+                first_weights,
+                first_biases,
+                second_weights,
+                second_biases,
+            );
+            output
+        }
+
+        Layer::ChannelScale(layer) =>
+            channel_scale_forward(layer, input, 1, params),
+
+        Layer::LayerNorm(layer) => {
+            let (output, _, _) = layer_norm_forward(layer, input, 1, params);
+            output
+        }
+
+        Layer::GlobalMixer(layer) => {
+            let (global_vectors, write_log_norm) = match state {
+                LayerInferenceState::GlobalMixer {
+                    global_vectors,
+                    write_log_norm,
+                } => (global_vectors, write_log_norm),
+                _ => panic!("GlobalMixer incremental state mismatch"),
+            };
+
+            global_mixer_forward_incremental(
+                layer,
+                input,
+                position,
+                global_vectors,
+                write_log_norm,
+                params,
+            )
+        }
+
+        Layer::Dense(_) => panic!(
+            "Dense is not supported by variable-context incremental inference"
+        ),
+
+        Layer::WeightTying(_) => panic!(
+            "WeightTying is the final LM projection and must not be in the incremental backbone"
+        ),
+    }
 }
 
 // ============================================================================
@@ -2820,12 +3436,15 @@ fn forward_layer_batch(
                 write_probs,
                 global_vectors,
                 read_probs,
+                write_log_norm,
+                position_features,
             ) =
                 global_mixer_forward(
                     layer,
                     input,
                     batch_size,
                     positions,
+                    0, // Training sequences begin at absolute position zero.
                     write_weights,
                     write_biases,
                     read_weights,
@@ -2840,6 +3459,8 @@ fn forward_layer_batch(
                     write_probs,
                     global_vectors,
                     read_probs,
+                    write_log_norm,
+                    position_features,
                     positions,
                     channels: layer.channels,
                     global_dim: layer.global_dim,
@@ -2851,5 +3472,29 @@ fn forward_layer_batch(
                 cache,
             )
         }
+    }
+}
+
+
+#[cfg(test)]
+mod global_mixer_position_tests {
+    use super::global_mixer_position_features;
+
+    #[test]
+    fn absolute_position_features_are_chunk_invariant() {
+        let full = global_mixer_position_features(512, 0);
+        let chunk = global_mixer_position_features(128, 128);
+
+        assert_eq!(&full[128..256], &chunk[..]);
+    }
+
+    #[test]
+    fn position_features_are_finite_at_long_offsets() {
+        let features = global_mixer_position_features(4, 1_000_000);
+
+        assert!(
+            features.iter().flatten().all(|value| value.is_finite()),
+            "GlobalMixer positional features must remain finite"
+        );
     }
 }

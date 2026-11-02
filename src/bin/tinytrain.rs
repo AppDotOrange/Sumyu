@@ -12,7 +12,7 @@ fn main() {
     //     CONFIG
     //------------------------------------------------------------------------------------------
 
-    let config = helper::poke_v5_to(1e-3, 32, 10000);
+    let config = helper::tiny_shakespeare_v1_hybrid(1e-3, 64, 10000);
     let description = "A small Sumyu Hybrid trained on Tiny Shakespeare.";
 
     //------------------------------------------------------------------------------------------

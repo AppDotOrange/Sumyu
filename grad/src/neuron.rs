@@ -284,6 +284,8 @@ pub enum BatchLayerCache {
         positions: usize,
         channels: usize,
         global_dim: usize,
+        write_log_norm: Vec<f32>,
+        position_features: Vec<[f32; GLOBAL_MIXER_POS_FEATURES]>,
     },
 }
 
@@ -786,6 +788,8 @@ impl LayerNormLayer {
     }
 }
 
+pub const GLOBAL_MIXER_POS_FEATURES: usize = 17;
+
 #[derive(Clone)]
 pub struct GlobalMixerLayer {
     pub(crate) channels: usize,
@@ -825,9 +829,8 @@ impl GlobalMixerLayer {
         let read_biases = params.alloc_many(
             std::iter::repeat_n(0.0f32, global_dim),
         );
-
-        const POS_FEATURES: usize = 4;
-        let positional_count = global_dim * POS_FEATURES;
+        let positional_count =
+            global_dim * GLOBAL_MIXER_POS_FEATURES;
 
         let write_positional_weights = params.alloc_many(
             std::iter::repeat_n(0.0f32, positional_count),
@@ -1978,14 +1981,13 @@ fn load_layer(
                 *global_dim
             );
 
-            const POS_FEATURES: usize = 4;
             assert_eq!(
                 write_positional_weights.len(),
-                global_dim * POS_FEATURES
+                global_dim * GLOBAL_MIXER_POS_FEATURES
             );
             assert_eq!(
                 read_positional_weights.len(),
-                global_dim * POS_FEATURES
+                global_dim * GLOBAL_MIXER_POS_FEATURES
             );
 
             Layer::GlobalMixer(
@@ -2346,6 +2348,91 @@ impl MLP {
             1,
             positions,
         )
+    }
+
+    /// Create bounded-memory state for token-by-token LM inference.
+    /// Only variable-context models ending in WeightTying are supported.
+    pub(crate) fn new_lm_inference_state(
+        &self,
+    ) -> Result<MLPInferenceState, String> {
+        if !matches!(
+            self.layers.last(),
+            Some(Layer::WeightTying(_))
+        ) {
+            return Err(
+                "Incremental LM inference requires WeightTying as the final layer"
+                    .to_string()
+            );
+        }
+
+        let backbone_len = self.layers.len() - 1;
+        MLPInferenceState::new(
+            &self.layers[..backbone_len]
+        )
+    }
+
+    /// Consume exactly one embedding vector and return logits for the next token.
+    /// The state retains causal-convolution histories and GlobalMixer memory.
+    pub(crate) fn forward_lm_incremental(
+        &self,
+        input: &[f32],
+        state: &mut MLPInferenceState,
+    ) -> Vec<f32> {
+        let embedding_dim = match self.layers.last() {
+            Some(Layer::WeightTying(layer)) =>
+                layer.embeddings.embedding_dim(),
+            _ => panic!(
+                "Incremental LM forward requires WeightTying as the final layer"
+            ),
+        };
+
+        assert_eq!(
+            input.len(),
+            embedding_dim,
+            "Incremental LM input must contain exactly one embedding vector"
+        );
+
+        let backbone_len = self.layers.len() - 1;
+        assert_eq!(
+            state.layer_states.len(),
+            backbone_len,
+            "Incremental inference state does not match this MLP"
+        );
+
+        let position = state.next_position;
+
+        let hidden = forward_layers_incremental(
+            &self.layers[..backbone_len],
+            &self.params,
+            input,
+            position,
+            &mut state.layer_states,
+        );
+
+        assert_eq!(
+            hidden.len(),
+            embedding_dim,
+            "Incremental LM backbone must preserve one-token channel width"
+        );
+
+        let weight_tying = match self.layers.last() {
+            Some(Layer::WeightTying(layer)) => layer,
+            _ => unreachable!(),
+        };
+
+        let logits = weight_tying_forward_last(
+            weight_tying,
+            &self.params,
+            &hidden,
+            1,
+            1,
+        );
+
+        state.next_position = state.next_position
+            .checked_add(1)
+            .expect("Incremental LM position overflow");
+
+        logits
     }
 
     pub(crate) fn backward_lm_batch(

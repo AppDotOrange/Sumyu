@@ -3,6 +3,7 @@ use crate::neuron::{
     Activation,
     BatchLayerCache,
     Layer,
+    GLOBAL_MIXER_POS_FEATURES,
 };
 use crate::parameters::ParameterStore;
 use cblas::{Layout, Transpose};
@@ -21,10 +22,7 @@ use std::arch::x86_64::{
 };
 use crate::conv1d_backward::backward_direct;
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
-use crate::forwards::{
-    global_mixer_position_features,
-    GLOBAL_MIXER_POS_FEATURES
-};
+
 // ============================================================================
 // Shared backward workspace
 // ============================================================================
@@ -2188,21 +2186,10 @@ fn global_mixer_positional_backward(
                     g
                         * GLOBAL_MIXER_POS_FEATURES;
 
-                output_grads[
-                    weight_base
-                    ] += ds * f[0];
-
-                output_grads[
-                    weight_base + 1
-                    ] += ds * f[1];
-
-                output_grads[
-                    weight_base + 2
-                    ] += ds * f[2];
-
-                output_grads[
-                    weight_base + 3
-                    ] += ds * f[3];
+                for feature in 0..GLOBAL_MIXER_POS_FEATURES {
+                    output_grads[weight_base + feature] +=
+                        ds * f[feature];
+                }
             }
         }
     }
@@ -2906,6 +2893,7 @@ pub fn global_mixer_backward(
     write_probs: &[f32],
     global_vectors: &[f32],
     read_probs: &[f32],
+    position_features: &[[f32; GLOBAL_MIXER_POS_FEATURES]],
     mut grad: Vec<f32>,
     batch_size: usize,
     positions: usize,
@@ -2921,10 +2909,10 @@ pub fn global_mixer_backward(
     let rows =
         batch_size * positions;
 
-    let position_features =
-        global_mixer_position_features(
-            positions
-        );
+    debug_assert_eq!(
+        position_features.len(),
+        positions
+    );
 
     debug_assert_eq!(
         input.len(),
@@ -3123,7 +3111,7 @@ pub fn global_mixer_backward(
 
     global_mixer_positional_backward(
         &workspace.mixer_read_score_grads,
-        &position_features,
+        position_features,
         batch_size,
         positions,
         global_dim,
@@ -3261,7 +3249,7 @@ pub fn global_mixer_backward(
 
     global_mixer_positional_backward(
         &workspace.mixer_score_grads,
-        &position_features,
+        position_features,
         batch_size,
         positions,
         global_dim,
@@ -3999,6 +3987,8 @@ fn backward_layer_batch(
                 write_probs,
                 global_vectors,
                 read_probs,
+                write_log_norm: _,
+                position_features,
                 positions,
                 channels,
                 global_dim,
@@ -4012,6 +4002,7 @@ fn backward_layer_batch(
                     write_probs,
                     global_vectors,
                     read_probs,
+                    position_features,
                     grad,
                     batch_size,
                     *positions,

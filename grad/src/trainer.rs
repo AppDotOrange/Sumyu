@@ -1074,11 +1074,6 @@ impl Trainer {
             return TrainResult::Finished;
         }
 
-        if self.batch_size > data_len {
-            println!("Batch size too high! Quitting...");
-            return TrainResult::Finished;
-        }
-
         let input_size =
             dataset[0].0.len();
 
@@ -1088,9 +1083,7 @@ impl Trainer {
         if input_size == 0
             || output_size == 0
         {
-            println!(
-                "Input/output vectors cannot be empty!"
-            );
+            println!("Input/output vectors cannot be empty!");
 
             return TrainResult::Finished;
         }

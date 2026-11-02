@@ -8126,3 +8126,114 @@ pub fn tinychat_v15_hybrid( // TinyChatP1 large
         epochs,
     )
 }
+
+pub fn tinychat_v16_hybrid(
+    lr: f32,
+    batch_size: usize,
+    epochs: usize,
+) -> HybridConfig {
+    const CHANNELS: usize = 48;
+    const RANK: usize = 24;
+    const GLOBAL_DIM: usize = 32;
+
+    let local_block = || LayerSpec::Residual {
+        layers: vec![
+            LayerSpec::LayerNorm {
+                channels: CHANNELS,
+                epsilon: 1e-5,
+            },
+
+            LayerSpec::DepthwiseConv1D {
+                in_channels: CHANNELS,
+                kernel_size: 7,
+                stride: 1,
+                padding: 3,
+                causal: true,
+                activation: Activation::LeakyReLU {
+                    slope: 0.01,
+                },
+            },
+
+            LayerSpec::LowRankPointwise {
+                in_channels: CHANNELS,
+                rank: RANK,
+                out_channels: CHANNELS,
+                activation: Activation::LeakyReLU {
+                    slope: 0.01,
+                },
+            },
+        ],
+    };
+
+    let pre_global_norm = || LayerSpec::LayerNorm {
+        channels: CHANNELS,
+        epsilon: 1e-5,
+    };
+
+    let global_mixer = || LayerSpec::GlobalMixer {
+        channels: CHANNELS,
+        global_dim: GLOBAL_DIM,
+    };
+
+    HybridConfig::new(
+        lr,
+        batch_size,
+        0,
+        tinychat_v2_no_pad(), // 2259-token vocabulary
+        128,                 // maximum context length
+        CHANNELS,
+        vec![
+            // ============================================================
+            // LOCAL BLOCKS #1–2
+            // Initial local feature extraction.
+            // ============================================================
+
+            local_block(),
+            local_block(),
+
+            pre_global_norm(),
+            global_mixer(),
+
+            // ============================================================
+            // LOCAL BLOCKS #3–4
+            // Refine features after the first global communication pass.
+            // ============================================================
+
+            local_block(),
+            local_block(),
+
+            pre_global_norm(),
+            global_mixer(),
+
+            // ============================================================
+            // LOCAL BLOCKS #5–6
+            // Further local refinement and global information integration.
+            // ============================================================
+
+            local_block(),
+            local_block(),
+
+            pre_global_norm(),
+            global_mixer(),
+
+            // ============================================================
+            // LOCAL BLOCKS #7–8
+            // Final local processing before the last global pass.
+            // ============================================================
+
+            local_block(),
+            local_block(),
+
+            pre_global_norm(),
+            global_mixer(),
+
+            // ============================================================
+            // FINAL NORMALIZATION AND TIED VOCABULARY HEAD
+            // ============================================================
+
+            pre_global_norm(),
+            LayerSpec::WeightTying,
+        ],
+        epochs,
+    )
+}
