@@ -1,3 +1,4 @@
+
 use crate::embeddings::{
     Embeddings,
     SavedEmbeddings,
@@ -12,6 +13,7 @@ use crate::neuron::{
     MLP,
     MLPInferenceState,
     SavedMLP,
+    BatchLayerCache
 };
 use crate::parameters::ParameterStore;
 use crate::trainer::{
@@ -2125,5 +2127,40 @@ impl LM {
 
     pub fn find_clusters(&self, threshold: f32) {
         self.embeddings.find_clusters(&self.mlp.parameters(), threshold, self.vocab.clone())
+    }
+
+    /// Inspect GlobalMixer signals for a text prompt.
+    pub fn inspect_text(
+        &self,
+        text: &str,
+    ) -> Result<crate::inspection::ModelInspection, String> {
+        crate::inspection::inspect_text(self, text)
+    }
+
+    /// Inspect GlobalMixer signals for token IDs.
+    pub fn inspect_ids(
+        &self,
+        ids: &[u16],
+    ) -> Result<crate::inspection::ModelInspection, String> {
+        crate::inspection::inspect_ids(self, ids)
+    }
+
+    /// Internal full-sequence forward pass used by inspection.rs.
+    pub(crate) fn inspection_forward(
+        &self,
+        ids: &[u16],
+    ) -> Vec<BatchLayerCache> {
+        assert!(!ids.is_empty(), "Cannot inspect an empty token sequence");
+
+        let embeddings = self.encode_embeddings(ids);
+        let input_size = embeddings.len();
+
+        let forward = self.mlp.forward_lm_batch(
+            &embeddings,
+            1,
+            input_size,
+        );
+
+        forward.layers
     }
 }

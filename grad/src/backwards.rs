@@ -11,14 +11,13 @@ use std::cell::RefCell;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     _mm256_add_ps,
-    _mm256_fmadd_ps,
     _mm256_loadu_ps,
     _mm256_mul_ps,
     _mm256_set1_ps,
     _mm256_setzero_ps,
     _mm256_storeu_ps,
     _mm256_sub_ps,
-    _mm256_fnmadd_ps
+    _mm256_fmadd_ps,
 };
 use crate::conv1d_backward::backward_direct;
 pub use crate::grouped_backward::backward_direct as grouped_conv1d_backward;
@@ -2195,16 +2194,84 @@ fn global_mixer_positional_backward(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn global_mixer_causal_reverse_avx2(
+
+fn global_mixer_causal_reverse_recompute(
     input: &[f32],
     grad: &[f32],
 
     write_probs: &[f32],
     read_probs: &[f32],
 
-    global_state: &mut [f32],
+    global_state_scratch: &mut [f32],
+    global_grads: &mut [f32],
+    input_grads: &mut [f32],
+
+    read_score_grads: &mut [f32],
+    write_score_grads: &mut [f32],
+
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    debug_assert_eq!(
+        global_state_scratch.len(),
+        positions * channels
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                global_mixer_causal_reverse_recompute_avx2(
+                    input,
+                    grad,
+                    write_probs,
+                    read_probs,
+                    global_state_scratch,
+                    global_grads,
+                    input_grads,
+                    read_score_grads,
+                    write_score_grads,
+                    batch_size,
+                    positions,
+                    channels,
+                    global_dim,
+                );
+            }
+
+            return;
+        }
+    }
+
+    global_mixer_causal_reverse_recompute_scalar(
+        input,
+        grad,
+        write_probs,
+        read_probs,
+        global_state_scratch,
+        global_grads,
+        input_grads,
+        read_score_grads,
+        write_score_grads,
+        batch_size,
+        positions,
+        channels,
+        global_dim,
+    );
+}
+
+
+fn global_mixer_causal_reverse_recompute_scalar(
+    input: &[f32],
+    grad: &[f32],
+
+    write_probs: &[f32],
+    read_probs: &[f32],
+
+    global_state_scratch: &mut [f32],
     global_grads: &mut [f32],
     input_grads: &mut [f32],
 
@@ -2226,663 +2293,498 @@ unsafe fn global_mixer_causal_reverse_avx2(
         let global_base =
             b * global_dim * channels;
 
-        for p in (0..positions).rev() {
-            let input_row =
-                input_base
-                    + p * channels;
+        // Process one global channel at a time.
+        // Scratch is reused for every global channel.
+        for g in 0..global_dim {
+            // ------------------------------------------------------------
+            // 1. Recompute all prefix states for this global channel.
+            //
+            // G_p = (1 - a_p) * G_{p-1} + a_p * X_p
+            // ------------------------------------------------------------
 
-            let probs_row =
-                probs_base
-                    + p * global_dim;
+            for p in 0..positions {
+                let input_row =
+                    input_base + p * channels;
 
-            let mut g = 0usize;
+                let probs_index =
+                    probs_base + p * global_dim + g;
 
-            while g + 8 <= global_dim {
-                let read_prob =
-                    _mm256_set1_ps(
-                        read_probs[
-                            probs_row + g
-                            ]
-                    );
+                let state_row =
+                    p * channels;
+
+                let previous_row =
+                    if p == 0 {
+                        None
+                    } else {
+                        Some((p - 1) * channels)
+                    };
 
                 let write_prob =
-                    _mm256_set1_ps(
-                        write_probs[
-                            probs_row + g
-                            ]
-                    );
+                    write_probs[probs_index];
 
-                let mut d_read0 =
-                    _mm256_setzero_ps();
+                let old_weight =
+                    1.0f32 - write_prob;
 
-                let mut d_read1 =
-                    _mm256_setzero_ps();
+                for c in 0..channels {
+                    let previous_state =
+                        match previous_row {
+                            Some(row) => {
+                                global_state_scratch[row + c]
+                            }
+                            None => 0.0,
+                        };
 
-                let mut d_write0 =
-                    _mm256_setzero_ps();
-
-                let mut d_write1 =
-                    _mm256_setzero_ps();
-
-                let global_row0 =
-                    global_base
-                        + g * channels;
-
-                let mut c = 0usize;
-
-                while c + 16 <= channels {
-                    // --------------------------------------------------------
-                    // First 8 channels.
-                    // --------------------------------------------------------
-
-                    let state0 =
-                        _mm256_loadu_ps(
-                            global_state
-                                .as_ptr().add(global_row0 + c));
-
-                    let dy0 =
-                        _mm256_loadu_ps(
-                            grad
-                                .as_ptr().add(input_row + c));
-
-                    let x0 =
-                        _mm256_loadu_ps(
-                            input
-                                .as_ptr().add(input_row + c));
-
-                    let old_dg0 =
-                        _mm256_loadu_ps(
-                            global_grads
-                                .as_ptr().add(global_row0 + c));
-
-                    // d read score.
-                    d_read0 =
-                        _mm256_fmadd_ps(
-                            state0,
-                            dy0,
-                            d_read0,
-                        );
-
-                    // dG += read_prob * dY.
-                    let new_dg0 =
-                        _mm256_fmadd_ps(
-                            read_prob,
-                            dy0,
-                            old_dg0,
-                        );
-
-                    _mm256_storeu_ps(
-                        global_grads
-                            .as_mut_ptr().add(global_row0 + c),
-                        new_dg0,
-                    );
-
-                    // d write score.
-                    d_write0 =
-                        _mm256_fmadd_ps(
-                            new_dg0,
-                            x0,
-                            d_write0,
-                        );
-
-                    // dX through causal global state.
-                    let old_dx0 =
-                        _mm256_loadu_ps(
-                            input_grads
-                                .as_ptr().add(input_row + c));
-
-                    let new_dx0 =
-                        _mm256_fmadd_ps(
-                            write_prob,
-                            new_dg0,
-                            old_dx0,
-                        );
-
-                    _mm256_storeu_ps(
-                        input_grads
-                            .as_mut_ptr().add(input_row + c),
-                        new_dx0,
-                    );
-
-                    // Reconstruct G_{p-1}.
-                    let previous_state0 =
-                        _mm256_fnmadd_ps(
-                            write_prob,
-                            x0,
-                            state0,
-                        );
-
-                    _mm256_storeu_ps(
-                        global_state
-                            .as_mut_ptr().add(global_row0 + c),
-                        previous_state0,
-                    );
-
-                    // --------------------------------------------------------
-                    // Next 8 channels.
-                    // --------------------------------------------------------
-
-                    let c1 = c + 8;
-
-                    let state1 =
-                        _mm256_loadu_ps(
-                            global_state
-                                .as_ptr().add(global_row0 + c1));
-
-                    let dy1 =
-                        _mm256_loadu_ps(
-                            grad
-                                .as_ptr().add(input_row + c1));
-
-                    let x1 =
-                        _mm256_loadu_ps(
-                            input
-                                .as_ptr().add(input_row + c1));
-
-                    let old_dg1 =
-                        _mm256_loadu_ps(
-                            global_grads
-                                .as_ptr().add(global_row0 + c1));
-
-                    d_read1 =
-                        _mm256_fmadd_ps(
-                            state1,
-                            dy1,
-                            d_read1,
-                        );
-
-                    let new_dg1 =
-                        _mm256_fmadd_ps(
-                            read_prob,
-                            dy1,
-                            old_dg1,
-                        );
-
-                    _mm256_storeu_ps(
-                        global_grads
-                            .as_mut_ptr().add(global_row0 + c1),
-                        new_dg1,
-                    );
-
-                    d_write1 =
-                        _mm256_fmadd_ps(
-                            new_dg1,
-                            x1,
-                            d_write1,
-                        );
-
-                    let old_dx1 =
-                        _mm256_loadu_ps(
-                            input_grads
-                                .as_ptr().add(input_row + c1));
-
-                    let new_dx1 =
-                        _mm256_fmadd_ps(
-                            write_prob,
-                            new_dg1,
-                            old_dx1,
-                        );
-
-                    _mm256_storeu_ps(
-                        input_grads
-                            .as_mut_ptr().add(input_row + c1),
-                        new_dx1,
-                    );
-
-                    let previous_state1 =
-                        _mm256_fnmadd_ps(
-                            write_prob,
-                            x1,
-                            state1,
-                        );
-
-                    _mm256_storeu_ps(
-                        global_state
-                            .as_mut_ptr().add(global_row0 + c1),
-                        previous_state1,
-                    );
-
-                    c += 16;
+                    global_state_scratch[state_row + c] =
+                        old_weight * previous_state
+                            + write_prob * input[input_row + c];
                 }
+            }
 
-                while c + 8 <= channels {
+            // ------------------------------------------------------------
+            // 2. Reverse through the recomputed states.
+            // ------------------------------------------------------------
+
+            let global_row =
+                global_base + g * channels;
+
+            for p in (0..positions).rev() {
+                let input_row =
+                    input_base + p * channels;
+
+                let probs_index =
+                    probs_base + p * global_dim + g;
+
+                let state_row =
+                    p * channels;
+
+                let previous_row =
+                    if p == 0 {
+                        None
+                    } else {
+                        Some((p - 1) * channels)
+                    };
+
+                let write_prob =
+                    write_probs[probs_index];
+
+                let read_prob =
+                    read_probs[probs_index];
+
+                let old_weight =
+                    1.0f32 - write_prob;
+
+                let mut d_read =
+                    0.0f32;
+
+                let mut d_write =
+                    0.0f32;
+
+                for c in 0..channels {
+                    let global_index =
+                        global_row + c;
+
+                    let input_index =
+                        input_row + c;
+
                     let state =
-                        _mm256_loadu_ps(
-                            global_state
-                                .as_ptr().add(global_row0 + c));
-
-                    let dy =
-                        _mm256_loadu_ps(
-                            grad
-                                .as_ptr().add(input_row + c));
-
-                    let x =
-                        _mm256_loadu_ps(
-                            input
-                                .as_ptr().add(input_row + c));
-
-                    let old_dg =
-                        _mm256_loadu_ps(
-                            global_grads
-                                .as_ptr().add(global_row0 + c));
-
-                    d_read0 =
-                        _mm256_fmadd_ps(
-                            state,
-                            dy,
-                            d_read0,
-                        );
-
-                    let new_dg =
-                        _mm256_fmadd_ps(
-                            read_prob,
-                            dy,
-                            old_dg,
-                        );
-
-                    _mm256_storeu_ps(
-                        global_grads
-                            .as_mut_ptr().add(global_row0 + c),
-                        new_dg,
-                    );
-
-                    d_write0 =
-                        _mm256_fmadd_ps(
-                            new_dg,
-                            x,
-                            d_write0,
-                        );
-
-                    let old_dx =
-                        _mm256_loadu_ps(
-                            input_grads
-                                .as_ptr().add(input_row + c));
-
-                    let new_dx =
-                        _mm256_fmadd_ps(
-                            write_prob,
-                            new_dg,
-                            old_dx,
-                        );
-
-                    _mm256_storeu_ps(
-                        input_grads
-                            .as_mut_ptr().add(input_row + c),
-                        new_dx,
-                    );
+                        global_state_scratch[state_row + c];
 
                     let previous_state =
-                        _mm256_fnmadd_ps(
-                            write_prob,
-                            x,
-                            state,
+                        match previous_row {
+                            Some(row) => {
+                                global_state_scratch[row + c]
+                            }
+                            None => 0.0,
+                        };
+
+                    let x =
+                        input[input_index];
+
+                    let dy =
+                        grad[input_index];
+
+                    // Include the current readback contribution.
+                    let new_dg =
+                        global_grads[global_index]
+                            + read_prob * dy;
+
+                    // Gradient of the read probability.
+                    d_read +=
+                        state * dy;
+
+                    // Gradient of the write probability.
+                    d_write +=
+                        new_dg * (x - previous_state);
+
+                    // Gradient through the current input.
+                    input_grads[input_index] +=
+                        write_prob * new_dg;
+
+                    // Propagate into the preceding prefix state.
+                    global_grads[global_index] =
+                        old_weight * new_dg;
+                }
+
+                read_score_grads[probs_index] =
+                    d_read;
+
+                write_score_grads[probs_index] =
+                    d_write;
+            }
+        }
+    }
+}
+
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn global_mixer_causal_reverse_recompute_avx2(
+    input: &[f32],
+    grad: &[f32],
+
+    write_probs: &[f32],
+    read_probs: &[f32],
+
+    global_state_scratch: &mut [f32],
+    global_grads: &mut [f32],
+    input_grads: &mut [f32],
+
+    read_score_grads: &mut [f32],
+    write_score_grads: &mut [f32],
+
+    batch_size: usize,
+    positions: usize,
+    channels: usize,
+    global_dim: usize,
+) {
+    debug_assert_eq!(
+        global_state_scratch.len(),
+        positions * channels
+    );
+
+    for b in 0..batch_size {
+        let input_base =
+            b * positions * channels;
+
+        let probs_base =
+            b * positions * global_dim;
+
+        let global_base =
+            b * global_dim * channels;
+
+        for g in 0..global_dim {
+            // ------------------------------------------------------------
+            // 1. Recompute prefix states.
+            // ------------------------------------------------------------
+
+            for p in 0..positions {
+                let input_row =
+                    input_base + p * channels;
+
+                let probs_index =
+                    probs_base + p * global_dim + g;
+
+                let state_row =
+                    p * channels;
+
+                let write_prob =
+                    write_probs[probs_index];
+
+                let old_weight =
+                    1.0f32 - write_prob;
+
+                let write_vec =
+                    _mm256_set1_ps(write_prob);
+
+                let old_vec =
+                    _mm256_set1_ps(old_weight);
+
+                let previous_row =
+                    if p == 0 {
+                        0
+                    } else {
+                        (p - 1) * channels
+                    };
+
+                let mut c =
+                    0usize;
+
+                while c + 8 <= channels {
+                    let x =
+                        _mm256_loadu_ps(
+                            input.as_ptr().add(input_row + c)
+                        );
+
+                    let previous =
+                        if p == 0 {
+                            _mm256_setzero_ps()
+                        } else {
+                            _mm256_loadu_ps(
+                                global_state_scratch
+                                    .as_ptr()
+                                    .add(previous_row + c)
+                            )
+                        };
+
+                    let new_state =
+                        _mm256_fmadd_ps(
+                            old_vec,
+                            previous,
+                            _mm256_mul_ps(write_vec, x),
                         );
 
                     _mm256_storeu_ps(
-                        global_state
-                            .as_mut_ptr().add(global_row0 + c),
-                        previous_state,
+                        global_state_scratch
+                            .as_mut_ptr()
+                            .add(state_row + c),
+                        new_state,
                     );
 
                     c += 8;
                 }
 
-                // ------------------------------------------------------------
-                // Scalar tail.
-                // ------------------------------------------------------------
+                while c < channels {
+                    let previous =
+                        if p == 0 {
+                            0.0
+                        } else {
+                            global_state_scratch[previous_row + c]
+                        };
 
-                let mut read_scalar0 =
-                    0.0f32;
+                    global_state_scratch[state_row + c] =
+                        old_weight * previous
+                            + write_prob * input[input_row + c];
 
-                let mut write_scalar0 =
-                    0.0f32;
+                    c += 1;
+                }
+            }
 
-                let mut c_tail =
-                    c;
+            // ------------------------------------------------------------
+            // 2. Reverse through the recomputed states.
+            // ------------------------------------------------------------
 
-                while c_tail < channels {
-                    let state_index =
-                        global_row0 + c_tail;
+            let global_row =
+                global_base + g * channels;
 
-                    let input_index =
-                        input_row + c_tail;
+            for p in (0..positions).rev() {
+                let input_row =
+                    input_base + p * channels;
 
-                    let old_state =
-                        global_state[
-                            state_index
-                            ];
+                let probs_index =
+                    probs_base + p * global_dim + g;
 
-                    let dy =
-                        grad[input_index];
+                let state_row =
+                    p * channels;
+
+                let write_prob =
+                    write_probs[probs_index];
+
+                let read_prob =
+                    read_probs[probs_index];
+
+                let old_weight =
+                    1.0f32 - write_prob;
+
+                let write_vec =
+                    _mm256_set1_ps(write_prob);
+
+                let read_vec =
+                    _mm256_set1_ps(read_prob);
+
+                let old_vec =
+                    _mm256_set1_ps(old_weight);
+
+                let previous_row =
+                    if p == 0 {
+                        0
+                    } else {
+                        (p - 1) * channels
+                    };
+
+                let mut d_read_vec =
+                    _mm256_setzero_ps();
+
+                let mut d_write_vec =
+                    _mm256_setzero_ps();
+
+                let mut c =
+                    0usize;
+
+                while c + 8 <= channels {
+                    let state =
+                        _mm256_loadu_ps(
+                            global_state_scratch
+                                .as_ptr()
+                                .add(state_row + c)
+                        );
+
+                    let previous =
+                        if p == 0 {
+                            _mm256_setzero_ps()
+                        } else {
+                            _mm256_loadu_ps(
+                                global_state_scratch
+                                    .as_ptr()
+                                    .add(previous_row + c)
+                            )
+                        };
 
                     let x =
-                        input[input_index];
+                        _mm256_loadu_ps(
+                            input.as_ptr().add(input_row + c)
+                        );
 
-                    read_scalar0 +=
-                        old_state * dy;
+                    let dy =
+                        _mm256_loadu_ps(
+                            grad.as_ptr().add(input_row + c)
+                        );
 
+                    let old_dg =
+                        _mm256_loadu_ps(
+                            global_grads.as_ptr().add(global_row + c)
+                        );
+
+                    // dG_p = dG_from_future + read_prob * dY.
                     let new_dg =
-                        global_grads[
-                            state_index
-                            ]
-                            + read_probs[
-                            probs_row + g
-                            ] * dy;
+                        _mm256_fmadd_ps(
+                            read_vec,
+                            dy,
+                            old_dg,
+                        );
 
-                    global_grads[
-                        state_index
-                        ] =
-                        new_dg;
+                    // d read probability.
+                    d_read_vec =
+                        _mm256_fmadd_ps(
+                            state,
+                            dy,
+                            d_read_vec,
+                        );
 
-                    write_scalar0 +=
-                        new_dg * x;
+                    // d write probability.
+                    let difference =
+                        _mm256_sub_ps(x, previous);
 
-                    input_grads[
-                        input_index
-                        ] +=
-                        write_probs[
-                            probs_row + g
-                            ]
-                            * new_dg;
+                    d_write_vec =
+                        _mm256_fmadd_ps(
+                            new_dg,
+                            difference,
+                            d_write_vec,
+                        );
 
-                    global_state[
-                        state_index
-                        ] =
-                        old_state
-                            - write_probs[
-                            probs_row + g
-                            ] * x;
+                    // dX through the global-state recurrence.
+                    let old_dx =
+                        _mm256_loadu_ps(
+                            input_grads.as_ptr().add(input_row + c)
+                        );
 
-                    c_tail += 1;
+                    let new_dx =
+                        _mm256_fmadd_ps(
+                            write_vec,
+                            new_dg,
+                            old_dx,
+                        );
+
+                    _mm256_storeu_ps(
+                        input_grads.as_mut_ptr().add(input_row + c),
+                        new_dx,
+                    );
+
+                    // dG_{p-1} = (1 - write_prob) * dG_p.
+                    let previous_dg =
+                        _mm256_mul_ps(
+                            old_vec,
+                            new_dg,
+                        );
+
+                    _mm256_storeu_ps(
+                        global_grads.as_mut_ptr().add(global_row + c),
+                        previous_dg,
+                    );
+
+                    c += 8;
                 }
 
+                // --------------------------------------------------------
                 // Horizontal reductions.
+                // --------------------------------------------------------
+
                 let mut tmp =
                     [0.0f32; 8];
 
                 _mm256_storeu_ps(
                     tmp.as_mut_ptr(),
-                    d_read0,
+                    d_read_vec,
                 );
-
-                let mut read_value =
-                    tmp[0]
-                        + tmp[1]
-                        + tmp[2]
-                        + tmp[3]
-                        + tmp[4]
-                        + tmp[5]
-                        + tmp[6]
-                        + tmp[7];
-
-                _mm256_storeu_ps(
-                    tmp.as_mut_ptr(),
-                    d_read1,
-                );
-
-                read_value +=
-                    tmp[0]
-                        + tmp[1]
-                        + tmp[2]
-                        + tmp[3]
-                        + tmp[4]
-                        + tmp[5]
-                        + tmp[6]
-                        + tmp[7];
-
-                _mm256_storeu_ps(
-                    tmp.as_mut_ptr(),
-                    d_write0,
-                );
-
-                let mut write_value =
-                    tmp[0]
-                        + tmp[1]
-                        + tmp[2]
-                        + tmp[3]
-                        + tmp[4]
-                        + tmp[5]
-                        + tmp[6]
-                        + tmp[7];
-
-                _mm256_storeu_ps(
-                    tmp.as_mut_ptr(),
-                    d_write1,
-                );
-
-                write_value +=
-                    tmp[0]
-                        + tmp[1]
-                        + tmp[2]
-                        + tmp[3]
-                        + tmp[4]
-                        + tmp[5]
-                        + tmp[6]
-                        + tmp[7];
-
-                read_value +=
-                    read_scalar0;
-
-                write_value +=
-                    write_scalar0;
-
-                read_score_grads[
-                    probs_row + g
-                    ] =
-                    read_value;
-
-                write_score_grads[
-                    probs_row + g
-                    ] =
-                    write_value;
-
-                g += 8;
-            }
-
-            // Scalar global-channel tail.
-            while g < global_dim {
-                let read_prob =
-                    read_probs[
-                        probs_row + g
-                        ];
-
-                let write_prob =
-                    write_probs[
-                        probs_row + g
-                        ];
-
-                let global_row =
-                    global_base
-                        + g * channels;
 
                 let mut d_read =
-                    0.0f32;
+                    tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                        + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+
+                _mm256_storeu_ps(
+                    tmp.as_mut_ptr(),
+                    d_write_vec,
+                );
 
                 let mut d_write =
-                    0.0f32;
+                    tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                        + tmp[4] + tmp[5] + tmp[6] + tmp[7];
 
-                for c in 0..channels {
+                // --------------------------------------------------------
+                // Scalar channel tail.
+                // --------------------------------------------------------
+
+                while c < channels {
                     let global_index =
                         global_row + c;
 
                     let input_index =
                         input_row + c;
 
-                    let old_state =
-                        global_state[
-                            global_index
-                            ];
+                    let state =
+                        global_state_scratch[state_row + c];
 
-                    let dy =
-                        grad[input_index];
-
-                    let x =
-                        input[input_index];
-
-                    d_read +=
-                        old_state * dy;
-
-                    let new_dg =
-                        global_grads[
-                            global_index
-                            ]
-                            + read_prob * dy;
-
-                    global_grads[
-                        global_index
-                        ] =
-                        new_dg;
-
-                    d_write +=
-                        new_dg * x;
-
-                    input_grads[
-                        input_index
-                        ] +=
-                        write_prob * new_dg;
-
-                    global_state[
-                        global_index
-                        ] =
-                        old_state
-                            - write_prob * x;
-                }
-
-                read_score_grads[
-                    probs_row + g
-                    ] =
-                    d_read;
-
-                write_score_grads[
-                    probs_row + g
-                    ] =
-                    d_write;
-
-                g += 1;
-            }
-        }
-    }
-}
-
-fn global_mixer_causal_reverse_scalar(
-    input: &[f32],
-    grad: &[f32],
-
-    write_probs: &[f32],
-    read_probs: &[f32],
-
-    global_state: &mut [f32],
-    global_grads: &mut [f32],
-    input_grads: &mut [f32],
-
-    read_score_grads: &mut [f32],
-    write_score_grads: &mut [f32],
-
-    batch_size: usize,
-    positions: usize,
-    channels: usize,
-    global_dim: usize,
-) {
-    for b in 0..batch_size {
-        let input_base =
-            b * positions * channels;
-
-        let probs_base =
-            b * positions * global_dim;
-
-        let global_base =
-            b * global_dim * channels;
-
-        for p in (0..positions).rev() {
-            let input_row =
-                input_base
-                    + p * channels;
-
-            let probs_row =
-                probs_base
-                    + p * global_dim;
-
-            for g in 0..global_dim {
-                let read_prob =
-                    read_probs[
-                        probs_row + g
-                        ];
-
-                let write_prob =
-                    write_probs[
-                        probs_row + g
-                        ];
-
-                let global_row =
-                    global_base
-                        + g * channels;
-
-                let mut d_read =
-                    0.0f32;
-
-                let mut d_write =
-                    0.0f32;
-
-                for c in 0..channels {
-                    let global_index =
-                        global_row + c;
-
-                    let input_index =
-                        input_row + c;
-
-                    let old_state =
-                        global_state[
-                            global_index
-                            ];
-
-                    let dy =
-                        grad[input_index];
+                    let previous =
+                        if p == 0 {
+                            0.0
+                        } else {
+                            global_state_scratch[previous_row + c]
+                        };
 
                     let x =
                         input[input_index];
 
-                    d_read +=
-                        old_state * dy;
+                    let dy =
+                        grad[input_index];
 
                     let new_dg =
-                        global_grads[
-                            global_index
-                            ]
+                        global_grads[global_index]
                             + read_prob * dy;
 
-                    global_grads[
-                        global_index
-                        ] =
-                        new_dg;
+                    d_read +=
+                        state * dy;
 
                     d_write +=
-                        new_dg * x;
+                        new_dg * (x - previous);
 
-                    input_grads[
-                        input_index
-                        ] +=
+                    input_grads[input_index] +=
                         write_prob * new_dg;
 
-                    global_state[
-                        global_index
-                        ] =
-                        old_state
-                            - write_prob * x;
+                    global_grads[global_index] =
+                        old_weight * new_dg;
+
+                    c += 1;
                 }
 
-                read_score_grads[
-                    probs_row + g
-                    ] =
+                read_score_grads[probs_index] =
                     d_read;
 
-                write_score_grads[
-                    probs_row + g
-                    ] =
+                write_score_grads[probs_index] =
                     d_write;
             }
         }
     }
 }
+
 
 // ============================================================================
 // GlobalMixer backward
@@ -2988,84 +2890,38 @@ pub fn global_mixer_backward(
     );
     workspace.mixer_input_grads.fill(0.0);
 
-    // ========================================================================
-    // 1. Fused reverse causal scan
-    //
-    // The previous implementation performed separate passes for:
-    //
-    //   dR
-    //   dG
-    //   dWrite
-    //   dX
-    //   G(previous)//
-    // These are now fused into one G×C traversal.
-    // ========================================================================
 
-    let global_state_len =
-        batch_size
-            * global_dim
-            * channels;
+    // ========================================================================
+    // 1. Recompute prefix states and reverse through the normalized
+    //    causal global-state recurrence.
+    //
+    // Scratch stores only [positions, channels] for one global channel.
+    // ========================================================================
 
     workspace.mixer_global_state.resize(
-        global_state_len,
+        positions * channels,
         0.0,
     );
 
-    workspace
-        .mixer_global_state
-        .copy_from_slice(
-            global_vectors
-        );
+    global_mixer_causal_reverse_recompute(
+        input,
+        &grad,
+        write_probs,
+        read_probs,
 
-    #[cfg(target_arch = "x86_64")]
-    let use_avx2 =
-        is_x86_feature_detected!("avx2")&& is_x86_feature_detected!("fma");
+        &mut workspace.mixer_global_state,
+        &mut workspace.mixer_global_grads,
+        &mut workspace.mixer_input_grads,
 
-    #[cfg(not(target_arch = "x86_64"))]
-    let use_avx2 = false;
+        &mut workspace.mixer_read_score_grads,
+        &mut workspace.mixer_score_grads,
 
-    if use_avx2 {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            global_mixer_causal_reverse_avx2(
-                input,
-                &grad,
-                write_probs,
-                read_probs,
+        batch_size,
+        positions,
+        channels,
+        global_dim,
+    );
 
-                &mut workspace.mixer_global_state,
-                &mut workspace.mixer_global_grads,
-                &mut workspace.mixer_input_grads,
-
-                &mut workspace.mixer_read_score_grads,
-                &mut workspace.mixer_score_grads,
-
-                batch_size,
-                positions,
-                channels,
-                global_dim,
-            );
-        }
-    } else {
-        global_mixer_causal_reverse_scalar(
-            input,
-            &grad,
-            write_probs,
-            read_probs,
-
-            &mut workspace.mixer_global_state,
-            &mut workspace.mixer_global_grads,
-            &mut workspace.mixer_input_grads,
-
-            &mut workspace.mixer_read_score_grads,
-            &mut workspace.mixer_score_grads,
-
-            batch_size,
-            positions,
-            channels,
-            global_dim,
-        );
-    }
 
     // ========================================================================
     // 2. Read softmax backward

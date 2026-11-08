@@ -18,5 +18,6 @@ pub mod depthwise_backward;
 pub mod grouped_kernel;
 pub mod grouped_backward;
 pub mod parameters;
+pub mod inspection;
 
 pub use parameters::{ParamRange, ParameterStore};

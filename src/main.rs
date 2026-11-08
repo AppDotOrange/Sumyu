@@ -1,10 +1,10 @@
-use grad::lm::{SavedLM, LM};
 use grad::helper;
-use std::{fs, io};
-use std::io::Write;
 use grad::helper::{poke_v2, recipe_v3};
+use grad::lm::{LM, SavedLM};
 use grad::neuron::{Activation, LayerSpec};
 use grad::trainer::CheckpointFrequency;
+use std::io::Write;
+use std::{fs, io};
 
 fn main() {
     print!("\x1B[2J\x1B[3J\x1B[1;1H");
@@ -43,7 +43,7 @@ fn main() {
         //------------------------------------------------------------------------------------------
         //     CONFIG
         //------------------------------------------------------------------------------------------
-        
+
         let lr = 0.01;
         let batch_size = 32;
         let max_batches_per_epoch = 10; // 0 means no limit
@@ -83,10 +83,7 @@ fn main() {
         if load {
             let bytes = fs::read("model.sumyu").unwrap();
             let (model, _): (SavedLM, usize) =
-                bincode::serde::decode_from_slice(
-                    &bytes,
-                    bincode::config::standard(),
-                ).unwrap();
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
             let mut lm = LM::from_saved(model);
             println!("Loaded!");
             lm.params();
@@ -99,22 +96,15 @@ fn main() {
             lm.load_corpus(&text);
             lm.train_options(lr, epochs, batch_size, max_batches_per_epoch);
             //lm.train(None);
-        let saved = lm.to_saved("");
-        let bytes = bincode::serde::encode_to_vec(
-            &saved,
-            bincode::config::standard(),
-        ).unwrap();
-        fs::write("model.sumyu", bytes).unwrap();
+            let saved = lm.to_saved("");
+            let bytes = bincode::serde::encode_to_vec(&saved, bincode::config::standard()).unwrap();
+            fs::write("model.sumyu", bytes).unwrap();
         }
     } else if test == 1 {
-        
     } else if test == 2 {
         let bytes = fs::read("ChatterP1.sumyu").unwrap();
         let (model, _): (SavedLM, usize) =
-            bincode::serde::decode_from_slice(
-                &bytes,
-                bincode::config::standard(),
-            ).unwrap();
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         let lm = LM::from_saved(model);
         lm.params();
         //lm.generate_gpt("<USER>Can you write a story about two birds?<EOT>\n".to_string(), 1000, 0.7);
@@ -139,10 +129,7 @@ fn main() {
         lm.params();
         lm.load_corpus(&text);
         //lm.train(None);
-        lm.save(
-            "Rustception_optimized.sumyu",
-            &description,
-        );
+        lm.save("Rustception_optimized.sumyu", &description);
     } else if test == 5 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -163,10 +150,7 @@ fn main() {
         lm.params();
         lm.load_corpus(&poke);
         //lm.train(None);
-        lm.save(
-            "PokeP4_32c.sumyu",
-            &description,
-        );
+        lm.save("PokeP4_32c.sumyu", &description);
     } else if test == 6 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -186,10 +170,7 @@ fn main() {
         lm.params();
         lm.load_corpus(&text);
         //lm.train(None);
-        lm.save(
-            "Tale_V1.sumyu",
-            &description,
-        );
+        lm.save("Tale_V1.sumyu", &description);
     } else if test == 7 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -204,11 +185,17 @@ fn main() {
         let mut lm = LM::from_config(config);
         lm.params();
         lm.load_corpus(&recipe_full);
-        lm.train(None, None, None, CheckpointFrequency::Disabled, None, None, false, 3);
-        lm.save(
-            "RecipeP4.sumyu",
-            &description,
+        lm.train(
+            None,
+            None,
+            None,
+            CheckpointFrequency::Disabled,
+            None,
+            None,
+            false,
+            3,
         );
+        lm.save("RecipeP4.sumyu", &description);
     } else if test == 8 {
         // let mut terminal = sumyu::Sumyu::new();
         // terminal.start();
@@ -240,10 +227,7 @@ fn main() {
             false,
             4,
         );
-        lm.save(
-            "ChatterP2.sumyu",
-            &description,
-        );
+        lm.save("ChatterP2.sumyu", &description);
     } else if test == 10 {
         unsafe extern "C" {
             fn openblas_set_num_threads(num_threads: i32);
@@ -281,10 +265,7 @@ fn main() {
             false,
             4,
         );
-        lm.save(
-            "pretrainV2.sumyu",
-            description,
-        );
+        lm.save("pretrainV2.sumyu", description);
     } else if test == 12 {
         //*
         let description = "Conv1D recipe experiment.";
@@ -303,11 +284,7 @@ fn main() {
                     causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
-
-                LayerSpec::ChannelScale {
-                    channels: 96,
-                },
-
+                LayerSpec::ChannelScale { channels: 96 },
                 // Residual feature-processing block.
                 LayerSpec::Residual {
                     layers: vec![
@@ -319,11 +296,7 @@ fn main() {
                             causal: false,
                             activation: Activation::LeakyReLU { slope: 0.01 },
                         },
-
-                        LayerSpec::ChannelScale {
-                            channels: 96,
-                        },
-
+                        LayerSpec::ChannelScale { channels: 96 },
                         LayerSpec::Conv1D {
                             in_channels: 96,
                             out_channels: 96,
@@ -333,13 +306,9 @@ fn main() {
                             causal: false,
                             activation: Activation::LeakyReLU { slope: 0.01 },
                         },
-
-                        LayerSpec::ChannelScale {
-                            channels: 96,
-                        },
+                        LayerSpec::ChannelScale { channels: 96 },
                     ],
                 },
-
                 // Downsample and reduce width.
                 LayerSpec::Conv1D {
                     in_channels: 96,
@@ -350,11 +319,7 @@ fn main() {
                     causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
-
-                LayerSpec::ChannelScale {
-                    channels: 64,
-                },
-
+                LayerSpec::ChannelScale { channels: 64 },
                 // Second residual feature-processing block.
                 LayerSpec::Residual {
                     layers: vec![
@@ -366,11 +331,7 @@ fn main() {
                             causal: false,
                             activation: Activation::LeakyReLU { slope: 0.01 },
                         },
-
-                        LayerSpec::ChannelScale {
-                            channels: 64,
-                        },
-
+                        LayerSpec::ChannelScale { channels: 64 },
                         LayerSpec::Conv1D {
                             in_channels: 64,
                             out_channels: 64,
@@ -380,13 +341,9 @@ fn main() {
                             causal: false,
                             activation: Activation::LeakyReLU { slope: 0.01 },
                         },
-
-                        LayerSpec::ChannelScale {
-                            channels: 64,
-                        },
+                        LayerSpec::ChannelScale { channels: 64 },
                     ],
                 },
-
                 // Final downsampling.
                 LayerSpec::Conv1D {
                     in_channels: 64,
@@ -397,17 +354,12 @@ fn main() {
                     causal: false,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
-
-                LayerSpec::ChannelScale {
-                    channels: 32,
-                },
-
+                LayerSpec::ChannelScale { channels: 32 },
                 // Bottleneck.
                 LayerSpec::Dense {
                     output_size: 30,
                     activation: Activation::LeakyReLU { slope: 0.01 },
                 },
-
                 // Vocabulary projection.
                 LayerSpec::Dense {
                     output_size: recipe_v3().len(),
@@ -461,10 +413,7 @@ fn main() {
             false,
             4,
         );
-        lm.save(
-            "pretrainV4.sumyu",
-            &description,
-        );
+        lm.save("pretrainV4.sumyu", &description);
     } else if test == 14 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -493,10 +442,7 @@ fn main() {
             false,
             4,
         );
-        lm.save(
-            "pretrainV5.sumyu",
-            &description,
-        );
+        lm.save("pretrainV5.sumyu", &description);
     } else if test == 15 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -525,10 +471,7 @@ fn main() {
             false,
             4,
         );
-        lm.save(
-            "pretrainV6.sumyu",
-            &description,
-        );
+        lm.save("pretrainV6.sumyu", &description);
     } else if test == 16 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -553,10 +496,7 @@ fn main() {
             true,
             4,
         );
-        lm.save(
-            "MiniChatterV11.sumyu",
-            &description,
-        );
+        lm.save("MiniChatterV11.sumyu", &description);
     } else if test == 17 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -571,7 +511,7 @@ fn main() {
         let mut lm = LM::from_hybrid_config(config);
 
         lm.set_cosine_lr(
-            0,   // warmup steps
+            0,       // warmup steps
             340_788, // one full epoch
             0.1,     // finish at 10% of base LR
         );
@@ -581,21 +521,21 @@ fn main() {
 
         lm.train(
             Some(1),
-            None,
+            Some("tinychat16/MiniChatterV16_batch_51230_epoch_1.check"),
             Some("tinychat16/MiniChatterV16"),
             CheckpointFrequency::EveryBatch(100),
-            None,
+            Some(2e-4),
             None,
             true,
             4,
         );
 
-        lm.save(
-            "MiniChatterV16.sumyu",
-            &description,
-        );
+        lm.save("MiniChatterV16.sumyu", &description);
     } else if test == 18 {
         let (_description, mut lm) = LM::load("TinyChatP1.sumyu");
-        lm.save("TinyChatP1.sumyu", "A Sumyu Hybrid model trained on the TinyChat dataset.");
+        lm.save(
+            "TinyChatP1.sumyu",
+            "A Sumyu Hybrid model trained on the TinyChat dataset.",
+        );
     }
 }

@@ -732,13 +732,11 @@ pub fn global_mixer_forward(
 
                 // Update G_p first, so readback sees the current token.
                 for c in 0..channels {
-                    global_vectors[
-                        global_row + c
-                        ] +=
-                        write_prob
-                            * input[
-                            input_row + c
-                            ];
+                    let old_weight = 1.0f32 - write_prob;
+
+                    global_vectors[global_row + c] =
+                        old_weight * global_vectors[global_row + c]
+                            + write_prob * input[input_row + c];
                 }
 
                 let read_prob =
@@ -1040,8 +1038,11 @@ fn global_mixer_forward_incremental(
 
         let global_base = g * channels;
         for c in 0..channels {
-            global_vectors[global_base + c] +=
-                write_probability * input[c];
+            let old_weight = 1.0f32 - write_probability;
+
+            global_vectors[global_base + c] =
+                old_weight * global_vectors[global_base + c]
+                    + write_probability * input[c];
         }
     }
 
