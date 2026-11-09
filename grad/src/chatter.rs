@@ -154,8 +154,6 @@ impl Chatter {
 
             // The next turn continues from the same persistent state.
             turn_prefix = "<EOT><USER>";
-
-            println!();
         }
     }
 }

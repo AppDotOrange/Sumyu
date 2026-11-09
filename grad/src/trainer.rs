@@ -1467,9 +1467,7 @@ impl Trainer {
         }
 
         if data_len == 0 {
-            println!(
-                "Dataset is too small for the selected context length!"
-            );
+            println!("Dataset is too small for the selected context length!");
 
             return TrainResult::Finished;
         }
@@ -2473,20 +2471,11 @@ impl Trainer {
                                     epoch_start_count
                                 );
 
-                        let remaining_at_start =
-                            data_len
-                                .saturating_sub(
-                                    epoch_start_count
-                                );
-
                         let progress =
-                            if remaining_at_start
-                                > 0
+                            if data_len > 0
                             {
-                                processed_samples
-                                    as f64
-                                    / remaining_at_start
-                                    as f64
+                                count as f64
+                                    / data_len as f64
                             } else {
                                 1.0
                             };

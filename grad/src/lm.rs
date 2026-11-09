@@ -181,12 +181,166 @@ pub fn tokenize_u16(
     )
 }
 
-#[inline]
-fn sample_logits(logits: &[f32], temp: f32) -> usize {
-    assert!(!logits.is_empty(), "Cannot sample from empty logits");
+#[derive(Clone, Copy, Debug)]
+pub struct SamplingConfig {
+    pub temperature: f32,
 
-    if temp <= 0.0 {
-        return logits
+    /// 1.0 disables repetition penalty.
+    /// Values above 1 discourage repetition; values below 1 encourage it.
+    pub repetition_penalty: f32,
+
+    /// Number of recent tokens considered.
+    /// 0 = entire available history.
+    pub repetition_window: usize,
+
+    /// 0 = disabled.
+    pub top_k: usize,
+
+    /// Probability mass to retain. Must be in (0, 1].
+    pub top_p: f32,
+
+    /// Minimum probability relative to the most likely token.
+    /// 0 = disabled.
+    pub min_p: f32,
+}
+
+impl SamplingConfig {
+    /// A sensible starting preset for general generation.
+    pub const fn recommended(temperature: f32) -> Self {
+        Self {
+            temperature,
+            repetition_penalty: 1.08,
+            repetition_window: 64,
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.0,
+        }
+    }
+
+    /// Reproduces temperature-only sampling.
+    pub const fn temperature_only(temperature: f32) -> Self {
+        Self {
+            temperature,
+            repetition_penalty: 1.0,
+            repetition_window: 0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    }
+
+    fn validate(self) {
+        assert!(
+            self.temperature.is_finite(),
+            "Temperature must be finite"
+        );
+
+        assert!(
+            self.repetition_penalty.is_finite()
+                && self.repetition_penalty > 0.0,
+            "Repetition penalty must be finite and positive"
+        );
+
+        assert!(
+            self.top_p.is_finite()
+                && self.top_p > 0.0
+                && self.top_p <= 1.0,
+            "top_p must be in (0, 1]"
+        );
+
+        assert!(
+            self.min_p.is_finite()
+                && self.min_p >= 0.0
+                && self.min_p <= 1.0,
+            "min_p must be in [0, 1]"
+        );
+    }
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self::recommended(0.7)
+    }
+}
+
+fn sample_logits_with_config(
+    logits: &[f32],
+    history: &[u16],
+    config: SamplingConfig,
+) -> usize {
+    assert!(
+        !logits.is_empty(),
+        "Cannot sample from empty logits"
+    );
+
+    config.validate();
+
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "Cannot sample from non-finite logits"
+    );
+
+    // ---------------------------------------------------------
+    // 1. Copy logits into f64.
+    // ---------------------------------------------------------
+
+    let mut adjusted: Vec<f64> =
+        logits.iter()
+            .map(|&x| x as f64)
+            .collect();
+
+    // ---------------------------------------------------------
+    // 2. Repetition penalty.
+    //
+    // Apply once per unique token in the recent history.
+    //
+    // Positive logits are divided by the penalty.
+    // Negative logits are multiplied by the penalty.
+    // ---------------------------------------------------------
+
+    if config.repetition_penalty != 1.0 {
+        let mut seen = vec![false; adjusted.len()];
+
+        let history_slice =
+            if config.repetition_window == 0 {
+                history
+            } else {
+                let start =
+                    history.len().saturating_sub(
+                        config.repetition_window
+                    );
+
+                &history[start..]
+            };
+
+        let penalty =
+            config.repetition_penalty as f64;
+
+        for &token_id in history_slice {
+            let id = token_id as usize;
+
+            if id >= adjusted.len() || seen[id] {
+                continue;
+            }
+
+            seen[id] = true;
+
+            let logit = &mut adjusted[id];
+
+            if *logit < 0.0 {
+                *logit *= penalty;
+            } else {
+                *logit /= penalty;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 3. Greedy decoding.
+    // ---------------------------------------------------------
+
+    if config.temperature <= 0.0 {
+        return adjusted
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
@@ -194,24 +348,138 @@ fn sample_logits(logits: &[f32], temp: f32) -> usize {
             .0;
     }
 
-    let max_logit = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    // ---------------------------------------------------------
+    // 4. Temperature.
+    // ---------------------------------------------------------
 
-    let exp_logits: Vec<f32> = logits
-        .iter()
-        .map(|&x| ((x - max_logit) / temp).exp())
-        .collect();
+    let temperature =
+        config.temperature as f64;
 
-    let sum_exp: f32 = exp_logits.iter().sum();
-    let probs: Vec<f32> = exp_logits
-        .iter()
-        .map(|&x| x / sum_exp)
-        .collect();
+    let scaled: Vec<f64> =
+        adjusted.iter()
+            .map(|&x| x / temperature)
+            .collect();
 
-    let distribution = WeightedIndex::new(&probs).unwrap();
-    distribution.sample(&mut rng())
+    // ---------------------------------------------------------
+    // 5. Candidate selection.
+    // ---------------------------------------------------------
+
+    let mut candidates: Vec<usize> =
+        (0..scaled.len()).collect();
+
+    // Top-k uses partial selection rather than sorting
+    // the entire vocabulary.
+    if config.top_k > 0
+        && config.top_k < candidates.len()
+    {
+        candidates.select_nth_unstable_by(
+            config.top_k,
+            |a, b| {
+                scaled[*b].total_cmp(
+                    &scaled[*a]
+                )
+            }
+        );
+
+        candidates.truncate(config.top_k);
+    }
+
+    // Nucleus sampling requires sorted candidates.
+    // When top-k is enabled, this only sorts the top-k set.
+    if config.top_p < 1.0 {
+        candidates.sort_unstable_by(
+            |a, b| {
+                scaled[*b].total_cmp(
+                    &scaled[*a]
+                )
+            }
+        );
+    }
+
+    // ---------------------------------------------------------
+    // 6. Min-p filtering.
+    //
+    // Retain tokens satisfying:
+    //
+    // P(token) >= min_p * P(best_token)
+    //
+    // Comparing scaled logits avoids computing softmax.
+    // ---------------------------------------------------------
+
+    if config.min_p > 0.0 {
+        let max_logit =
+            candidates.iter()
+                .map(|&i| scaled[i])
+                .fold(f64::NEG_INFINITY, f64::max);
+
+        let threshold =
+            max_logit + (config.min_p as f64).ln();
+
+        candidates.retain(
+            |&i| scaled[i] >= threshold
+        );
+    }
+
+    // ---------------------------------------------------------
+    // 7. Stable softmax over remaining candidates.
+    // ---------------------------------------------------------
+
+    let max_logit =
+        candidates.iter()
+            .map(|&i| scaled[i])
+            .fold(f64::NEG_INFINITY, f64::max);
+
+    let mut weights: Vec<f64> =
+        candidates.iter()
+            .map(|&i| {
+                (scaled[i] - max_logit).exp()
+            })
+            .collect();
+
+    // ---------------------------------------------------------
+    // 8. Top-p filtering.
+    //
+    // Keep the smallest descending-probability prefix
+    // whose cumulative probability reaches top_p.
+    // ---------------------------------------------------------
+
+    if config.top_p < 1.0 {
+        let total_weight: f64 =
+            weights.iter().sum();
+
+        let target =
+            total_weight * config.top_p as f64;
+
+        let mut cumulative = 0.0;
+        let mut keep_count = weights.len();
+
+        for (i, &weight) in weights.iter().enumerate() {
+            cumulative += weight;
+
+            if cumulative >= target {
+                keep_count = i + 1;
+                break;
+            }
+        }
+
+        candidates.truncate(keep_count);
+        weights.truncate(keep_count);
+    }
+
+    // ---------------------------------------------------------
+    // 9. Weighted random sampling.
+    // ---------------------------------------------------------
+
+    let distribution =
+        WeightedIndex::new(&weights)
+            .expect("Invalid sampling weights");
+
+    let mut random = rng();
+
+    let sampled_position =
+        distribution.sample(&mut random);
+
+    candidates[sampled_position]
 }
 
 fn byte_fallback_base(vocab: &[String]) -> u32 {
@@ -519,6 +787,64 @@ impl LM {
         println!("NEW CONTEXT: {}", self.context_len);
     }
 
+    fn is_repetition_exempt(&self, token_id: u16) -> bool {
+        matches!(
+        self.vocab.get(token_id as usize).map(String::as_str),
+        Some("<USER>") | Some("<BOT>") | Some("<EOT>")
+    )
+    }
+
+    fn initial_repetition_history(
+        &self,
+        prompt_ids: &[u16],
+        config: SamplingConfig,
+    ) -> Vec<u16> {
+        if config.repetition_penalty == 1.0 {
+            return Vec::new();
+        }
+
+        let mut history: Vec<u16> =
+            prompt_ids.iter()
+                .copied()
+                .filter(|&id| !self.is_repetition_exempt(id))
+                .collect();
+
+        if config.repetition_window > 0
+            && history.len() > config.repetition_window
+        {
+            let excess =
+                history.len() - config.repetition_window;
+
+            history.drain(..excess);
+        }
+
+        history
+    }
+
+    fn remember_repetition_token(
+        &self,
+        history: &mut Vec<u16>,
+        token_id: u16,
+        config: SamplingConfig,
+    ) {
+        if config.repetition_penalty == 1.0
+            || self.is_repetition_exempt(token_id)
+        {
+            return;
+        }
+
+        history.push(token_id);
+
+        if config.repetition_window > 0
+            && history.len() > config.repetition_window
+        {
+            let excess =
+                history.len() - config.repetition_window;
+
+            history.drain(..excess);
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Checkpoint loading
     // ------------------------------------------------------------------------
@@ -715,7 +1041,24 @@ impl LM {
         logits: &[f32],
         temperature: f32,
     ) -> u16 {
-        sample_logits(logits, temperature) as u16
+        sample_logits_with_config(
+            logits,
+            &[],
+            SamplingConfig::recommended(temperature),
+        ) as u16
+    }
+
+    pub fn sample_next_token_with_history(
+        &self,
+        logits: &[f32],
+        history: &[u16],
+        config: SamplingConfig,
+    ) -> u16 {
+        sample_logits_with_config(
+            logits,
+            history,
+            config,
+        ) as u16
     }
 
     pub fn token_text(&self, token_id: u16) -> &str {
@@ -783,31 +1126,87 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
+        self.generate_with_sampling(
+            context,
+            gen_length,
+            SamplingConfig::recommended(temp),
+            threads,
+        )
+    }
+
+    pub fn generate_with_sampling(
+        &self,
+        context: String,
+        gen_length: usize,
+        sampling: SamplingConfig,
+        threads: usize,
+    ) -> String {
         let _ = threads;
 
         if gen_length == 0 {
             return String::new();
         }
 
-        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        let prompt_ids =
+            tokenize_u16(&context, &self.vocab);
+
         assert!(
             !prompt_ids.is_empty(),
             "Generation input cannot be empty"
         );
 
-        let mut state = self.new_inference_state()
-            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
-        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
-            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
+        let mut history =
+            self.initial_repetition_history(
+                &prompt_ids,
+                sampling,
+            );
 
-        let mut tokens = Vec::<String>::with_capacity(gen_length);
+        let mut state =
+            self.new_inference_state()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot start incremental inference: {}",
+                        error
+                    )
+                });
+
+        let mut logits =
+            self.prefill_ids(&prompt_ids, &mut state)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot prefill incremental inference: {}",
+                        error
+                    )
+                });
+
+        let mut tokens =
+            Vec::<String>::with_capacity(gen_length);
 
         for step in 0..gen_length {
-            let idx = sample_logits(&logits, temp);
-            tokens.push(self.vocab[idx].clone());
+            let idx =
+                sample_logits_with_config(
+                    &logits,
+                    &history,
+                    sampling,
+                );
+
+            let token_id = idx as u16;
+
+            tokens.push(
+                self.vocab[idx].clone()
+            );
+
+            self.remember_repetition_token(
+                &mut history,
+                token_id,
+                sampling,
+            );
 
             if step + 1 < gen_length {
-                logits = self.forward_token_id(idx as u16, &mut state);
+                logits = self.forward_token_id(
+                    token_id,
+                    &mut state,
+                );
             }
         }
 
@@ -818,6 +1217,19 @@ impl LM {
         &self,
         ids: &[u16],
         temp: f32,
+        threads: usize,
+    ) -> usize {
+        self.generate_one_ids_with_sampling(
+            ids,
+            SamplingConfig::recommended(temp),
+            threads,
+        )
+    }
+
+    pub fn generate_one_ids_with_sampling(
+        &self,
+        ids: &[u16],
+        sampling: SamplingConfig,
         _threads: usize,
     ) -> usize {
         assert!(
@@ -825,12 +1237,10 @@ impl LM {
             "Generation input cannot be empty"
         );
 
-        let positions =
-            ids.len();
+        let positions = ids.len();
 
         let max_context_len =
-            self.context_len
-                as usize;
+            self.context_len as usize;
 
         assert!(
             positions <= max_context_len,
@@ -854,7 +1264,17 @@ impl LM {
                 positions * embedding_dim,
             );
 
-        sample_logits(&logits, temp)
+        let history =
+            self.initial_repetition_history(
+                ids,
+                sampling,
+            );
+
+        sample_logits_with_config(
+            &logits,
+            &history,
+            sampling,
+        )
     }
 
     pub fn generate_one(
@@ -863,36 +1283,39 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
+        self.generate_one_with_sampling(
+            context,
+            SamplingConfig::recommended(temp),
+            threads,
+        )
+    }
+
+    pub fn generate_one_with_sampling(
+        &self,
+        context: String,
+        sampling: SamplingConfig,
+        threads: usize,
+    ) -> String {
         let mut ids =
-            self.encode_nums(
-                context
-            );
+            self.encode_nums(context);
 
         let max_context_len =
-            self.context_len
-                as usize;
+            self.context_len as usize;
 
-        if ids.len()
-            > max_context_len
-        {
-            ids =
-                ids[
-                    ids.len()
-                        - max_context_len
-                        ..
-                    ]
-                    .to_vec();
+        if ids.len() > max_context_len {
+            ids = ids[
+                ids.len() - max_context_len..
+                ].to_vec();
         }
 
         let idx =
-            self.generate_one_ids(
+            self.generate_one_ids_with_sampling(
                 &ids,
-                temp,
+                sampling,
                 threads,
             );
 
-        self.vocab[idx]
-            .clone()
+        self.vocab[idx].clone()
     }
 
     pub fn generate_one_distribution(
@@ -1048,49 +1471,105 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
-        let _ = threads; // Incremental inference currently processes one token at a time.
+        self.generate_gpt_with_sampling(
+            context,
+            gen_length,
+            SamplingConfig::recommended(temp),
+            threads,
+        )
+    }
+
+    pub fn generate_gpt_with_sampling(
+        &self,
+        context: String,
+        gen_length: usize,
+        sampling: SamplingConfig,
+        threads: usize,
+    ) -> String {
+        let _ = threads;
 
         if gen_length == 0 {
             return String::new();
         }
 
-        // Tokenize the complete prompt once. Unlike the previous implementation,
-        // we do not truncate this to context_len: convolution histories remain
-        // bounded, while each GlobalMixer carries its compact persistent state.
-        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        let prompt_ids =
+            tokenize_u16(&context, &self.vocab);
+
         assert!(
             !prompt_ids.is_empty(),
             "Generation input cannot be empty"
         );
 
-        let mut state = self.new_inference_state()
-            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
-        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
-            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
+        let mut history =
+            self.initial_repetition_history(
+                &prompt_ids,
+                sampling,
+            );
+
+        let mut state =
+            self.new_inference_state()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot start incremental inference: {}",
+                        error
+                    )
+                });
+
+        let mut logits =
+            self.prefill_ids(&prompt_ids, &mut state)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot prefill incremental inference: {}",
+                        error
+                    )
+                });
 
         let mut output = String::new();
         let mut byte_buffer = Vec::<u8>::new();
 
         for step in 0..gen_length {
-            let idx = sample_logits(&logits, temp);
+            let idx =
+                sample_logits_with_config(
+                    &logits,
+                    &history,
+                    sampling,
+                );
+
+            let token_id = idx as u16;
             let generation = &self.vocab[idx];
 
             output.push_str(generation);
-            stream_token(generation, &mut byte_buffer);
+
+            stream_token(
+                generation,
+                &mut byte_buffer,
+            );
+
             let _ = std::io::stdout().flush();
 
-            // The sampled token becomes the next model input. Avoid doing this
-            // final forward step when no subsequent token will be sampled.
+            self.remember_repetition_token(
+                &mut history,
+                token_id,
+                sampling,
+            );
+
             if step + 1 < gen_length {
-                logits = self.forward_token_id(idx as u16, &mut state);
+                logits = self.forward_token_id(
+                    token_id,
+                    &mut state,
+                );
             }
         }
 
         if !byte_buffer.is_empty() {
-            print!("{}", String::from_utf8_lossy(&byte_buffer));
+            print!(
+                "{}",
+                String::from_utf8_lossy(&byte_buffer)
+            );
         }
 
         let _ = std::io::stdout().flush();
+
         output
     }
 
@@ -1101,59 +1580,134 @@ impl LM {
         temp: f32,
         threads: usize,
     ) -> String {
+        self.generate_gpt_chatter_with_sampling(
+            context,
+            gen_length,
+            SamplingConfig::recommended(temp),
+            threads,
+        )
+    }
+
+    pub fn generate_gpt_chatter_with_sampling(
+        &self,
+        context: String,
+        gen_length: usize,
+        sampling: SamplingConfig,
+        threads: usize,
+    ) -> String {
         let _ = threads;
 
         if gen_length == 0 {
             return String::new();
         }
 
-        let prompt_ids = tokenize_u16(&context, &self.vocab);
+        let prompt_ids =
+            tokenize_u16(&context, &self.vocab);
+
         assert!(
             !prompt_ids.is_empty(),
             "Generation input cannot be empty"
         );
 
-        let mut state = self.new_inference_state()
-            .unwrap_or_else(|error| panic!("Cannot start incremental inference: {}", error));
-        let mut logits = self.prefill_ids(&prompt_ids, &mut state)
-            .unwrap_or_else(|error| panic!("Cannot prefill incremental inference: {}", error));
+        let mut history =
+            self.initial_repetition_history(
+                &prompt_ids,
+                sampling,
+            );
+
+        let mut state =
+            self.new_inference_state()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot start incremental inference: {}",
+                        error
+                    )
+                });
+
+        let mut logits =
+            self.prefill_ids(&prompt_ids, &mut state)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Cannot prefill incremental inference: {}",
+                        error
+                    )
+                });
 
         let mut output = String::new();
         let mut byte_buffer = Vec::<u8>::new();
 
         for step in 0..gen_length {
-            let idx = sample_logits(&logits, temp);
+            let idx =
+                sample_logits_with_config(
+                    &logits,
+                    &history,
+                    sampling,
+                );
+
+            let token_id = idx as u16;
             let generation = &self.vocab[idx];
 
+            // Stop at the end-of-turn token.
             if generation.contains("<EOT>") {
-                let before_eot = generation.split("<EOT>").next().unwrap();
+                let before_eot =
+                    generation.split("<EOT>")
+                        .next()
+                        .unwrap();
 
-                stream_token(before_eot, &mut byte_buffer);
+                stream_token(
+                    before_eot,
+                    &mut byte_buffer,
+                );
+
                 if !byte_buffer.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&byte_buffer));
+                    print!(
+                        "{}",
+                        String::from_utf8_lossy(&byte_buffer)
+                    );
                     byte_buffer.clear();
                 }
+
                 let _ = std::io::stdout().flush();
 
                 output.push_str(before_eot);
+
                 return output;
             }
 
             output.push_str(generation);
-            stream_token(generation, &mut byte_buffer);
+
+            stream_token(
+                generation,
+                &mut byte_buffer,
+            );
+
             let _ = std::io::stdout().flush();
 
+            self.remember_repetition_token(
+                &mut history,
+                token_id,
+                sampling,
+            );
+
             if step + 1 < gen_length {
-                logits = self.forward_token_id(idx as u16, &mut state);
+                logits = self.forward_token_id(
+                    token_id,
+                    &mut state,
+                );
             }
         }
 
         if !byte_buffer.is_empty() {
-            print!("{}", String::from_utf8_lossy(&byte_buffer));
+            print!(
+                "{}",
+                String::from_utf8_lossy(&byte_buffer)
+            );
         }
 
         let _ = std::io::stdout().flush();
+
         println!();
+
         output
     }
 

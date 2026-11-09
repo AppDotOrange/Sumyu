@@ -521,10 +521,10 @@ fn main() {
 
         lm.train(
             Some(1),
-            Some("tinychat16/MiniChatterV16_batch_51230_epoch_1.check"),
+            Some("tinychat16/MiniChatterV16_batch_63749_epoch_1.check"),
             Some("tinychat16/MiniChatterV16"),
             CheckpointFrequency::EveryBatch(100),
-            Some(2e-4),
+            Some(1e-4),
             None,
             true,
             4,
