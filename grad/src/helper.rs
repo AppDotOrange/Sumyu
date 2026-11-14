@@ -499,6 +499,11 @@ impl Trie {
 
         result
     }
+
+    #[inline]
+    pub(crate) fn max_token_bytes(&self) -> usize {
+        self.max_token_bytes
+    }
 }
 
 #[derive(Default)]

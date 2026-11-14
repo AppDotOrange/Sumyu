@@ -57,6 +57,43 @@ pub fn stream_token(
     }
 }
 
+pub fn append_decoded_token_bytes(
+    token: &str,
+    output: &mut Vec<u8>,
+) {
+    let bytes = token.as_bytes();
+    let mut i = 0;
+    let mut normal_start = 0;
+
+    while i + 5 < bytes.len() {
+        if bytes[i] == b'<'
+            && bytes[i + 1] == b'0'
+            && bytes[i + 2] == b'x'
+            && bytes[i + 5] == b'>'
+        {
+            if let Ok(byte) =
+                u8::from_str_radix(&token[i + 3..i + 5], 16)
+            {
+                output.extend_from_slice(
+                    &bytes[normal_start..i]
+                );
+
+                output.push(byte);
+
+                i += 6;
+                normal_start = i;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    output.extend_from_slice(
+        &bytes[normal_start..]
+    );
+}
+
 pub fn decode_token_stream(tokens: &[String]) -> String {
     let mut output = String::new();
     let mut byte_buffer = Vec::<u8>::new();

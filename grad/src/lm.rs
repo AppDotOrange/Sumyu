@@ -1,4 +1,3 @@
-
 use crate::embeddings::{
     Embeddings,
     SavedEmbeddings,
@@ -27,6 +26,7 @@ use crate::trainer::{
     Trainer,
 };
 pub use crate::miscellaneous::{
+    append_decoded_token_bytes,
     decode_token_stream,
     print_layer_specs,
     stream_token,
@@ -41,6 +41,7 @@ use serde::{
 };
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::sync::Arc;
 use std::path::Path;
 
@@ -521,6 +522,23 @@ impl LMInferenceState {
     }
 }
 
+fn build_tokenizer_data(
+    vocab: &[String],
+) -> (Arc<crate::helper::Trie>, usize) {
+    let byte_fallback = byte_fallback_base(vocab);
+
+    let trie = Arc::new(
+        crate::helper::Trie::from_vocab(
+            vocab,
+            byte_fallback,
+        )
+    );
+
+    let max_token_bytes = trie.max_token_bytes();
+
+    (trie, max_token_bytes)
+}
+
 #[derive(Clone)]
 pub struct LM {
     trainer: Trainer,
@@ -535,7 +553,15 @@ pub struct LM {
     // Some(...) = only selected target ranges contribute to loss.
     dataset_loss_mask: Option<LmLossMask>,
 
+    // Optional hard boundaries between independently sampled JSON chats.
+    // None = one ordinary continuous token stream.
+    dataset_chat_ranges: Option<Vec<Range<usize>>>,
+
     vocab: Vec<String>,
+    // Shared tokenizer trie used by text encoding and generated-token merging.
+    // Keeping it here avoids rebuilding a vocabulary-sized trie during generation.
+    tokenizer_trie: Arc<crate::helper::Trie>,
+    max_token_bytes: usize,
     context_len: u32,
     hidden_layers: Vec<usize>,
     embeddings: Arc<Embeddings>,
@@ -602,12 +628,17 @@ impl LM {
                 0,
             );
 
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&vocab);
+
         Self {
             trainer,
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len,
             hidden_layers:
             hidden_dim.to_vec(),
@@ -653,12 +684,17 @@ impl LM {
                 0,
             );
 
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&vocab);
+
         Self {
             trainer,
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len,
             hidden_layers: Vec::new(),
             embeddings,
@@ -722,12 +758,17 @@ impl LM {
                 config.max_batches_per_epoch,
             );
 
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&config.vocab);
+
         Self {
             trainer,
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab: config.vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len:
             config.context_len as u32,
             hidden_layers:
@@ -767,12 +808,17 @@ impl LM {
                 params,
             );
 
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&config.vocab);
+
         Self {
             trainer,
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab: config.vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len:
             config.context_len as u32,
             hidden_layers: Vec::new(),
@@ -915,12 +961,17 @@ impl LM {
                 0,
             );
 
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&vocab);
+
         Self {
             trainer,
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len,
             hidden_layers,
             embeddings,
@@ -989,10 +1040,7 @@ impl LM {
         &self,
         string: String,
     ) -> Vec<u16> {
-        tokenize_u16(
-            &string,
-            &self.vocab,
-        )
+        self.tokenize_text(&string)
     }
 
     pub fn max(
@@ -1030,9 +1078,93 @@ impl LM {
         })
     }
 
+    /// Number of entries in this model's vocabulary.
+    ///
+    /// Special tokens represented by empty strings still occupy ordinary
+    /// vocabulary IDs and must be supplied to chat/agent configs by ID.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Re-tokenize a sequence of generated token IDs using the same greedy
+    /// byte-aware trie used for training text. This merges adjacent generated
+    /// pieces whenever their concatenated bytes form a larger vocabulary token.
+    ///
+    /// Empty-string special tokens are hard boundaries: pending text bytes are
+    /// flushed before them, and the special token ID is preserved unchanged.
+    pub fn merge_token_ids(&self, ids: &[u16]) -> Result<Vec<u16>, String> {
+        let mut merged = Vec::<u16>::with_capacity(ids.len());
+        let mut pending_bytes = Vec::<u8>::new();
+
+        for &id in ids {
+            let token = self.vocab.get(id as usize).ok_or_else(|| {
+                format!("Token ID {} is outside the vocabulary", id)
+            })?;
+
+            if token.is_empty() {
+                self.tokenizer_trie
+                    .tokenize_bytes_u16_into(&pending_bytes, &mut merged);
+                pending_bytes.clear();
+                merged.push(id);
+            } else {
+                append_decoded_token_bytes(
+                    token,
+                    &mut pending_bytes,
+                );
+            }
+        }
+
+        self.tokenizer_trie
+            .tokenize_bytes_u16_into(&pending_bytes, &mut merged);
+        Ok(merged)
+    }
+
+    /// Number of trailing token IDs whose segmentation may still change when
+    /// more bytes are appended. The prefix before this boundary is guaranteed
+    /// stable for the current vocabulary's maximum token byte length.
+    /// Empty-string special tokens split text into independent tokenization runs.
+    pub fn stable_token_prefix_len(&self, ids: &[u16]) -> usize {
+        let run_start = ids
+            .iter()
+            .rposition(|&id| self.vocab[id as usize].is_empty())
+            .map_or(0, |index| index + 1);
+
+        if run_start == ids.len() {
+            return ids.len();
+        }
+
+        let mut byte_buffer = Vec::<u8>::new();
+        let mut run_bytes = 0usize;
+        for &id in &ids[run_start..] {
+            byte_buffer.clear();
+            append_decoded_token_bytes(&self.vocab[id as usize], &mut byte_buffer);
+            run_bytes = run_bytes.saturating_add(byte_buffer.len());
+        }
+
+        let stable_byte_end = run_bytes.saturating_sub(self.max_token_bytes);
+        let mut stable_bytes = 0usize;
+        let mut stable_count = run_start;
+
+        for &id in &ids[run_start..] {
+            byte_buffer.clear();
+            append_decoded_token_bytes(&self.vocab[id as usize], &mut byte_buffer);
+            stable_bytes = stable_bytes.saturating_add(byte_buffer.len());
+            if stable_bytes > stable_byte_end {
+                break;
+            }
+            stable_count += 1;
+        }
+
+        stable_count
+    }
+
     /// Tokenize text using this model's vocabulary and byte fallback.
+    /// Empty-string special tokens are intentionally not produced by text
+    /// tokenization; inject their IDs directly into the token stream.
     pub fn tokenize_text(&self, text: &str) -> Vec<u16> {
-        tokenize_u16(text, &self.vocab)
+        let mut ids = Vec::with_capacity(text.len().saturating_div(2));
+        self.tokenizer_trie.tokenize_bytes_u16_into(text.as_bytes(), &mut ids);
+        ids
     }
 
     /// Sample a token ID from model logits.
@@ -1762,6 +1894,8 @@ impl LM {
         // Explicitly supplied raw-token datasets are unmasked.
         self.dataset_loss_mask =
             None;
+
+        self.dataset_chat_ranges = None;
     }
 
     pub fn set_dataset_with_mask(
@@ -1776,15 +1910,15 @@ impl LM {
             Some(
                 loss_mask
             );
+
+        self.dataset_chat_ranges = None;
     }
 
     pub fn load_corpus(
         &mut self,
         corpus: &str,
     ) {
-        println!(
-            "Tokenizing corpus..."
-        );
+        println!("Tokenizing corpus...");
 
         self.dataset =
             tokenize_u16(
@@ -1793,17 +1927,15 @@ impl LM {
             );
 
         // Raw text corpus = ordinary next-token training.
-        self.dataset_loss_mask =
-            None;
+        self.dataset_loss_mask = None;
+        self.dataset_chat_ranges = None;
 
         println!(
             "Done! Loaded {} tokens ({} training samples).",
             self.dataset.len(),
             self.dataset
                 .len()
-                .saturating_sub(
-                    self.context_len as usize
-                )
+                .saturating_sub(self.context_len as usize)
         );
     }
 
@@ -1819,6 +1951,8 @@ impl LM {
 
         self.dataset_loss_mask =
             None;
+
+        self.dataset_chat_ranges = None;
     }
 
     pub fn load_dataset_file(
@@ -1858,15 +1992,9 @@ impl LM {
             // without keeping all original strings in RAM.
             // =========================================================
 
-            println!(
-                "Loading masked JSON dataset: {}",
-                path
-            );
+            println!("Loading masked JSON dataset: {}", path);
 
-            let byte_fallback =
-                byte_fallback_base(
-                    &self.vocab
-                );
+            let byte_fallback = byte_fallback_base(&self.vocab);
 
             let trie =
                 crate::helper::Trie::from_vocab(
@@ -1875,9 +2003,10 @@ impl LM {
                 );
 
             let loaded =
-                crate::trainer::load_masked_json_lm_dataset(
+                crate::trainer::load_masked_json_lm_dataset_with_vocab_size(
                     path_ref,
                     1024 * 1024,
+                    self.vocab.len(),
                     move |text, out| {
                         trie.tokenize_bytes_u16_into(
                             text.as_bytes(),
@@ -1895,21 +2024,23 @@ impl LM {
                         }
                     );
 
-            self.dataset =
-                loaded.tokens;
+            self.dataset = loaded.tokens;
+            self.dataset_loss_mask = Some(loaded.loss_mask);
 
-            self.dataset_loss_mask =
-                Some(
-                    loaded.loss_mask
-                );
+            let context_len = self.context_len as usize;
+            let training_samples: usize = loaded.chat_ranges
+                .iter()
+                .map(|range| {
+                    (range.end - range.start).saturating_sub(context_len)
+                })
+                .sum();
+            let chat_count = loaded.chat_ranges.len();
+            let too_short_chats = loaded.chat_ranges
+                .iter()
+                .filter(|range| range.end - range.start <= context_len)
+                .count();
 
-            let training_samples =
-                self.dataset
-                    .len()
-                    .saturating_sub(
-                        self.context_len
-                            as usize
-                    );
+            self.dataset_chat_ranges = Some(loaded.chat_ranges);
 
             let masked_ranges =
                 self.dataset_loss_mask
@@ -1922,9 +2053,12 @@ impl LM {
                     .unwrap_or(0);
 
             println!(
-                "Done! Loaded {} tokens ({} training samples, {} selected loss ranges).",
+                "Done! Loaded {} tokens across {} chats ({} training samples, {} chats too short for context length {}, {} selected loss ranges).",
                 self.dataset.len(),
+                chat_count,
                 training_samples,
+                too_short_chats,
+                context_len,
                 masked_ranges,
             );
 
@@ -2280,7 +2414,7 @@ impl LM {
             };
 
         self.mlp.set_num_threads(threads as usize);
-        self.trainer.train_lm(
+        self.trainer.train_lm_with_chat_ranges(
             1,
             batch_update_frequency,
             resume_state,
@@ -2293,6 +2427,7 @@ impl LM {
             &self.embeddings,
             &token_byte_lens,
             self.dataset_loss_mask.as_ref(),
+            self.dataset_chat_ranges.as_deref(),
             seed.unwrap_or(
                 PermutationSampler::DEFAULT_SEED
             ),
@@ -2305,6 +2440,17 @@ impl LM {
     ) -> bool {
         self.dataset_loss_mask
             .is_some()
+    }
+
+    /// Number of independent chat ranges in the currently loaded dataset.
+    /// Raw text datasets are represented as one continuous stream and return 0.
+    pub fn dataset_chat_count(
+        &self,
+    ) -> usize {
+        self.dataset_chat_ranges
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(0)
     }
 
     pub fn dataset_loss_mask(
@@ -2428,6 +2574,13 @@ impl LM {
 
         self.vocab =
             checkpoint.model.vocab;
+
+        // The checkpoint may contain a different vocabulary, so rebuild the
+        // tokenizer cache before any subsequent text encoding or ID merging.
+        let (tokenizer_trie, max_token_bytes) =
+            build_tokenizer_data(&self.vocab);
+        self.tokenizer_trie = tokenizer_trie;
+        self.max_token_bytes = max_token_bytes;
 
         self.context_len =
             checkpoint.model.context_len;
@@ -2586,12 +2739,18 @@ impl LM {
                 params,
             );
 
+        let (tokenizer_trie, max_token_bytes) =
+            build_tokenizer_data(&saved.vocab);
+
         Self {
             trainer: Trainer::new(0.0, 0, 0, 0),
             mlp,
             dataset: Vec::new(),
             dataset_loss_mask: None,
+            dataset_chat_ranges: None,
             vocab: saved.vocab,
+            tokenizer_trie,
+            max_token_bytes,
             context_len: saved.context_len,
             hidden_layers: saved.hidden_layers,
             embeddings,
@@ -2716,5 +2875,19 @@ impl LM {
         );
 
         forward.layers
+    }
+
+    pub fn user_bot_eot_to_blank_in_vocab(&mut self) {
+        for token in &mut self.vocab {
+            if matches!(token.as_str(), "<USER>" | "<BOT>" | "<EOT>") {
+                token.clear();
+            }
+        }
+
+        let (trie, max_token_bytes) =
+            build_tokenizer_data(&self.vocab);
+
+        self.tokenizer_trie = trie;
+        self.max_token_bytes = max_token_bytes;
     }
 }

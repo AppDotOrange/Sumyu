@@ -503,7 +503,7 @@ fn main() {
         //------------------------------------------------------------------------------------------
 
         let config = helper::tinychat_v16_hybrid(1e-3, 512, 1);
-        let description = "A large Sumyu Hybrid model trained on TinyChat.";
+        let description = "A small Sumyu Hybrid model trained on starhopp3r/TinyChat.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
@@ -521,7 +521,7 @@ fn main() {
 
         lm.train(
             Some(1),
-            Some("tinychat16/MiniChatterV16_batch_63749_epoch_1.check"),
+            Some("tinychat16/MiniChatterV16_batch_69994_epoch_1.check"),
             Some("tinychat16/MiniChatterV16"),
             CheckpointFrequency::EveryBatch(100),
             Some(1e-4),
@@ -532,10 +532,10 @@ fn main() {
 
         lm.save("MiniChatterV16.sumyu", &description);
     } else if test == 18 {
-        let (_description, mut lm) = LM::load("TinyChatP1.sumyu");
+        let (_description, mut lm) = LM::load("TinyChatP1-small.sumyu");
         lm.save(
-            "TinyChatP1.sumyu",
-            "A Sumyu Hybrid model trained on the TinyChat dataset.",
+            "TinyChatP1-small.sumyu",
+            "A small Sumyu Hybrid model trained on starhopp3r/TinyChat.",
         );
     }
 }

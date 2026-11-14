@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -552,12 +553,38 @@ impl LmLossMask {
 pub struct JsonLmDataset {
     pub tokens: Vec<u16>,
     pub loss_mask: LmLossMask,
+    /// Half-open token ranges for individual chats. Training samples are
+    /// restricted so their complete input and target windows stay in one.
+    pub chat_ranges: Vec<Range<usize>>,
+}
+
+/// Token IDs inserted immediately before and after a turn's text.
+///
+/// Both `start` and `end` tokens are included in the loss mask when the role
+/// is selected by `train_on`, so the model can learn to emit structural role
+/// markers as well as end markers.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoleTokenConfig {
+    pub start: Vec<u16>,
+    pub end: Vec<u16>,
+}
+
+/// Configuration is read in a lightweight first pass. Unknown fields such as
+/// `turns` are consumed as IgnoredAny, so the strings are not materialized.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct JsonDatasetConfig {
+    train_on: Vec<String>,
+    role_tokens: HashMap<String, RoleTokenConfig>,
 }
 
 struct JsonBuildState<F> {
     tokens: Vec<u16>,
     ranges: Vec<Range<usize>>,
+    chat_ranges: Vec<Range<usize>>,
     train_on: Vec<String>,
+    role_tokens: HashMap<String, RoleTokenConfig>,
     tokenizer: F,
 }
 
@@ -566,6 +593,14 @@ struct TurnsSeed<'a, F> {
 }
 
 struct TurnSeed<'a, F> {
+    state: &'a mut JsonBuildState<F>,
+}
+
+struct ChatsSeed<'a, F> {
+    state: &'a mut JsonBuildState<F>,
+}
+
+struct ChatSeed<'a, F> {
     state: &'a mut JsonBuildState<F>,
 }
 
@@ -726,10 +761,21 @@ where
                                 == role.as_ref()
                         );
 
-                let start =
+                // The role's selected training span includes its boundary
+                // tokens as well as its text. This lets the model learn to
+                // emit structural starts (for example, a tool-call marker)
+                // and ends (for example, an end-of-turn marker).
+                let target_start =
                     self.state.tokens.len();
 
-                // IMPORTANT:
+                if let Some(config) =
+                    self.state.role_tokens.get(role.as_ref())
+                {
+                    self.state.tokens.extend_from_slice(
+                        &config.start
+                    );
+                }
+
                 // Tokenize directly into the final dataset buffer.
                 // No temporary Vec<u16>, and no second copy.
                 (self.state.tokenizer)(
@@ -737,13 +783,21 @@ where
                     &mut self.state.tokens,
                 );
 
-                let end =
+                if let Some(config) =
+                    self.state.role_tokens.get(role.as_ref())
+                {
+                    self.state.tokens.extend_from_slice(
+                        &config.end
+                    );
+                }
+
+                let target_end =
                     self.state.tokens.len();
 
-                if selected && start < end {
+                if selected && target_start < target_end {
                     self.state
                         .ranges
-                        .push(start..end);
+                        .push(target_start..target_end);
                 }
 
                 Ok(())
@@ -755,6 +809,144 @@ where
                 state: self.state,
             }
         )
+    }
+}
+
+impl<'de, F> DeserializeSeed<'de>
+for ChatsSeed<'_, F>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    type Value = ();
+
+    fn deserialize<D>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChatsVisitor<'a, F> {
+            state: &'a mut JsonBuildState<F>,
+        }
+
+        impl<'de, 'a, F> Visitor<'de>
+        for ChatsVisitor<'a, F>
+        where
+            F: FnMut(&str, &mut Vec<u16>),
+        {
+            type Value = ();
+
+            fn expecting(
+                &self,
+                formatter: &mut fmt::Formatter,
+            ) -> fmt::Result {
+                formatter.write_str("an array of chat objects")
+            }
+
+            fn visit_seq<A>(
+                self,
+                mut seq: A,
+            ) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq
+                    .next_element_seed(ChatSeed {
+                        state: self.state,
+                    })?
+                    .is_some()
+                {}
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(ChatsVisitor {
+            state: self.state,
+        })
+    }
+}
+
+impl<'de, F> DeserializeSeed<'de>
+for ChatSeed<'_, F>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
+    type Value = ();
+
+    fn deserialize<D>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChatVisitor<'a, F> {
+            state: &'a mut JsonBuildState<F>,
+        }
+
+        impl<'de, 'a, F> Visitor<'de>
+        for ChatVisitor<'a, F>
+        where
+            F: FnMut(&str, &mut Vec<u16>),
+        {
+            type Value = ();
+
+            fn expecting(
+                &self,
+                formatter: &mut fmt::Formatter,
+            ) -> fmt::Result {
+                formatter.write_str("a chat object containing a turns array")
+            }
+
+            fn visit_map<M>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let chat_start = self.state.tokens.len();
+                let mut saw_turns = false;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "turns" => {
+                            if saw_turns {
+                                return Err(serde::de::Error::custom(
+                                    "chat contains more than one 'turns' field",
+                                ));
+                            }
+
+                            saw_turns = true;
+                            map.next_value_seed(TurnsSeed {
+                                state: self.state,
+                            })?;
+                        }
+
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                if !saw_turns {
+                    return Err(serde::de::Error::missing_field("turns"));
+                }
+
+                let chat_end = self.state.tokens.len();
+                if chat_start < chat_end {
+                    self.state.chat_ranges.push(chat_start..chat_end);
+                }
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_map(ChatVisitor {
+            state: self.state,
+        })
     }
 }
 
@@ -785,27 +977,54 @@ where
     where
         A: MapAccess<'de>,
     {
+        let mut saw_root_turns = false;
+        let mut saw_chats = false;
+
         while let Some(key) =
             map.next_key::<Cow<'de, str>>()?
         {
             match key.as_ref() {
-                "train_on" => {
-                    self.state.train_on =
-                        map.next_value()?;
-                }
-
+                // Backward compatibility: the old top-level `turns` array is
+                // interpreted as one chat.
                 "turns" => {
-                    map.next_value_seed(
-                        TurnsSeed {
-                            state:
-                            &mut self.state,
-                        }
-                    )?;
+                    if saw_root_turns || saw_chats {
+                        return Err(serde::de::Error::custom(
+                            "use either top-level 'turns' or 'chats', not both or repeated",
+                        ));
+                    }
+
+                    saw_root_turns = true;
+                    let chat_start = self.state.tokens.len();
+
+                    map.next_value_seed(TurnsSeed {
+                        state: &mut self.state,
+                    })?;
+
+                    let chat_end = self.state.tokens.len();
+                    if chat_start < chat_end {
+                        self.state.chat_ranges.push(chat_start..chat_end);
+                    }
                 }
 
+                // New format: each entry owns its own token range and is
+                // sampled independently from every other chat.
+                "chats" => {
+                    if saw_root_turns || saw_chats {
+                        return Err(serde::de::Error::custom(
+                            "use either top-level 'turns' or one 'chats' field",
+                        ));
+                    }
+
+                    saw_chats = true;
+                    map.next_value_seed(ChatsSeed {
+                        state: &mut self.state,
+                    })?;
+                }
+
+                // These were parsed in the first pass, before tokenization.
+                // Ignore them here regardless of their position in the JSON.
                 _ => {
-                    let _: IgnoredAny =
-                        map.next_value()?;
+                    let _: IgnoredAny = map.next_value()?;
                 }
             }
         }
@@ -824,10 +1043,19 @@ where
             ),
 
             loss_mask,
+
+            chat_ranges:
+            std::mem::take(
+                &mut self.state.chat_ranges
+            ),
         })
     }
 }
 
+/// Loads the existing JSON dataset format without vocabulary-specific ID
+/// validation. Kept for compatibility with callers that do not have a vocab
+/// size available. Prefer `load_masked_json_lm_dataset_with_vocab_size` from
+/// an LM, so every configured role token ID is checked against its vocab.
 pub fn load_masked_json_lm_dataset<F>(
     path: impl AsRef<Path>,
     initial_capacity: usize,
@@ -839,8 +1067,56 @@ pub fn load_masked_json_lm_dataset<F>(
 where
     F: FnMut(&str, &mut Vec<u16>),
 {
+    load_masked_json_lm_dataset_with_vocab_size(
+        path,
+        initial_capacity,
+        usize::from(u16::MAX) + 1,
+        tokenizer,
+    )
+}
+
+/// Loads a JSON LM dataset and validates every configured role token ID
+/// against `vocab_size`.
+pub fn load_masked_json_lm_dataset_with_vocab_size<F>(
+    path: impl AsRef<Path>,
+    initial_capacity: usize,
+    vocab_size: usize,
+    tokenizer: F,
+) -> Result<
+    JsonLmDataset,
+    Box<dyn std::error::Error>,
+>
+where
+    F: FnMut(&str, &mut Vec<u16>),
+{
     let json =
         std::fs::read(path)?;
+
+    // This first pass reads only dataset-level configuration. Serde consumes
+    // the large `turns` / `chats` fields as IgnoredAny, preserving the
+    // streaming approach and allowing config keys in any property order.
+    let config: JsonDatasetConfig =
+        serde_json::from_slice(&json)?;
+
+    for (role, role_config) in &config.role_tokens {
+        for (boundary, ids) in [
+            ("start", role_config.start.as_slice()),
+            ("end", role_config.end.as_slice()),
+        ] {
+            for (index, &token_id) in ids.iter().enumerate() {
+                if usize::from(token_id) >= vocab_size {
+                    return Err(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "role_tokens.{role}.{boundary}[{index}] = {token_id} is outside vocabulary size {vocab_size}"
+                            ),
+                        ).into()
+                    );
+                }
+            }
+        }
+    }
 
     let state =
         JsonBuildState {
@@ -852,12 +1128,16 @@ where
             ranges:
             Vec::new(),
 
-            train_on:
+            chat_ranges:
             Vec::new(),
 
+            train_on: config.train_on,
+            role_tokens: config.role_tokens,
             tokenizer,
         };
 
+    // Second pass streams turn text directly into the final token buffer and
+    // records the independent token range belonging to every chat.
     let mut deserializer =
         serde_json::Deserializer::from_slice(
             &json
@@ -875,6 +1155,118 @@ where
 // ============================================================================
 // Trainer
 // ============================================================================
+
+/// Maps a shuffled ordinal to a token position while ensuring that every
+/// training window (context plus its following target token) stays inside one
+/// chat. The representation is O(number of chats), not O(number of samples).
+#[derive(Debug)]
+struct ChatSampleMap {
+    sample_ranges: Vec<Range<usize>>,
+    cumulative_ends: Vec<usize>,
+    len: usize,
+}
+
+impl ChatSampleMap {
+    fn new(
+        chat_ranges: &[Range<usize>],
+        token_count: usize,
+        context_len: usize,
+    ) -> Self {
+        let mut sample_ranges = Vec::with_capacity(chat_ranges.len());
+        let mut cumulative_ends = Vec::with_capacity(chat_ranges.len());
+        let mut total = 0usize;
+        let mut previous_chat_end = 0usize;
+
+        for range in chat_ranges {
+            assert!(
+                range.start <= range.end && range.end <= token_count,
+                "Invalid chat token range {:?} for dataset length {}",
+                range,
+                token_count,
+            );
+            assert!(
+                range.start >= previous_chat_end,
+                "Chat token ranges must be sorted and non-overlapping",
+            );
+            previous_chat_end = range.end;
+
+            // For a chat of N tokens and context C, there are N-C valid
+            // starts: the target at sample+C must still be inside the chat.
+            let sample_count =
+                (range.end - range.start).saturating_sub(context_len);
+
+            if sample_count == 0 {
+                continue;
+            }
+
+            sample_ranges.push(range.start..range.start + sample_count);
+            total += sample_count;
+            cumulative_ends.push(total);
+        }
+
+        Self {
+            sample_ranges,
+            cumulative_ends,
+            len: total,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn token_start(&self, ordinal: usize) -> usize {
+        assert!(ordinal < self.len, "Chat sample ordinal out of bounds");
+
+        let range_index = self.cumulative_ends.partition_point(
+            |&cumulative_end| cumulative_end <= ordinal,
+        );
+        let previous_end = if range_index == 0 {
+            0
+        } else {
+            self.cumulative_ends[range_index - 1]
+        };
+
+        self.sample_ranges[range_index].start
+            + (ordinal - previous_end)
+    }
+}
+
+#[cfg(test)]
+mod chat_sample_map_tests {
+    use super::ChatSampleMap;
+
+    #[test]
+    fn maps_samples_without_crossing_chat_boundaries() {
+        let chats = vec![0..7, 7..13];
+        let map = ChatSampleMap::new(&chats, 13, 3);
+
+        assert_eq!(map.len(), 7);
+        assert_eq!(map.token_start(0), 0);
+        assert_eq!(map.token_start(3), 3);
+        assert_eq!(map.token_start(4), 7);
+        assert_eq!(map.token_start(6), 9);
+
+        for ordinal in 0..map.len() {
+            let sample = map.token_start(ordinal);
+            let chat = if sample < 7 { &chats[0] } else { &chats[1] };
+            assert!(sample >= chat.start);
+            assert!(sample + 3 < chat.end);
+        }
+    }
+
+    #[test]
+    fn skips_chats_too_short_for_the_context() {
+        let chats = vec![0..3, 3..8];
+        let map = ChatSampleMap::new(&chats, 8, 3);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.token_start(0), 3);
+        assert_eq!(map.token_start(1), 4);
+    }
+}
 
 #[derive(Clone)]
 pub struct Trainer {
@@ -1387,7 +1779,54 @@ impl Trainer {
         TrainResult::Finished
     }
 
+    /// Backward-compatible trainer entry point for a single continuous token
+    /// stream. JSON chat datasets should use `train_lm_with_chat_ranges`.
     pub fn train_lm(
+        &mut self,
+        update_frequency: usize,
+        batch_update_frequency: Option<usize>,
+        resume: Option<ResumeState>,
+        variable_context: bool,
+        checkpoint_frequency: CheckpointFrequency,
+        savefn: Option<
+            &mut dyn FnMut(
+                CheckpointState,
+                &MLP,
+                &Embeddings,
+            ),
+        >,
+        mlp: &mut MLP,
+        tokens: &[u16],
+        context_len: usize,
+        embeddings: &Embeddings,
+        token_byte_lens: &[u32],
+        loss_mask: Option<&LmLossMask>,
+        sampler_seed: u64,
+        threads: usize,
+    ) -> TrainResult {
+        self.train_lm_with_chat_ranges(
+            update_frequency,
+            batch_update_frequency,
+            resume,
+            variable_context,
+            checkpoint_frequency,
+            savefn,
+            mlp,
+            tokens,
+            context_len,
+            embeddings,
+            token_byte_lens,
+            loss_mask,
+            None,
+            sampler_seed,
+            threads,
+        )
+    }
+
+    /// Trains over a flat token buffer while restricting each sample to one
+    /// chat range. Model parameters and optimizer state remain shared across
+    /// chats; only sequence context/targets are isolated at chat boundaries.
+    pub fn train_lm_with_chat_ranges(
         &mut self,
         update_frequency: usize,
         batch_update_frequency: Option<usize>,
@@ -1407,6 +1846,7 @@ impl Trainer {
         embeddings: &Embeddings,
         token_byte_lens: &[u32],
         loss_mask: Option<&LmLossMask>,
+        chat_ranges: Option<&[Range<usize>]>,
         sampler_seed: u64,
         threads: usize,
     ) -> TrainResult {
@@ -1442,10 +1882,14 @@ impl Trainer {
         // Dataset validation
         // =============================================================
 
-        let data_len =
-            tokens
-                .len()
-                .saturating_sub(context_len);
+        let chat_sample_map = chat_ranges.map(|ranges| {
+            ChatSampleMap::new(ranges, tokens.len(), context_len)
+        });
+
+        let data_len = chat_sample_map
+            .as_ref()
+            .map(ChatSampleMap::len)
+            .unwrap_or_else(|| tokens.len().saturating_sub(context_len));
 
         if let Some(mask) =
             loss_mask
@@ -1857,10 +2301,13 @@ impl Trainer {
 
                 let batch_context_len =
                     if variable_context {
-                        let first_sample =
-                            sampler.index(
-                                count
-                            );
+                        let first_ordinal =
+                            sampler.index(count);
+
+                        let first_sample = chat_sample_map
+                            .as_ref()
+                            .map(|map| map.token_start(first_ordinal))
+                            .unwrap_or(first_ordinal);
 
                         derive_context_len(
                             first_sample,
@@ -1888,11 +2335,16 @@ impl Trainer {
                 for batch_index
                 in 0..current_batch
                 {
-                    let sample =
+                    let sample_ordinal =
                         sampler.index(
                             count
                                 + batch_index
                         );
+
+                    let sample = chat_sample_map
+                        .as_ref()
+                        .map(|map| map.token_start(sample_ordinal))
+                        .unwrap_or(sample_ordinal);
 
                     // -------------------------------------------------
                     // Inputs:
