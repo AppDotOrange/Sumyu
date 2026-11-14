@@ -1,4 +1,4 @@
-use crate::lm::{append_decoded_token_bytes, LM, LMInferenceState};
+use crate::lm::{append_decoded_token_bytes, LM, LMInferenceState, SamplingConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -79,6 +79,25 @@ fn feed_ids(
     }
 
     Ok(logits)
+}
+
+fn append_repetition_history(
+    history: &mut Vec<u16>,
+    ids: &[u16],
+    exempt_ids: &[u16],
+    window: usize,
+) {
+    history.extend(
+        ids.iter()
+            .copied()
+            .filter(|id| !exempt_ids.contains(id)),
+    );
+
+    // A window of zero means unlimited history.
+    if window > 0 && history.len() > window {
+        let excess = history.len() - window;
+        history.drain(..excess);
+    }
 }
 
 fn decode_ids(lm: &LM, ids: &[u16]) -> String {
@@ -210,7 +229,9 @@ fn generate_until_markers(
     state: &mut LMInferenceState,
     initial_logits: &[f32],
     max_gen_length: usize,
-    temperature: f32,
+    sampling: SamplingConfig,
+    repetition_history: &mut Vec<u16>,
+    repetition_exempt_ids: &[u16],
     stops: &[StopSequence<'_>],
 ) -> Result<(Vec<u16>, GenerationStop), String> {
     if stops.is_empty() {
@@ -231,7 +252,23 @@ fn generate_until_markers(
     let mut stable_prefix_len = 0usize;
 
     for _ in 0..max_gen_length {
-        let token_id = lm.sample_next_token(&sampling_logits, temperature);
+        // Rebuild history from the persistent conversation plus the current
+        // canonical output. This matters because generated pieces can merge
+        // into different tokens during re-tokenization.
+        let mut sampling_history = repetition_history.clone();
+
+        append_repetition_history(
+            &mut sampling_history,
+            &output_ids,
+            repetition_exempt_ids,
+            sampling.repetition_window,
+        );
+
+        let token_id = lm.sample_next_token_with_history(
+            &sampling_logits,
+            &sampling_history,
+            sampling,
+        );
         pending.push(token_id);
 
         // Stop markers are tested on sampled IDs before text re-tokenization.
@@ -239,6 +276,13 @@ fn generate_until_markers(
         if let Some(stop) = stops.iter().find(|candidate| {
             pending.as_slice() == candidate.ids
         }) {
+            append_repetition_history(
+                repetition_history,
+                &output_ids,
+                repetition_exempt_ids,
+                sampling.repetition_window,
+            );
+
             return Ok((output_ids, stop.stop));
         }
 
@@ -279,6 +323,13 @@ fn generate_until_markers(
 
     // An unfinished prefix of a configured stop marker is discarded. It was
     // never added to the model state, so the state remains aligned with output_ids.
+    append_repetition_history(
+        repetition_history,
+        &output_ids,
+        repetition_exempt_ids,
+        sampling.repetition_window,
+    );
+
     Ok((output_ids, GenerationStop::TokenLimit))
 }
 
@@ -347,6 +398,20 @@ impl ChatConfig {
         Ok(())
     }
 
+    fn repetition_exempt_ids(&self) -> Vec<u16> {
+        let mut ids = Vec::new();
+
+        ids.extend_from_slice(&self.user_start_ids);
+        ids.extend_from_slice(&self.user_end_ids);
+        ids.extend_from_slice(&self.assistant_start_ids);
+        ids.extend_from_slice(&self.assistant_end_ids);
+
+        ids.sort_unstable();
+        ids.dedup();
+
+        ids
+    }
+
     pub fn tinychat() -> Self {
         Self {
             user_start_ids: vec![0],
@@ -365,6 +430,7 @@ impl ChatConfig {
 pub struct ChatSession {
     state: LMInferenceState,
     assistant_end_is_pending: bool,
+    repetition_history: Vec<u16>,
 }
 
 pub struct Chatter {
@@ -391,6 +457,7 @@ impl Chatter {
         Ok(ChatSession {
             state: self.lm.new_inference_state()?,
             assistant_end_is_pending: false,
+            repetition_history: Vec::new(),
         })
     }
 
@@ -448,12 +515,24 @@ impl Chatter {
 
         let logits = feed_ids(&self.lm, &mut session.state, &prompt_ids)?;
 
+        let sampling = SamplingConfig::recommended(temperature);
+        let repetition_exempt_ids = self.config.repetition_exempt_ids();
+
+        append_repetition_history(
+            &mut session.repetition_history,
+            &prompt_ids,
+            &repetition_exempt_ids,
+            sampling.repetition_window,
+        );
+
         let (assistant_ids, stop) = generate_until_markers(
             &self.lm,
             &mut session.state,
             &logits,
             max_gen_length,
-            temperature,
+            sampling,
+            &mut session.repetition_history,
+            &repetition_exempt_ids,
             &[StopSequence {
                 ids: &self.config.assistant_end_ids,
                 stop: GenerationStop::MessageEnd,
@@ -635,6 +714,22 @@ impl ToolConfig {
         ])?;
 
         Ok(())
+    }
+
+    fn repetition_exempt_ids(&self) -> Vec<u16> {
+        let mut ids = self.chat.repetition_exempt_ids();
+
+        ids.extend_from_slice(&self.system_start_ids);
+        ids.extend_from_slice(&self.system_end_ids);
+        ids.extend_from_slice(&self.tool_start_ids);
+        ids.extend_from_slice(&self.tool_end_ids);
+        ids.extend_from_slice(&self.tool_call_start_ids);
+        ids.extend_from_slice(&self.tool_call_end_ids);
+
+        ids.sort_unstable();
+        ids.dedup();
+
+        ids
     }
 }
 
@@ -929,15 +1024,29 @@ impl Agent {
         &self,
         state: &mut LMInferenceState,
         tool_result: &Value,
+        repetition_history: &mut Vec<u16>,
+        sampling: SamplingConfig,
+        repetition_exempt_ids: &[u16],
     ) -> Result<Vec<f32>, String> {
         let serialized = serde_json::to_string(tool_result)
             .map_err(|e| format!("Could not serialize tool result: {}", e))?;
+
         let mut ids = Vec::new();
         ids.extend_from_slice(&self.config.tool_start_ids);
         ids.extend(self.lm.tokenize_text(&serialized));
         ids.extend_from_slice(&self.config.tool_end_ids);
         ids.extend_from_slice(&self.config.chat.assistant_start_ids);
-        feed_ids(&self.lm, state, &ids)
+
+        let logits = feed_ids(&self.lm, state, &ids)?;
+
+        append_repetition_history(
+            repetition_history,
+            &ids,
+            repetition_exempt_ids,
+            sampling.repetition_window,
+        );
+
+        Ok(logits)
     }
 
     /// Runs an interactive agent session. Tools are launched as separate
@@ -950,12 +1059,23 @@ impl Agent {
     ) -> Result<(), String> {
         let mut state = self.lm.new_inference_state()?;
 
+        let sampling = SamplingConfig::recommended(temperature);
+        let repetition_exempt_ids = self.config.repetition_exempt_ids();
+        let mut repetition_history = Vec::new();
+
         // Supply the available-tool catalogue using the configured system role.
         let system_prompt = self.build_system_prompt();
         let mut system_ids = self.config.system_start_ids.clone();
         system_ids.extend(self.lm.tokenize_text(&system_prompt));
         system_ids.extend_from_slice(&self.config.system_end_ids);
         feed_ids(&self.lm, &mut state, &system_ids)?;
+
+        append_repetition_history(
+            &mut repetition_history,
+            &system_ids,
+            &repetition_exempt_ids,
+            sampling.repetition_window,
+        );
 
         let mut previous_assistant_end_is_pending = false;
 
@@ -984,6 +1104,13 @@ impl Agent {
             prompt_ids.extend_from_slice(&self.config.chat.assistant_start_ids);
             let mut logits = feed_ids(&self.lm, &mut state, &prompt_ids)?;
 
+            append_repetition_history(
+                &mut repetition_history,
+                &prompt_ids,
+                &repetition_exempt_ids,
+                sampling.repetition_window,
+            );
+
             print!("BOT: ");
             io::stdout().flush().map_err(|e| e.to_string())?;
 
@@ -996,7 +1123,9 @@ impl Agent {
                     &mut state,
                     &logits,
                     max_gen_length,
-                    temperature,
+                    sampling,
+                    &mut repetition_history,
+                    &repetition_exempt_ids,
                     &[
                         StopSequence {
                             ids: &self.config.chat.assistant_end_ids,
@@ -1038,7 +1167,9 @@ impl Agent {
                             &mut state,
                             &logits,
                             max_gen_length,
-                            temperature,
+                            sampling,
+                            &mut repetition_history,
+                            &repetition_exempt_ids,
                             &[
                                 StopSequence {
                                     ids: &self.config.tool_call_end_ids,
@@ -1103,6 +1234,9 @@ impl Agent {
                         logits = self.feed_tool_result(
                             &mut state,
                             &tool_result,
+                            &mut repetition_history,
+                            sampling,
+                            &repetition_exempt_ids,
                         )?;
                     }
 
@@ -1173,12 +1307,25 @@ impl ModelComparison {
             prompt_ids.extend_from_slice(&config.assistant_start_ids);
             let logits = feed_ids(model, &mut state, &prompt_ids)?;
 
+            let sampling = SamplingConfig::recommended(temperature);
+            let repetition_exempt_ids = config.repetition_exempt_ids();
+            let mut repetition_history = Vec::new();
+
+            append_repetition_history(
+                &mut repetition_history,
+                &prompt_ids,
+                &repetition_exempt_ids,
+                sampling.repetition_window,
+            );
+
             let (bot_ids, _) = generate_until_markers(
                 model,
                 &mut state,
                 &logits,
                 max_gen_length,
-                temperature,
+                sampling,
+                &mut repetition_history,
+                &repetition_exempt_ids,
                 &[StopSequence {
                     ids: &config.assistant_end_ids,
                     stop: GenerationStop::MessageEnd,

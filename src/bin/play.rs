@@ -3,7 +3,6 @@ use std::io::Write;
 use grad::chatter::ChatConfig;
 #[allow(unused_imports)]
 use grad::chatter::Chatter;
-use grad::inspection::inspect_text;
 use grad::lm::LM;
 
 fn main() {
@@ -16,5 +15,5 @@ fn main() {
     lm.params();
     let chatter = Chatter::new(lm, ChatConfig::tinychat());
 
-    chatter.start_chat(tokens, 0.1, 1);
+    chatter.start_chat(tokens, 0.5, 1);
 }
