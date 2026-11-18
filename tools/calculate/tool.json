@@ -1,0 +1,8 @@
+{
+  "name": "calculate",
+  "description": "Evaluate a mathematical expression. Arguments: expression (string). Supports arithmetic, parentheses, powers, and round(value, digits).",
+  "command": "py",
+  "args": ["main.py"],
+  "enabled": true,
+  "timeout_ms": 5000
+}

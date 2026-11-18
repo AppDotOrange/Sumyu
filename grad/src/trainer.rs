@@ -1156,64 +1156,38 @@ where
 // Trainer
 // ============================================================================
 
-/// Maps a shuffled ordinal to a token position while ensuring that every
-/// training window (context plus its following target token) stays inside one
-/// chat. The representation is O(number of chats), not O(number of samples).
+/// One context-length bucket. Every sample in a bucket has enough tokens
+/// inside its own chat to use exactly `context_len` input positions and their
+/// corresponding next-token targets.
 #[derive(Debug)]
-struct ChatSampleMap {
+struct ChatSampleBucket {
+    context_len: usize,
     sample_ranges: Vec<Range<usize>>,
     cumulative_ends: Vec<usize>,
     len: usize,
 }
 
-impl ChatSampleMap {
+impl ChatSampleBucket {
     fn new(
-        chat_ranges: &[Range<usize>],
-        token_count: usize,
         context_len: usize,
+        sample_ranges: Vec<Range<usize>>,
     ) -> Self {
-        let mut sample_ranges = Vec::with_capacity(chat_ranges.len());
-        let mut cumulative_ends = Vec::with_capacity(chat_ranges.len());
+        let mut cumulative_ends = Vec::with_capacity(sample_ranges.len());
         let mut total = 0usize;
-        let mut previous_chat_end = 0usize;
 
-        for range in chat_ranges {
-            assert!(
-                range.start <= range.end && range.end <= token_count,
-                "Invalid chat token range {:?} for dataset length {}",
-                range,
-                token_count,
-            );
-            assert!(
-                range.start >= previous_chat_end,
-                "Chat token ranges must be sorted and non-overlapping",
-            );
-            previous_chat_end = range.end;
-
-            // For a chat of N tokens and context C, there are N-C valid
-            // starts: the target at sample+C must still be inside the chat.
-            let sample_count =
-                (range.end - range.start).saturating_sub(context_len);
-
-            if sample_count == 0 {
-                continue;
-            }
-
-            sample_ranges.push(range.start..range.start + sample_count);
-            total += sample_count;
+        for range in &sample_ranges {
+            let count = range.end - range.start;
+            total = total.checked_add(count)
+                .expect("Chat sample count overflow");
             cumulative_ends.push(total);
         }
 
         Self {
+            context_len,
             sample_ranges,
             cumulative_ends,
             len: total,
         }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
     }
 
     #[inline]
@@ -1234,6 +1208,211 @@ impl ChatSampleMap {
     }
 }
 
+/// A chat dataset split into context-length buckets. Short chats are retained
+/// as one sample using their full available next-token context; longer chats
+/// retain all rolling windows at the configured maximum context length.
+#[derive(Debug)]
+struct ChatSampleMap {
+    buckets: Vec<ChatSampleBucket>,
+    len: usize,
+}
+
+impl ChatSampleMap {
+    fn new(
+        chat_ranges: &[Range<usize>],
+        token_count: usize,
+        context_len: usize,
+    ) -> Self {
+        assert!(context_len > 0, "Context length must be > 0");
+
+        // Index by the maximum usable context length so batches never mix
+        // samples that require different sequence lengths.
+        let mut ranges_by_context =
+            (0..=context_len)
+                .map(|_| Vec::<Range<usize>>::new())
+                .collect::<Vec<_>>();
+
+        let mut previous_chat_end = 0usize;
+
+        for range in chat_ranges {
+            assert!(
+                range.start <= range.end && range.end <= token_count,
+                "Invalid chat token range {:?} for dataset length {}",
+                range,
+                token_count,
+            );
+            assert!(
+                range.start >= previous_chat_end,
+                "Chat token ranges must be sorted and non-overlapping",
+            );
+            previous_chat_end = range.end;
+
+            let chat_len = range.end - range.start;
+
+            // Next-token training needs one token after the input window.
+            // A one-token (or empty) chat therefore cannot form a sample.
+            if chat_len < 2 {
+                continue;
+            }
+
+            let usable_context_len = context_len.min(chat_len - 1);
+
+            // If the chat reaches the configured context size, use every
+            // rolling window whose shifted target still remains in the chat.
+            // Otherwise, make one sample covering the entire available chat.
+            let sample_count = if chat_len > context_len {
+                chat_len - context_len
+            } else {
+                1
+            };
+
+            ranges_by_context[usable_context_len].push(
+                range.start..range.start + sample_count,
+            );
+        }
+
+        let mut buckets = Vec::new();
+        let mut total = 0usize;
+
+        for usable_context_len in 1..=context_len {
+            let ranges = std::mem::take(
+                &mut ranges_by_context[usable_context_len],
+            );
+
+            if ranges.is_empty() {
+                continue;
+            }
+
+            let bucket = ChatSampleBucket::new(
+                usable_context_len,
+                ranges,
+            );
+            total = total.checked_add(bucket.len)
+                .expect("Total chat sample count overflow");
+            buckets.push(bucket);
+        }
+
+        Self {
+            buckets,
+            len: total,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Creates an epoch-specific order of context buckets and independently
+    /// permutes samples within each bucket. Keeping each bucket contiguous
+    /// allows a batch to use its full context without padding or truncation.
+    fn epoch_map(
+        &self,
+        seed: u64,
+        epoch: usize,
+        batch_size: usize,
+    ) -> ChatEpochMap {
+        let bucket_order = PermutationSampler::new(
+            seed ^ 0xA0761D6478BD642F,
+            epoch,
+            self.buckets.len(),
+        );
+
+        let mut segments = Vec::with_capacity(self.buckets.len());
+        let mut total = 0usize;
+        let mut total_batches = 0usize;
+
+        for order_position in 0..self.buckets.len() {
+            let bucket_index = bucket_order.index(order_position);
+            let bucket = &self.buckets[bucket_index];
+            let bucket_seed = seed ^ (bucket.context_len as u64)
+                .wrapping_mul(0xD6E8FEB86659FD93);
+            let sample_order = PermutationSampler::new(
+                bucket_seed,
+                epoch,
+                bucket.len,
+            );
+
+            let end = total.checked_add(bucket.len)
+                .expect("Epoch sample count overflow");
+
+            segments.push(ChatEpochSegment {
+                bucket_index,
+                start: total,
+                end,
+                sample_order,
+            });
+
+            total = end;
+            total_batches +=
+                (bucket.len + batch_size - 1) / batch_size;
+        }
+
+        debug_assert_eq!(total, self.len);
+
+        ChatEpochMap {
+            segments,
+            total_batches,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChatEpochSegment {
+    bucket_index: usize,
+    start: usize,
+    end: usize,
+    sample_order: PermutationSampler,
+}
+
+#[derive(Debug)]
+struct ChatEpochMap {
+    segments: Vec<ChatEpochSegment>,
+    total_batches: usize,
+}
+
+impl ChatEpochMap {
+    #[inline]
+    fn segment_index(&self, position: usize) -> usize {
+        assert!(position < self.segments.last().map_or(0, |segment| segment.end));
+        self.segments.partition_point(
+            |segment| segment.end <= position,
+        )
+    }
+
+    #[inline]
+    fn context_len(
+        &self,
+        dataset: &ChatSampleMap,
+        position: usize,
+    ) -> usize {
+        let segment = self.segments[self.segment_index(position)];
+        dataset.buckets[segment.bucket_index].context_len
+    }
+
+    #[inline]
+    fn batch_len(
+        &self,
+        position: usize,
+        max_batch_size: usize,
+    ) -> usize {
+        let segment = self.segments[self.segment_index(position)];
+        max_batch_size.min(segment.end - position)
+    }
+
+    #[inline]
+    fn token_start(
+        &self,
+        dataset: &ChatSampleMap,
+        position: usize,
+    ) -> usize {
+        let segment = self.segments[self.segment_index(position)];
+        let local_position = position - segment.start;
+        let sample_ordinal = segment.sample_order.index(local_position);
+        dataset.buckets[segment.bucket_index].token_start(sample_ordinal)
+    }
+}
+
 #[cfg(test)]
 mod chat_sample_map_tests {
     use super::ChatSampleMap;
@@ -1244,27 +1423,72 @@ mod chat_sample_map_tests {
         let map = ChatSampleMap::new(&chats, 13, 3);
 
         assert_eq!(map.len(), 7);
-        assert_eq!(map.token_start(0), 0);
-        assert_eq!(map.token_start(3), 3);
-        assert_eq!(map.token_start(4), 7);
-        assert_eq!(map.token_start(6), 9);
+        assert_eq!(map.buckets.len(), 1);
+        assert_eq!(map.buckets[0].context_len, 3);
 
-        for ordinal in 0..map.len() {
-            let sample = map.token_start(ordinal);
-            let chat = if sample < 7 { &chats[0] } else { &chats[1] };
-            assert!(sample >= chat.start);
-            assert!(sample + 3 < chat.end);
+        let epoch_map = map.epoch_map(1, 1, 4);
+        let mut observed = Vec::new();
+
+        for position in 0..map.len() {
+            let sample = epoch_map.token_start(&map, position);
+            let context = epoch_map.context_len(&map, position);
+            let chat = chats.iter().find(|range| {
+                sample >= range.start && sample < range.end
+            }).expect("Sample must belong to a chat");
+
+            assert!(sample + context < chat.end);
+            observed.push(sample);
+        }
+
+        observed.sort_unstable();
+        assert_eq!(observed, vec![0, 1, 2, 3, 7, 8, 9]);
+
+        assert_eq!(epoch_map.batch_len(0, 4), 4);
+        assert_eq!(epoch_map.batch_len(4, 4), 3);
+    }
+
+    #[test]
+    fn retains_chats_shorter_than_the_maximum_context() {
+        let chats = vec![0..3, 3..8];
+        let map = ChatSampleMap::new(&chats, 8, 3);
+
+        // The 3-token chat supplies one 2-token input context; the 5-token
+        // chat supplies two rolling samples with a 3-token input context.
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.buckets.len(), 2);
+        assert_eq!(map.buckets[0].context_len, 2);
+        assert_eq!(map.buckets[0].len, 1);
+        assert_eq!(map.buckets[1].context_len, 3);
+        assert_eq!(map.buckets[1].len, 2);
+
+        // A 64-token chat with a maximum context of 128 contributes one
+        // sample with 63 input positions and 63 next-token targets.
+        let sixty_four_tokens = ChatSampleMap::new(&[0..64], 64, 128);
+        assert_eq!(sixty_four_tokens.len(), 1);
+        assert_eq!(sixty_four_tokens.buckets[0].context_len, 63);
+
+        let epoch_map = map.epoch_map(7, 2, 8);
+        assert_eq!(epoch_map.total_batches, 2);
+
+        for position in 0..map.len() {
+            let sample = epoch_map.token_start(&map, position);
+            let context = epoch_map.context_len(&map, position);
+            let chat = chats.iter().find(|range| {
+                sample >= range.start && sample < range.end
+            }).expect("Sample must belong to a chat");
+
+            assert!(sample + context < chat.end);
         }
     }
 
     #[test]
-    fn skips_chats_too_short_for_the_context() {
-        let chats = vec![0..3, 3..8];
-        let map = ChatSampleMap::new(&chats, 8, 3);
+    fn skips_only_chats_that_cannot_predict_a_next_token() {
+        let chats = vec![0..0, 0..1, 1..2, 2..5];
+        let map = ChatSampleMap::new(&chats, 5, 128);
 
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.token_start(0), 3);
-        assert_eq!(map.token_start(1), 4);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.buckets.len(), 1);
+        assert_eq!(map.buckets[0].context_len, 2);
     }
 }
 
@@ -1911,17 +2135,18 @@ impl Trainer {
         }
 
         if data_len == 0 {
-            println!("Dataset is too small for the selected context length!");
+            println!("Dataset contains no usable next-token samples!");
 
             return TrainResult::Finished;
         }
 
         if self.batch_size > data_len {
             println!(
-                "Batch size too high! Quitting..."
+                "Batch size ({}) exceeds the {} available samples; \
+                 training will use one partial batch per context bucket.",
+                self.batch_size,
+                data_len,
             );
-
-            return TrainResult::Finished;
         }
 
         mlp.set_num_threads(
@@ -2192,6 +2417,19 @@ impl Trainer {
                     data_len,
                 );
 
+            // Chat samples are grouped by their usable context length. Each
+            // batch stays inside one group, so short chats do not force every
+            // other sample in a randomly mixed batch to shrink to their size.
+            let chat_epoch_map = chat_sample_map
+                .as_ref()
+                .map(|map| {
+                    map.epoch_map(
+                        sampler_seed,
+                        epoch,
+                        self.batch_size,
+                    )
+                });
+
             let (
                 mut count,
                 mut batches_done,
@@ -2224,12 +2462,12 @@ impl Trainer {
             let epoch_start_count =
                 count;
 
-            let total_batches =
-                (
-                    data_len
-                        + self.batch_size
-                        - 1
-                ) / self.batch_size;
+            let total_batches = chat_epoch_map
+                .as_ref()
+                .map(|map| map.total_batches)
+                .unwrap_or_else(|| {
+                    (data_len + self.batch_size - 1) / self.batch_size
+                });
 
             let mut total_loss =
                 0.0f32;
@@ -2282,9 +2520,14 @@ impl Trainer {
                 let remaining =
                     data_len - count;
 
-                let current_batch =
-                    self.batch_size
-                        .min(remaining);
+                let current_batch = chat_epoch_map
+                    .as_ref()
+                    .map(|map| {
+                        map.batch_len(count, self.batch_size)
+                    })
+                    .unwrap_or_else(|| {
+                        self.batch_size.min(remaining)
+                    });
 
                 // -----------------------------------------------------
                 // Choose ONE context length for the whole batch.
@@ -2300,17 +2543,27 @@ impl Trainer {
                 // -----------------------------------------------------
 
                 let batch_context_len =
-                    if variable_context {
-                        let first_ordinal =
-                            sampler.index(count);
+                    if let (Some(dataset), Some(epoch_map)) =
+                        (chat_sample_map.as_ref(), chat_epoch_map.as_ref())
+                    {
+                        let available_context =
+                            epoch_map.context_len(dataset, count);
 
-                        let first_sample = chat_sample_map
-                            .as_ref()
-                            .map(|map| map.token_start(first_ordinal))
-                            .unwrap_or(first_ordinal);
+                        if variable_context {
+                            let first_sample =
+                                epoch_map.token_start(dataset, count);
 
+                            derive_context_len(
+                                first_sample,
+                                epoch,
+                                available_context,
+                            )
+                        } else {
+                            available_context
+                        }
+                    } else if variable_context {
                         derive_context_len(
-                            first_sample,
+                            sampler.index(count),
                             epoch,
                             context_len,
                         )
@@ -2335,16 +2588,20 @@ impl Trainer {
                 for batch_index
                 in 0..current_batch
                 {
-                    let sample_ordinal =
-                        sampler.index(
-                            count
-                                + batch_index
-                        );
+                    let sample_position =
+                        count + batch_index;
 
-                    let sample = chat_sample_map
-                        .as_ref()
-                        .map(|map| map.token_start(sample_ordinal))
-                        .unwrap_or(sample_ordinal);
+                    let sample =
+                        if let (Some(dataset), Some(epoch_map)) =
+                            (chat_sample_map.as_ref(), chat_epoch_map.as_ref())
+                        {
+                            epoch_map.token_start(
+                                dataset,
+                                sample_position,
+                            )
+                        } else {
+                            sampler.index(sample_position)
+                        };
 
                     // -------------------------------------------------
                     // Inputs:
@@ -3283,8 +3540,7 @@ impl Trainer {
 
                 #[cfg(feature = "timing")]
                 {
-                    let elapsed_secs =
-                        elapsed.as_secs_f64();
+                    let elapsed_secs = elapsed.as_secs_f64();
 
                     let pct =
                         |duration: Duration| {

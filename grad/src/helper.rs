@@ -1,7 +1,13 @@
+use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserializer;
 pub use crate::datasets::*;
 pub use crate::model_configs::*;
 pub use crate::vocabs::*;
@@ -9,7 +15,7 @@ pub use crate::vocabs::*;
 pub fn dump_vocab_as_rust(
     vocab: &[String],
     path: &str,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let file = File::options()
         .read(true)
         .write(true)
@@ -585,7 +591,7 @@ impl OccurrenceStore {
         &mut self,
         key: u32,
         node: u32,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         self.lists
             .entry(key)
             .or_default()
@@ -595,8 +601,8 @@ impl OccurrenceStore {
             self.total_len
                 .checked_add(1)
                 .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
                         "occurrence count overflow",
                     )
                 })?;
@@ -836,6 +842,16 @@ impl Hasher for FastHasher {
     }
 }
 
+#[inline]
+fn has_punctuation_or_symbol(
+    token: &str,
+) -> bool {
+    token.chars().any(|ch| {
+        !ch.is_whitespace()
+            && !ch.is_alphanumeric()
+    })
+}
+
 // ------------------------------------------------------------
 // Token metadata
 // ------------------------------------------------------------
@@ -876,8 +892,7 @@ impl TokenMeta {
                     ends_non_ws = false;
                 } else {
                     if first {
-                        starts_non_ws =
-                            true;
+                        starts_non_ws = true;
                     }
 
                     if !in_word {
@@ -894,10 +909,14 @@ impl TokenMeta {
             return Self {
                 byte_len:
                 token.len() as u32,
+
                 word_count,
                 starts_non_ws,
                 ends_non_ws,
-                mergeable,
+
+                mergeable:
+                mergeable
+                    && !has_punctuation_or_symbol(token),
             };
         }
 
@@ -922,6 +941,9 @@ impl TokenMeta {
         let mut pos =
             0usize;
 
+        let mut decoded_bytes =
+            Vec::with_capacity(bytes.len() / 6);
+
         while pos < bytes.len() {
             let byte =
                 parse_byte_token(
@@ -935,13 +957,14 @@ impl TokenMeta {
                         "validated byte token",
                     );
 
+            decoded_bytes.push(byte);
+
             if byte.is_ascii_whitespace() {
                 in_word = false;
                 ends_non_ws = false;
             } else {
                 if first {
-                    starts_non_ws =
-                        true;
+                    starts_non_ws = true;
                 }
 
                 if !in_word {
@@ -956,13 +979,32 @@ impl TokenMeta {
             pos += 6;
         }
 
+        let has_punctuation =
+            match std::str::from_utf8(&decoded_bytes) {
+                Ok(decoded) => {
+                    has_punctuation_or_symbol(decoded)
+                }
+
+                Err(_) => {
+                    decoded_bytes.iter().any(|&byte| {
+                        byte.is_ascii()
+                            && !byte.is_ascii_whitespace()
+                            && !byte.is_ascii_alphanumeric()
+                    })
+                }
+            };
+
         Self {
             byte_len:
             (bytes.len() / 6) as u32,
+
             word_count,
             starts_non_ws,
             ends_non_ws,
-            mergeable,
+
+            mergeable:
+            mergeable
+                && !has_punctuation,
         }
     }
 
@@ -1442,7 +1484,7 @@ impl PairIndex {
     fn build(
         tokens: &[u16],
         meta: &[TokenMeta],
-    ) -> std::io::Result<Self> {
+    ) -> io::Result<Self> {
         let n =
             tokens.len();
 
@@ -1723,7 +1765,7 @@ impl PairIndex {
         a: u16,
         b: u16,
         meta: &[TokenMeta],
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         if !TokenMeta::valid_fusion(
             meta[a as usize],
             meta[b as usize],
@@ -2021,7 +2063,7 @@ fn tokenize_reader_u16<R: Read>(
     trie: &Trie,
     mut reader: R,
     initial_capacity: usize,
-) -> std::io::Result<Vec<u16>> {
+) -> io::Result<Vec<u16>> {
     const CHUNK_SIZE:
     usize = 4 * 1024 * 1024;
 
@@ -2060,8 +2102,8 @@ fn tokenize_reader_u16<R: Read>(
                     read as u64,
                 )
                 .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
                         "input size overflow",
                     )
                 })?;
@@ -2070,8 +2112,8 @@ fn tokenize_reader_u16<R: Read>(
             > MAX_CORPUS_BYTES
         {
             return Err(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
                     format!(
                         "corpus exceeds 2 GiB limit ({} bytes)",
                         MAX_CORPUS_BYTES,
@@ -2107,8 +2149,8 @@ fn tokenize_reader_u16<R: Read>(
             > u32::MAX as usize
         {
             return Err(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
                     "token count exceeds u32 index capacity",
                 ),
             );
@@ -2139,8 +2181,8 @@ fn tokenize_reader_u16<R: Read>(
         > u32::MAX as usize
     {
         return Err(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "token count exceeds u32 index capacity",
             ),
         );
@@ -2175,7 +2217,7 @@ fn merge_pair(
     pair_index: &mut PairIndex,
     meta: &[TokenMeta],
     occ_limit: usize,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     /*
      * Take the entire occurrence vector out of the store.
      *
@@ -2428,7 +2470,7 @@ fn build_vocab_from_reader_with_capacity<R: Read>(
     reserved_token_num: usize,
     special_tokens: Option<&[&str]>,
     initial_token_capacity: usize,
-) -> std::io::Result<Vec<String>> {
+) -> io::Result<Vec<String>> {
     let special_count =
         special_tokens.map_or(
             0,
@@ -2437,7 +2479,6 @@ fn build_vocab_from_reader_with_capacity<R: Read>(
 
     let initial_vocab_size =
         reserved_token_num
-            + 1
             + special_count
             + 256;
 
@@ -2457,7 +2498,7 @@ fn build_vocab_from_reader_with_capacity<R: Read>(
         );
 
     vocab.resize(
-        reserved_token_num + 1,
+        reserved_token_num,
         String::new(),
     );
 
@@ -2662,6 +2703,492 @@ fn build_vocab_from_reader_with_capacity<R: Read>(
 
 
 // ------------------------------------------------------------
+// Streaming extraction of conversation text from the LM JSON format
+// ------------------------------------------------------------
+
+struct JsonTextState<W> {
+    writer: W,
+    io_error: Option<io::Error>,
+}
+
+impl<W: Write> JsonTextState<W> {
+    fn write_turn_text<E: de::Error>(
+        &mut self,
+        text: &str,
+    ) -> Result<(), E> {
+        if let Err(error) = self.writer
+            .write_all(text.as_bytes())
+            .and_then(|_| self.writer.write_all(b"\n"))
+        {
+            self.io_error = Some(error);
+            return Err(E::custom(
+                "failed to write extracted JSON conversation text",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+struct JsonTurnsSeed<'a, W> {
+    state: &'a mut JsonTextState<W>,
+}
+
+struct JsonTurnSeed<'a, W> {
+    state: &'a mut JsonTextState<W>,
+}
+
+struct JsonChatsSeed<'a, W> {
+    state: &'a mut JsonTextState<W>,
+}
+
+struct JsonChatSeed<'a, W> {
+    state: &'a mut JsonTextState<W>,
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for JsonTurnsSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TurnsVisitor<'a, W> {
+            state: &'a mut JsonTextState<W>,
+        }
+
+        impl<'de, W: Write> Visitor<'de> for TurnsVisitor<'_, W> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an array of conversation turns")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element_seed(JsonTurnSeed {
+                    state: self.state,
+                })?.is_some() {}
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(TurnsVisitor {
+            state: self.state,
+        })
+    }
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for JsonTurnSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TurnVisitor<'a, W> {
+            state: &'a mut JsonTextState<W>,
+        }
+
+        impl<'de, W: Write> Visitor<'de> for TurnVisitor<'_, W> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a turn object containing string role and text fields")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<(), M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut role: Option<Cow<'de, str>> = None;
+                let mut text: Option<Cow<'de, str>> = None;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "role" => {
+                            role = Some(map.next_value::<Cow<'de, str>>()?);
+                        }
+                        "text" => {
+                            text = Some(map.next_value::<Cow<'de, str>>()?);
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let _role = role.ok_or_else(|| {
+                    de::Error::missing_field("role")
+                })?;
+                let text = text.ok_or_else(|| {
+                    de::Error::missing_field("text")
+                })?;
+
+                self.state.write_turn_text::<M::Error>(text.as_ref())
+            }
+        }
+
+        deserializer.deserialize_map(TurnVisitor {
+            state: self.state,
+        })
+    }
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for JsonChatsSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ChatsVisitor<'a, W> {
+            state: &'a mut JsonTextState<W>,
+        }
+
+        impl<'de, W: Write> Visitor<'de> for ChatsVisitor<'_, W> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an array of chat objects")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element_seed(JsonChatSeed {
+                    state: self.state,
+                })?.is_some() {}
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(ChatsVisitor {
+            state: self.state,
+        })
+    }
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for JsonChatSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ChatVisitor<'a, W> {
+            state: &'a mut JsonTextState<W>,
+        }
+
+        impl<'de, W: Write> Visitor<'de> for ChatVisitor<'_, W> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a chat object containing a turns array")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<(), M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut saw_turns = false;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "turns" => {
+                            if saw_turns {
+                                return Err(de::Error::custom(
+                                    "chat contains more than one 'turns' field",
+                                ));
+                            }
+                            saw_turns = true;
+                            map.next_value_seed(JsonTurnsSeed {
+                                state: self.state,
+                            })?;
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                if !saw_turns {
+                    return Err(de::Error::missing_field("turns"));
+                }
+
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_map(ChatVisitor {
+            state: self.state,
+        })
+    }
+}
+
+struct JsonRootVisitor<'a, W> {
+    state: &'a mut JsonTextState<W>,
+}
+
+impl<'de, W: Write> Visitor<'de> for JsonRootVisitor<'_, W> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a conversation dataset object with chats or turns")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<(), M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut saw_root_turns = false;
+        let mut saw_chats = false;
+
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            match key.as_ref() {
+                // Compatibility with the previous single-chat format.
+                "turns" => {
+                    if saw_root_turns || saw_chats {
+                        return Err(de::Error::custom(
+                            "use either top-level 'turns' or one 'chats' field, not both or repeated",
+                        ));
+                    }
+                    saw_root_turns = true;
+                    map.next_value_seed(JsonTurnsSeed {
+                        state: self.state,
+                    })?;
+                }
+                // Current format: each chat contains its own turns array.
+                "chats" => {
+                    if saw_root_turns || saw_chats {
+                        return Err(de::Error::custom(
+                            "use either top-level 'turns' or one 'chats' field, not both or repeated",
+                        ));
+                    }
+                    saw_chats = true;
+                    map.next_value_seed(JsonChatsSeed {
+                        state: self.state,
+                    })?;
+                }
+                // Config, metadata, role_tokens, and other fields do not
+                // contribute text to BPE statistics.
+                _ => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+
+        if !saw_root_turns && !saw_chats {
+            return Err(de::Error::custom(
+                "dataset must contain either 'chats' or top-level 'turns'",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+fn write_json_text_corpus<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+) -> io::Result<()> {
+    let mut state = JsonTextState {
+        writer,
+        io_error: None,
+    };
+
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let parsed = deserializer.deserialize_map(JsonRootVisitor {
+        state: &mut state,
+    });
+
+    if let Err(error) = parsed {
+        if let Some(io_error) = state.io_error.take() {
+            return Err(io_error);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid conversation JSON dataset: {error}"),
+        ));
+    }
+
+    if let Some(io_error) = state.io_error.take() {
+        return Err(io_error);
+    }
+
+    deserializer.end().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid trailing data after conversation JSON dataset: {error}"),
+        )
+    })?;
+
+    state.writer.flush()
+}
+
+struct TemporaryCorpusFile {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryCorpusFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn create_temporary_corpus_file() -> io::Result<(File, TemporaryCorpusFile)> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    for _ in 0..128 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sumyu-vocab-corpus-{}-{id}.tmp",
+            std::process::id(),
+        ));
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                let guard = TemporaryCorpusFile { path };
+                return Ok((file, guard));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary vocabulary corpus file",
+    ))
+}
+
+fn build_vocab_from_json_reader<R: Read>(
+    reader: R,
+    token_num: usize,
+    reserved_token_num: usize,
+    special_tokens: Option<&[&str]>,
+) -> io::Result<Vec<String>> {
+    let (file, _temporary_file) = create_temporary_corpus_file()?;
+
+    {
+        let writer = BufWriter::with_capacity(1024 * 1024, file);
+        write_json_text_corpus(reader, writer)?;
+    }
+
+    let corpus = File::open(&_temporary_file.path)?;
+    build_vocab_from_reader_with_capacity(
+        BufReader::with_capacity(1024 * 1024, corpus),
+        token_num,
+        reserved_token_num,
+        special_tokens,
+        1 << 20,
+    )
+}
+
+/// Builds a vocabulary from the `chats[].turns[]` JSON format used by
+/// `load_masked_json_lm_dataset`. Only each turn's `text` is used for BPE
+/// statistics; roles and dataset configuration are not treated as ordinary
+/// text. The legacy top-level `turns` format is accepted as well.
+pub fn make_vocab_from_json_reader<R: Read>(
+    reader: R,
+    token_num: usize,
+    reserved_token_num: usize,
+    special_tokens: Option<&[&str]>,
+) -> io::Result<Vec<String>> {
+    let now = std::time::Instant::now();
+
+    let vocab = build_vocab_from_json_reader(
+        reader,
+        token_num,
+        reserved_token_num,
+        special_tokens,
+    )?;
+
+    println!(
+        "JSON vocabulary creation finished in {:?}.",
+        now.elapsed(),
+    );
+
+    Ok(vocab)
+}
+
+/// File-based convenience wrapper for `make_vocab_from_json_reader`.
+pub fn make_vocab_from_json_file(
+    path: &str,
+    token_num: usize,
+    reserved_token_num: usize,
+    special_tokens: Option<&[&str]>,
+) -> io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    make_vocab_from_json_reader(
+        BufReader::with_capacity(1024 * 1024, file),
+        token_num,
+        reserved_token_num,
+        special_tokens,
+    )
+}
+
+
+#[cfg(test)]
+mod json_vocab_tests {
+    use super::write_json_text_corpus;
+    use std::io::Cursor;
+
+    #[test]
+    fn extracts_text_from_all_chats_and_ignores_dataset_config() {
+        let json = br#"{
+            "chats": [
+                {"turns": [
+                    {"role": "user", "text": "first message"},
+                    {"role": "assistant", "text": "second message", "metadata": {"x": 1}}
+                ]},
+                {"turns": [
+                    {"role": "tool", "text": "third message"}
+                ]}
+            ],
+            "train_on": ["assistant"],
+            "role_tokens": {"assistant": {"start": [12], "end": [13]}}
+        }"#;
+
+        let mut extracted = Vec::new();
+        write_json_text_corpus(Cursor::new(json), &mut extracted).unwrap();
+
+        assert_eq!(
+            String::from_utf8(extracted).unwrap(),
+            "first message\nsecond message\nthird message\n",
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_top_level_turns() {
+        let json = br#"{
+            "turns": [
+                {"role": "user", "text": "legacy input"},
+                {"role": "assistant", "text": "legacy output"}
+            ]
+        }"#;
+
+        let mut extracted = Vec::new();
+        write_json_text_corpus(Cursor::new(json), &mut extracted).unwrap();
+
+        assert_eq!(
+            String::from_utf8(extracted).unwrap(),
+            "legacy input\nlegacy output\n",
+        );
+    }
+}
+
+
+// ------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------
 
@@ -2670,7 +3197,7 @@ pub fn make_vocab_from_reader<R: Read>(
     token_num: usize,
     reserved_token_num: usize,
     special_tokens: Option<&[&str]>,
-) -> std::io::Result<Vec<String>> {
+) -> io::Result<Vec<String>> {
     let now =
         std::time::Instant::now();
 
@@ -2696,7 +3223,20 @@ pub fn make_vocab_from_file(
     token_num: usize,
     reserved_token_num: usize,
     special_tokens: Option<&[&str]>,
-) -> std::io::Result<Vec<String>> {
+) -> io::Result<Vec<String>> {
+    if Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return make_vocab_from_json_file(
+            path,
+            token_num,
+            reserved_token_num,
+            special_tokens,
+        );
+    }
+
     let now =
         std::time::Instant::now();
 

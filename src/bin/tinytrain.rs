@@ -3,8 +3,10 @@ use grad;
 use grad::lm::LM;
 use grad::helper;
 use grad::trainer::CheckpointFrequency;
+use helper::calculator_v1;
 
 fn main() {
+    /*
     print!("\x1B[2J\x1B[3J\x1B[1;1H");
     let _ = io::stdout().flush();
     let shake = fs::read_to_string("Datasets/tiny_shakespeare.txt").expect("Can't read tiny_shakespeare.txt!").replace("\r\n", "\n");
@@ -35,4 +37,5 @@ fn main() {
         "PoetP1.sumyu",
         &description,
     );
+    */
 }

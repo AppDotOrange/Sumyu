@@ -1,5 +1,5 @@
 use grad::helper;
-use grad::helper::{poke_v2, recipe_v3};
+use grad::helper::{calculator_v1, recipe_v3};
 use grad::lm::{LM, SavedLM};
 use grad::neuron::{Activation, LayerSpec};
 use grad::trainer::CheckpointFrequency;
@@ -28,7 +28,7 @@ fn main() {
     //let fineweb = fs::read_to_string("Datasets/fineweb.txt").expect("Can't read fineweb.txt!").replace("\r\n", "\n");
     //let fineweb2 = fs::read_to_string("Datasets/fineweb_v2.txt").expect("Can't read fineweb_v2.txt!");
     //let fineweb3 = fs::read_to_string("Datasets/fineweb_v3.txt").expect("Can't read fineweb_v3.txt!");
-    let tinychat = fs::read_to_string("Datasets/tinychat.txt").expect("Can't read tinychat.txt!");
+    //let tinychat = fs::read_to_string("Datasets/tinychat.txt").expect("Can't read tinychat.txt!");
     let test = 17;
     if test == -3 {
         #[cfg(target_arch = "x86_64")]
@@ -38,7 +38,7 @@ fn main() {
             is_x86_feature_detected!("fma"),
         );
     } else if test == -2 {
-        println!("{}", poke_v2().len())
+        println!("{}", calculator_v1().len())
     } else if test == -1 {
         //------------------------------------------------------------------------------------------
         //     CONFIG
@@ -485,7 +485,7 @@ fn main() {
         //------------------------------------------------------------------------------------------
         let mut lm = LM::from_hybrid_config(config);
         lm.params();
-        lm.load_corpus(&tinychat);
+        // lm.load_corpus(&tinychat);
         lm.train(
             Some(1),
             Some("tinychat11/MiniChatterV11_batch_2_epoch_1.check"),
@@ -502,8 +502,8 @@ fn main() {
         //     CONFIG
         //------------------------------------------------------------------------------------------
 
-        let config = helper::tinychat_v16_hybrid(1e-3, 512, 1);
-        let description = "A small Sumyu Hybrid model trained on starhopp3r/TinyChat.";
+        let config = helper::calculator_v1_hybrid(1e-3, 256, 1);
+        let description = "A small Sumyu Hybrid agent trained on a calculating dataset.";
 
         //------------------------------------------------------------------------------------------
         //     DON'T TOUCH
@@ -512,25 +512,25 @@ fn main() {
 
         lm.set_cosine_lr(
             0,       // warmup steps
-            340_788, // one full epoch
+            219_627, // one full epoch
             0.1,     // finish at 10% of base LR
         );
 
         lm.params();
-        lm.load_dataset_file("Datasets/tinychat_sumyu.json");
+        lm.load_dataset_file("Datasets/sumyu_calculator_dataset.json");
 
         lm.train(
             Some(1),
-            Some("tinychat16/MiniChatterV16_batch_69994_epoch_1.check"),
-            Some("tinychat16/MiniChatterV16"),
+            Some("calculator1/CalcV1_batch_2381_epoch_1.check"),
+            Some("calculator1/CalcV1"),
             CheckpointFrequency::EveryBatch(100),
-            Some(1e-4),
+            Some(5e-4),
             None,
             true,
             4,
         );
 
-        lm.save("MiniChatterV16.sumyu", &description);
+        lm.save("CalcV1.sumyu", &description);
     } else if test == 18 {
         let (_description, mut lm) = LM::load("TinyChatP1-small.sumyu");
         lm.save(

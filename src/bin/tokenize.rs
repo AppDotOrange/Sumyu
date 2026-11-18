@@ -3,10 +3,10 @@ use grad::helper::{dump_vocab_as_rust, make_vocab_from_file};
 fn main() {
     let vocab =
         make_vocab_from_file(
-            "Datasets/tinychat.txt",
-            2_000,
-            0,
-            Some(&["<USER>", "<BOT>", "<EOT>"]),
+            "Datasets/sumyu_calculator_dataset.json",
+            1_000,
+            5,
+            None,
         ).unwrap();
     println!("{:?}", vocab)
     /*

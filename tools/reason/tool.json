@@ -1,0 +1,8 @@
+{
+  "name": "reason",
+  "description": "Submit a short reasoning note before performing a calculation. Arguments: cot (string).",
+  "command": "py",
+  "args": ["main.py"],
+  "enabled": true,
+  "timeout_ms": 5000
+}

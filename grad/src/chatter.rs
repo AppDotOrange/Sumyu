@@ -35,6 +35,18 @@ fn validate_token_sequence(
     Ok(())
 }
 
+fn validate_optional_token_sequence(
+    lm: &LM,
+    name: &str,
+    ids: &[u16],
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    validate_token_sequence(lm, name, ids)
+}
+
 fn validate_stop_sequences(
     stops: &[(&str, &[u16])],
 ) -> Result<(), String> {
@@ -77,6 +89,19 @@ fn feed_ids(
         }
         logits = lm.forward_token_id(id, state);
     }
+
+    Ok(logits)
+}
+
+fn feed_ids_counted(
+    lm: &LM,
+    state: &mut LMInferenceState,
+    ids: &[u16],
+    context_tokens_used: &mut usize,
+) -> Result<Vec<f32>, String> {
+    let logits = feed_ids(lm, state, ids)?;
+
+    *context_tokens_used = (*context_tokens_used).saturating_add(ids.len());
 
     Ok(logits)
 }
@@ -231,6 +256,7 @@ fn generate_until_markers(
     max_gen_length: usize,
     sampling: SamplingConfig,
     repetition_history: &mut Vec<u16>,
+    context_tokens_used: &mut usize, // NEW
     repetition_exempt_ids: &[u16],
     stops: &[StopSequence<'_>],
 ) -> Result<(Vec<u16>, GenerationStop), String> {
@@ -283,6 +309,9 @@ fn generate_until_markers(
                 sampling.repetition_window,
             );
 
+            *context_tokens_used =
+                (*context_tokens_used).saturating_add(output_ids.len());
+
             return Ok((output_ids, stop.stop));
         }
 
@@ -330,6 +359,9 @@ fn generate_until_markers(
         sampling.repetition_window,
     );
 
+    *context_tokens_used =
+        (*context_tokens_used).saturating_add(output_ids.len());
+
     Ok((output_ids, GenerationStop::TokenLimit))
 }
 
@@ -356,6 +388,78 @@ fn read_capped<R: Read>(
     }
 
     Ok((output, truncated))
+}
+
+// ============================================================================
+// Tool-call terminal display
+// ============================================================================
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_CYAN: &str = "\x1b[36m";
+
+fn terminal_safe(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+
+    for ch in text.chars() {
+        match ch {
+            '\n' => output.push('\n'),
+            '\t' => output.push('\t'),
+            '\r' => output.push_str("\\r"),
+            ch if ch.is_control() => {
+                output.push_str(
+                    &format!("\\u{:04X}", ch as u32)
+                );
+            }
+            ch => output.push(ch),
+        }
+    }
+
+    output
+}
+
+fn print_marked_block(
+    label: &str,
+    body: &str,
+    header_color: &str,
+    body_color: &str,
+) {
+    let label = terminal_safe(label);
+    let body = terminal_safe(body);
+
+    println!();
+
+    println!(
+        "{}========== {} =========={} ",
+        header_color,
+        label,
+        ANSI_RESET,
+    );
+
+    if body.is_empty() {
+        println!(
+            "{}(empty){}",
+            body_color,
+            ANSI_RESET,
+        );
+    } else {
+        for line in body.lines() {
+            println!(
+                "{}{}{}",
+                body_color,
+                line,
+                ANSI_RESET,
+            );
+        }
+    }
+
+    println!(
+        "{}================================{}",
+        header_color,
+        ANSI_RESET,
+    );
 }
 
 // ============================================================================
@@ -393,7 +497,7 @@ impl ChatConfig {
     fn validate(&self, lm: &LM) -> Result<(), String> {
         validate_token_sequence(lm, "user_start_ids", &self.user_start_ids)?;
         validate_token_sequence(lm, "user_end_ids", &self.user_end_ids)?;
-        validate_token_sequence(lm, "assistant_start_ids", &self.assistant_start_ids)?;
+        validate_optional_token_sequence(lm, "assistant_start_ids", &self.assistant_start_ids)?;
         validate_token_sequence(lm, "assistant_end_ids", &self.assistant_end_ids)?;
         Ok(())
     }
@@ -412,12 +516,24 @@ impl ChatConfig {
         ids
     }
 
+    /// Legacy three-token TinyChat convention.
     pub fn tinychat() -> Self {
         Self {
             user_start_ids: vec![0],
             user_end_ids: vec![2],
             assistant_start_ids: vec![1],
             assistant_end_ids: vec![2],
+        }
+    }
+
+    /// Five-token calculator-agent convention:
+    /// user = 0, assistant = 1, tool-call = 2, tool-result = 3, shared EOT = 4.
+    pub fn calculator() -> Self {
+        Self {
+            user_start_ids: vec![0],
+            user_end_ids: vec![4, 1],
+            assistant_start_ids: vec![],
+            assistant_end_ids: vec![4],
         }
     }
 }
@@ -431,6 +547,7 @@ pub struct ChatSession {
     state: LMInferenceState,
     assistant_end_is_pending: bool,
     repetition_history: Vec<u16>,
+    context_tokens_used: usize,
 }
 
 pub struct Chatter {
@@ -458,6 +575,7 @@ impl Chatter {
             state: self.lm.new_inference_state()?,
             assistant_end_is_pending: false,
             repetition_history: Vec::new(),
+            context_tokens_used: 0,
         })
     }
 
@@ -513,7 +631,12 @@ impl Chatter {
         prompt_ids.extend_from_slice(&self.config.user_end_ids);
         prompt_ids.extend_from_slice(&self.config.assistant_start_ids);
 
-        let logits = feed_ids(&self.lm, &mut session.state, &prompt_ids)?;
+        let logits = feed_ids_counted(
+            &self.lm,
+            &mut session.state,
+            &prompt_ids,
+            &mut session.context_tokens_used,
+        )?;
 
         let sampling = SamplingConfig::recommended(temperature);
         let repetition_exempt_ids = self.config.repetition_exempt_ids();
@@ -532,6 +655,7 @@ impl Chatter {
             max_gen_length,
             sampling,
             &mut session.repetition_history,
+            &mut session.context_tokens_used,
             &repetition_exempt_ids,
             &[StopSequence {
                 ids: &self.config.assistant_end_ids,
@@ -555,15 +679,22 @@ impl Chatter {
     /// token-ID based; text is tokenized only at this user-interface boundary
     /// and generated IDs are decoded only for display.
     pub fn start_chat_result(
-        &self,
+        &mut self,
         max_gen_length: usize,
         temperature: f32,
-        _threads: usize,
+        threads: usize,
     ) -> Result<(), String> {
+        self.lm.set_num_threads(threads);
+
+        let context_length = self.lm.context_len();
         let mut session = self.new_session()?;
 
         loop {
-            print!("USER: ");
+            print!(
+                "USER ({}/{} tokens used): ",
+                session.context_tokens_used,
+                context_length,
+            );
             io::stdout().flush().map_err(|e| e.to_string())?;
 
             let mut user = String::new();
@@ -600,12 +731,16 @@ impl Chatter {
     /// token-ID based; text is tokenized only at this user-interface boundary
     /// and generated IDs are decoded only for display.
     pub fn start_chat(
-        &self,
+        &mut self,
         max_gen_length: usize,
         temperature: f32,
-        _threads: usize,
+        threads: usize,
     ) {
-        match self.start_chat_result(max_gen_length, temperature, _threads) {
+        match self.start_chat_result(
+            max_gen_length,
+            temperature,
+            threads,
+        ) {
             Ok(_o) => {}
             Err(e) => println!("ERROR in Chatter::start_chat() : {}", e)
         }
@@ -698,19 +833,79 @@ impl ToolConfig {
         }
     }
 
+    /// Ready-to-use configuration for the five-token calculator dataset.
+    /// System prompts are disabled by default and therefore need no extra IDs.
+    pub fn calculator(tools_dir: impl Into<PathBuf>) -> Self {
+        Self::new(
+            ChatConfig::calculator(),
+            Vec::new(),
+            Vec::new(),
+            vec![3],
+            vec![4, 1],
+            vec![2],
+            vec![4],
+            tools_dir,
+        )
+    }
+
     fn validate(&self, lm: &LM) -> Result<(), String> {
         self.chat.validate(lm)?;
-        validate_token_sequence(lm, "system_start_ids", &self.system_start_ids)?;
-        validate_token_sequence(lm, "system_end_ids", &self.system_end_ids)?;
+
+        // System markers are optional when Agent::start_chat(..., false) is
+        // used. Configure both or neither; a disabled system prompt consumes
+        // no dedicated vocabulary entries.
+        match (self.system_start_ids.is_empty(), self.system_end_ids.is_empty()) {
+            (true, true) => {}
+            (false, false) => {
+                validate_optional_token_sequence(
+                    lm,
+                    "system_start_ids",
+                    &self.system_start_ids,
+                )?;
+                validate_optional_token_sequence(
+                    lm,
+                    "system_end_ids",
+                    &self.system_end_ids,
+                )?;
+            }
+            _ => {
+                return Err(
+                    "system_start_ids and system_end_ids must either both be configured or both be empty"
+                        .to_string(),
+                );
+            }
+        }
+
         validate_token_sequence(lm, "tool_start_ids", &self.tool_start_ids)?;
         validate_token_sequence(lm, "tool_end_ids", &self.tool_end_ids)?;
         validate_token_sequence(lm, "tool_call_start_ids", &self.tool_call_start_ids)?;
         validate_token_sequence(lm, "tool_call_end_ids", &self.tool_call_end_ids)?;
 
+        // Tool calls and final assistant answers end with [4].
+        if self.tool_call_end_ids.as_slice()
+            != self.chat.assistant_end_ids.as_slice()
+        {
+            return Err(
+                "tool_call_end_ids must equal assistant_end_ids".to_string(),
+            );
+        }
+
+        // User messages and tool results both end with [4, 1].
+        if self.chat.user_end_ids.as_slice()
+            != self.tool_end_ids.as_slice()
+        {
+            return Err(
+                "user_end_ids must equal tool_end_ids".to_string(),
+            );
+        }
+
+        // During assistant generation, only EOT and tool-call-start can end
+        // the text phase. Tool-call-end is the same EOT and is detected in
+        // the separate tool-payload generation phase, so it must not be
+        // registered as a second, identical stop sequence here.
         validate_stop_sequences(&[
             ("assistant_end_ids", &self.chat.assistant_end_ids),
             ("tool_call_start_ids", &self.tool_call_start_ids),
-            ("tool_call_end_ids", &self.tool_call_end_ids),
         ])?;
 
         Ok(())
@@ -1025,6 +1220,7 @@ impl Agent {
         state: &mut LMInferenceState,
         tool_result: &Value,
         repetition_history: &mut Vec<u16>,
+        context_tokens_used: &mut usize,
         sampling: SamplingConfig,
         repetition_exempt_ids: &[u16],
     ) -> Result<Vec<f32>, String> {
@@ -1037,7 +1233,12 @@ impl Agent {
         ids.extend_from_slice(&self.config.tool_end_ids);
         ids.extend_from_slice(&self.config.chat.assistant_start_ids);
 
-        let logits = feed_ids(&self.lm, state, &ids)?;
+        let logits = feed_ids_counted(
+            &self.lm,
+            state,
+            &ids,
+            context_tokens_used,
+        )?;
 
         append_repetition_history(
             repetition_history,
@@ -1052,35 +1253,60 @@ impl Agent {
     /// Runs an interactive agent session. Tools are launched as separate
     /// processes and communicate through JSON on stdin/stdout.
     pub fn start_chat(
-        &self,
+        &mut self,
         max_gen_length: usize,
         temperature: f32,
-        _threads: usize,
+        threads: usize,
+        system_prompt: bool,
     ) -> Result<(), String> {
+        let context_length = self.lm.context_len();
+        if context_length == 0 {
+            return Err("Context length must be greater than zero".to_string());
+        }
+        self.lm.set_num_threads(threads);
         let mut state = self.lm.new_inference_state()?;
-
-        let sampling = SamplingConfig::recommended(temperature);
+        let mut context_tokens_used = 0usize;
+        let mut sampling = SamplingConfig::recommended(temperature);
+        sampling.repetition_penalty = 1.0;
         let repetition_exempt_ids = self.config.repetition_exempt_ids();
         let mut repetition_history = Vec::new();
+        if system_prompt {
+            if self.config.system_start_ids.is_empty()
+                || self.config.system_end_ids.is_empty()
+            {
+                return Err(
+                    "system_prompt is enabled, but system_start_ids/system_end_ids are empty"
+                        .to_string(),
+                );
+            }
 
-        // Supply the available-tool catalogue using the configured system role.
-        let system_prompt = self.build_system_prompt();
-        let mut system_ids = self.config.system_start_ids.clone();
-        system_ids.extend(self.lm.tokenize_text(&system_prompt));
-        system_ids.extend_from_slice(&self.config.system_end_ids);
-        feed_ids(&self.lm, &mut state, &system_ids)?;
-
-        append_repetition_history(
-            &mut repetition_history,
-            &system_ids,
-            &repetition_exempt_ids,
-            sampling.repetition_window,
-        );
+            // Supply the available-tool catalogue using the configured system role.
+            let system_prompt = self.build_system_prompt();
+            let mut system_ids = self.config.system_start_ids.clone();
+            system_ids.extend(self.lm.tokenize_text(&system_prompt));
+            system_ids.extend_from_slice(&self.config.system_end_ids);
+            feed_ids_counted(
+                &self.lm,
+                &mut state,
+                &system_ids,
+                &mut context_tokens_used,
+            )?;
+            append_repetition_history(
+                &mut repetition_history,
+                &system_ids,
+                &repetition_exempt_ids,
+                sampling.repetition_window,
+            );
+        }
 
         let mut previous_assistant_end_is_pending = false;
 
         loop {
-            print!("USER: ");
+            print!(
+                "USER ({}/{} tokens used): ",
+                context_tokens_used,
+                context_length,
+            );
             io::stdout().flush().map_err(|e| e.to_string())?;
 
             let mut user = String::new();
@@ -1102,7 +1328,12 @@ impl Agent {
             prompt_ids.extend(self.lm.tokenize_text(&user));
             prompt_ids.extend_from_slice(&self.config.chat.user_end_ids);
             prompt_ids.extend_from_slice(&self.config.chat.assistant_start_ids);
-            let mut logits = feed_ids(&self.lm, &mut state, &prompt_ids)?;
+            let mut logits = feed_ids_counted(
+                &self.lm,
+                &mut state,
+                &prompt_ids,
+                &mut context_tokens_used,
+            )?;
 
             append_repetition_history(
                 &mut repetition_history,
@@ -1125,6 +1356,7 @@ impl Agent {
                     max_gen_length,
                     sampling,
                     &mut repetition_history,
+                    &mut context_tokens_used,
                     &repetition_exempt_ids,
                     &[
                         StopSequence {
@@ -1156,10 +1388,11 @@ impl Agent {
 
                         // The call-start marker was withheld by the generator;
                         // now insert it into the persistent model context.
-                        logits = feed_ids(
+                        logits = feed_ids_counted(
                             &self.lm,
                             &mut state,
                             &self.config.tool_call_start_ids,
+                            &mut context_tokens_used,
                         )?;
 
                         let (call_ids, call_stop) = generate_until_markers(
@@ -1169,72 +1402,111 @@ impl Agent {
                             max_gen_length,
                             sampling,
                             &mut repetition_history,
+                            &mut context_tokens_used,
                             &repetition_exempt_ids,
-                            &[
-                                StopSequence {
-                                    ids: &self.config.tool_call_end_ids,
-                                    stop: GenerationStop::ToolCallEnd,
-                                },
-                                StopSequence {
-                                    ids: &self.config.chat.assistant_end_ids,
-                                    stop: GenerationStop::MessageEnd,
-                                },
-                            ],
+                            &[StopSequence {
+                                ids: &self.config.tool_call_end_ids,
+                                stop: GenerationStop::ToolCallEnd,
+                            }],
                         )?;
 
-                        // Complete the generated control sequence in context.
+                        // The generated EOT is withheld by the generator. Feed
+                        // it exactly once, whether the JSON payload completed or
+                        // hit its token limit (the latter becomes an error result).
                         match call_stop {
-                            GenerationStop::ToolCallEnd => {
-                                feed_ids(
+                            GenerationStop::ToolCallEnd | GenerationStop::TokenLimit => {
+                                feed_ids_counted(
                                     &self.lm,
                                     &mut state,
                                     &self.config.tool_call_end_ids,
-                                )?;
-                                feed_ids(
-                                    &self.lm,
-                                    &mut state,
-                                    &self.config.chat.assistant_end_ids,
-                                )?;
-                            }
-                            GenerationStop::MessageEnd | GenerationStop::TokenLimit => {
-                                // Close the incomplete tool-call assistant message
-                                // before injecting the tool error/result message.
-                                feed_ids(
-                                    &self.lm,
-                                    &mut state,
-                                    &self.config.chat.assistant_end_ids,
+                                    &mut context_tokens_used,
                                 )?;
                             }
                             _ => unreachable!(),
                         }
 
-                        let call_text = decode_ids(&self.lm, &call_ids);
-                        let tool_result = if call_stop != GenerationStop::ToolCallEnd {
-                            json!({
-                                "name": "(incomplete call)",
-                                "ok": false,
-                                "error": "The model did not finish the tool-call payload.",
-                            })
-                        } else {
-                            match serde_json::from_str::<ToolInvocation>(&call_text) {
-                                Ok(invocation) => {
-                                    let name = invocation.name.clone();
-                                    println!("\n[Tool: {}]", name);
-                                    self.invoke_tool(invocation)
+                        let call_text =
+                            decode_ids(&self.lm, &call_ids);
+
+                        let (tool_result, tool_label) =
+                            if call_stop != GenerationStop::ToolCallEnd {
+                                print_marked_block(
+                                    "INCOMPLETE TOOL CALL",
+                                    &call_text,
+                                    ANSI_BOLD_RED,
+                                    ANSI_RED,
+                                );
+
+                                (
+                                    json!({
+                "name": "(incomplete call)",
+                "ok": false,
+                "error": "The model did not finish the tool-call payload.",
+                "received": call_text,
+            }),
+                                    "incomplete call".to_string(),
+                                )
+                            } else {
+                                match serde_json::from_str::<ToolInvocation>(&call_text) {
+                                    Ok(invocation) => {
+                                        let name = invocation.name.clone();
+
+                                        // Show the exact JSON generated by the model.
+                                        // This happens BEFORE executing the tool.
+                                        print_marked_block(
+                                            &format!("TOOL CALL: {}", name),
+                                            &call_text,
+                                            ANSI_BOLD_RED,
+                                            ANSI_RED,
+                                        );
+
+                                        let result =
+                                            self.invoke_tool(invocation);
+
+                                        (result, name)
+                                    }
+
+                                    Err(error) => {
+                                        print_marked_block(
+                                            "INVALID TOOL CALL",
+                                            &call_text,
+                                            ANSI_BOLD_RED,
+                                            ANSI_RED,
+                                        );
+
+                                        (
+                                            json!({
+                        "name": "(invalid call)",
+                        "ok": false,
+                        "error": format!(
+                            "Tool call must be valid JSON: {}",
+                            error
+                        ),
+                        "received": call_text,
+                    }),
+                                            "invalid call".to_string(),
+                                        )
+                                    }
                                 }
-                                Err(error) => json!({
-                                    "name": "(invalid call)",
-                                    "ok": false,
-                                    "error": format!("Tool call must be valid JSON: {}", error),
-                                    "received": call_text,
-                                }),
-                            }
-                        };
+                            };
+
+                        // Display the actual result returned by the tool.
+                        let result_text =
+                            serde_json::to_string_pretty(&tool_result)
+                                .unwrap_or_else(|_| format!("{:?}", tool_result));
+
+                        print_marked_block(
+                            &format!("TOOL RESULT: {}", tool_label),
+                            &result_text,
+                            ANSI_BOLD_CYAN,
+                            ANSI_CYAN,
+                        );
 
                         logits = self.feed_tool_result(
                             &mut state,
                             &tool_result,
                             &mut repetition_history,
+                            &mut context_tokens_used,
                             sampling,
                             &repetition_exempt_ids,
                         )?;
@@ -1282,11 +1554,12 @@ impl ModelComparison {
     }
 
     pub fn compare_one_message(
-        &self,
+        &mut self,
         max_gen_length: usize,
         temperature: f32,
-        _threads: usize,
+        threads: usize,
     ) -> Result<Vec<String>, String> {
+        self.models.iter_mut().for_each(|x| {x.0.set_num_threads(threads)});
         print!("USER: ");
         io::stdout().flush().map_err(|e| e.to_string())?;
 
@@ -1306,6 +1579,7 @@ impl ModelComparison {
             prompt_ids.extend_from_slice(&config.user_end_ids);
             prompt_ids.extend_from_slice(&config.assistant_start_ids);
             let logits = feed_ids(model, &mut state, &prompt_ids)?;
+            let mut context_tokens_used = prompt_ids.len();
 
             let sampling = SamplingConfig::recommended(temperature);
             let repetition_exempt_ids = config.repetition_exempt_ids();
@@ -1325,6 +1599,7 @@ impl ModelComparison {
                 max_gen_length,
                 sampling,
                 &mut repetition_history,
+                &mut context_tokens_used,
                 &repetition_exempt_ids,
                 &[StopSequence {
                     ids: &config.assistant_end_ids,

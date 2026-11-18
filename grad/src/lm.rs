@@ -2676,26 +2676,12 @@ impl LM {
         description: &str,
     ) -> SavedLM {
         SavedLM {
-            description:
-            description.to_string(),
-
-            mlp:
-            self.mlp.save(),
-
-            vocab:
-            self.vocab.clone(),
-
-            context_len:
-            self.context_len,
-
-            hidden_layers:
-            self.hidden_layers.clone(),
-
-            embeddings:
-            self.embeddings
-                .save(
-                    &self.mlp.params
-                ),
+            description: description.to_string(),
+            mlp: self.mlp.save(),
+            vocab: self.vocab.clone(),
+            context_len: self.context_len,
+            hidden_layers: self.hidden_layers.clone(),
+            embeddings: self.embeddings.save(&self.mlp.params),
         }
     }
 
@@ -2707,13 +2693,9 @@ impl LM {
             saved.description
         );
 
-        println!(
-            "Loading..."
-        );
+        println!("Loading...");
 
-        Self::from_saved_silent(
-            saved
-        )
+        Self::from_saved_silent(saved)
     }
 
     pub fn from_saved_silent(
@@ -2733,14 +2715,11 @@ impl LM {
         let mlp =
             MLP::load_with_embeddings(
                 &saved.mlp,
-                Arc::clone(
-                    &embeddings
-                ),
+                Arc::clone(&embeddings),
                 params,
             );
 
-        let (tokenizer_trie, max_token_bytes) =
-            build_tokenizer_data(&saved.vocab);
+        let (tokenizer_trie, max_token_bytes) = build_tokenizer_data(&saved.vocab);
 
         Self {
             trainer: Trainer::new(0.0, 0, 0, 0),
@@ -2768,31 +2747,24 @@ impl LM {
         path: &str,
         description: &str,
     ) {
-        let saved =
-            self.to_saved(
-                description
-            );
+        let saved = self.to_saved(description);
 
         let bytes =
             bincode::serde::encode_to_vec(
                 &saved,
                 bincode::config::standard(),
-            )
-                .unwrap();
+            ).unwrap();
 
         fs::write(
             path,
             bytes,
-        )
-            .unwrap();
+        ).unwrap();
     }
 
     pub fn load(
         path: &str,
     ) -> (String, Self) {
-        let bytes =
-            fs::read(path)
-                .unwrap();
+        let bytes = fs::read(path).unwrap();
 
         let (
             model,
@@ -2802,23 +2774,18 @@ impl LM {
             bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
-            )
-                .unwrap();
+            ).unwrap();
 
         (
             model.description.clone(),
-            Self::from_saved(
-                model
-            ),
+            Self::from_saved(model),
         )
     }
 
     pub fn load_silent(
         path: &str,
     ) -> (String, Self) {
-        let bytes =
-            fs::read(path)
-                .unwrap();
+        let bytes = fs::read(path).unwrap();
 
         let (
             model,
@@ -2827,14 +2794,11 @@ impl LM {
             bincode::serde::decode_from_slice(
                 &bytes,
                 bincode::config::standard(),
-            )
-                .unwrap();
+            ).unwrap();
 
         (
             model.description.clone(),
-            Self::from_saved_silent(
-                model
-            ),
+            Self::from_saved_silent(model),
         )
     }
 
@@ -2884,10 +2848,40 @@ impl LM {
             }
         }
 
-        let (trie, max_token_bytes) =
-            build_tokenizer_data(&self.vocab);
+        let (trie, max_token_bytes) = build_tokenizer_data(&self.vocab);
 
         self.tokenizer_trie = trie;
         self.max_token_bytes = max_token_bytes;
+    }
+
+    pub fn set_num_threads(
+        &mut self,
+        threads: usize,
+    ) {
+        assert!(
+            threads > 0,
+            "Must use at least one thread!"
+        );
+
+        let threads_i32 = i32::try_from(threads).expect("Thread count exceeds i32::MAX");
+
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num_threads: i32);
+        }
+
+        unsafe {
+            openblas_set_num_threads(threads_i32);
+        }
+
+        self.mlp.set_num_threads(threads);
+
+        println!(
+            "Inference threads configured: {}",
+            threads
+        );
+    }
+
+    pub fn context_len(&self) -> u32 {
+        self.context_len
     }
 }
